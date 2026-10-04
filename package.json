@@ -1,0 +1,45 @@
+{
+  "name": "dsh-adapter-compat",
+  "version": "1.0.0",
+  "description": "DSH LLM adapter 兼容垫片：在 adapter 注册时回填缺失的 LlmAdapter 基类默认方法（imageRequestPricing 等），修复 /compact 与自动压缩因 'xxx is not a function' 静默失败的问题。独立于任何被保护插件——不改它的文件，它的自更新/强制更新无法移除本修复。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "test"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "adapter",
+    "compat",
+    "compact",
+    "llm"
+  ],
+  "author": "EvelynShiao",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EvelynShiao/dsh-adapter-compat.git"
+  },
+  "homepage": "https://github.com/EvelynShiao/dsh-adapter-compat#readme",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

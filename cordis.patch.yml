@@ -1,0 +1,5 @@
+# dsh-adapter-compat bundle patch: one host row over the web profile.
+# 纯服务端垫片，无浏览器半身。
+- insert:
+    - id: adapter-compat
+      name: dsh-adapter-compat
