@@ -1,8 +1,11 @@
 # dsh-adapter-compat
 
-DSH LLM adapter **兼容垫片**：在 adapter 注册时回填缺失的 `LlmAdapter` 基类默认方法，修复 `/compact` 与自动压缩因 `xxx is not a function` 静默失败的问题。
+DSH LLM adapter **兼容垫片** + **自动压缩硬闸**：
 
-> 独立插件，不依赖、不修改任何被保护插件的源码。被保护插件（如 `dsh-our-free-model`）即使被强制更新换回裸类，下一次注册仍会被本插件兜住——**它的更新机制无法移除这个修复**。
+1. **回填层**：在 adapter 注册时回填缺失的 `LlmAdapter` 基类默认方法，修复 `/compact` 因 `xxx is not a function` 静默失败；
+2. **硬闸层（v1.1.0）**：把压缩引擎的 `compactIfNeeded` 恒置为"无需压缩"，**从代码层彻底关闭自动压缩**——手动 `/compact` 完全不受影响。
+
+> 独立插件，不依赖、不修改任何被保护插件的源码，也**不依赖任何配置文件**。被保护插件（如 `dsh-our-free-model`）即使被强制更新换回裸类，下一次注册仍会被本插件兜住——**它的更新机制无法移除这个修复**；`cordis.patch.yml` 被 sync 覆盖、`auto` 配置回滚到默认 `true` 也一样拦得住。
 
 ## 根因
 
@@ -30,6 +33,19 @@ this.adapters.get(...)?.adapter.imageRequestPricing is not a function
 
 回填表逐行镜像自 `dsh-llm` 基类默认实现（`providerInfo` / `providerRetryPolicy` / `imageRequestPricing` / `listModels` / `resolveModel` / `prepareCall`），语义与基类一致。
 
+## 硬闸层：彻底关闭自动压缩（v1.1.0）
+
+宿主自动压缩的唯一咽喉是 `BasicCompactionEngine.compactIfNeeded()`，两个自动触发器（每步压力 `pressure`、请求溢出恢复 `context-overflow`）都经过它；**手动 `/compact` 走的是另一条完全独立的 `compactNow()`，从不经过它**。硬闸把 `compactIfNeeded` 替换为恒返回 `null`（宿主语义 = 无需压缩，调用方静默跳过）：
+
+- **与配置无关**：`cordis.patch.yml` 被 sync 整文件盖掉、`auto` 回到默认 `true`、监听器照常注册——事件触发时调到的也是这道闸；
+- **与实例无关**：instance + prototype 双层打标，preset 作用域的引擎在首次 `agent/pre-step` 时补闸（`prepend`，先于 compaction-basic 自己的监听执行）；
+- **手动无损**：`compactNow`（`/compact` 命令入口）一概不碰；
+- **代价（预期行为）**：窗口真爆时不再自动压缩救场，而是原样报 context-overflow 错——手动 `/compact` 兜底。这正是"不要自动压缩"的应有之义。
+
+恢复官方行为：`cordis.patch.yml` 本插件行 `config: { autoGate: false }` + 重启。
+
+生效条件：插件代码在 composition 构建时读取一次，**改动后需重启 DSH**。
+
 ## 安装
 
 电脑（profile 目录 = 你的 DSH profile，如 `~/.dsh/profiles/web`）：
@@ -48,13 +64,11 @@ pnpm install
 ## 验证
 
 ```bash
-node --test test/
+node --test test/compat.test.js test/gate.test.js
 ```
 
-装完后开个新会话敲 `/compact`：
-
-- 回 `Compacted N history items (~X tokens)` → 修好了
-- 还报 `imageRequestPricing is not a function` → 本插件没被加载，检查 bundles 列表
+- 回填层：装完后开个新会话敲 `/compact`，回 `Compacted N history items (~X tokens)` 即修好；还报 `imageRequestPricing is not a function` → 本插件没被加载，检查 bundles 列表。
+- 硬闸层：重启后 DSH 日志应出现 `[adapter-compat] auto-compaction gate armed`；此后无论怎么聊，**不应再出现任何非手动触发的 `compaction/start` 事件**（`command/run compact` 手动触发的除外）。
 
 ## 仓库
 
