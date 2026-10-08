@@ -926,7 +926,11 @@ export async function purgeTombstones(ctx, options = {}) {
 
 /** 装配本层：开机早期多轮补清 + 待清理台账每 60 秒重试一次。 */
 export function installTrueDelete(ctx, config = {}) {
-  if (config?.trueDelete === false) return undefined
+  /* 默认关闭写盘：本层会重写会话文件，必须显式 config.trueDelete === true 才启用。
+     教训：曾把 agent/inbox/spliced 当普通事件删掉，而它是顺序状态机（每条 splice 的
+     start/removedCount 依赖前序队列），删中间一条就会让后续全部错位 →
+     「invalid persisted inbox splice」+ 删掉的内容以「排队消息」形态复现。 */
+  if (config?.trueDelete !== true) return undefined
   const home = dshHomeDir()
   const summarise = (tag, r) => {
     const written = r.results.filter((x) => x.status === 'written')

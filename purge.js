@@ -13,6 +13,49 @@ import { readSession, writeSession, excise, verify, seqsOfTurn, decodeSeqRanges 
 export const PURGE_DEFAULTS = Object.freeze({ write: false, only: undefined, home: undefined });
 
 /**
+ * 离线复现宿主 inbox 投影的状态机（移植自 dsh-agent-loop 的 splice apply）。
+ * agent/inbox/spliced 是**顺序状态机**：每条 splice 的 start/removedCount 都相对于
+ * 前序 splice 演化出的队列，且两边队列的 message.id 不能重复。因此它不能像普通事件
+ * 那样删除——删中间一条会让后续全部错位，宿主就会抛
+ * "invalid persisted inbox splice at session seq N"，会话直接打不开。
+ * @returns {{problems: Array<{seq:number,reason:string}>, final: Record<string,unknown[]>}}
+ */
+export function checkInboxSplices(events) {
+  const state = { 'next-turn': [], 'next-step': [] };
+  const problems = [];
+  for (const event of events) {
+    if (event?.type !== 'agent/inbox/spliced') continue;
+    const splice = event.data;
+    try {
+      const inbox = state[splice.target];
+      if (!Array.isArray(inbox)) throw new Error('splice.target 未知: ' + String(splice.target));
+      const removedCount = splice.removedCount ?? 0;
+      if (!Number.isSafeInteger(splice.start) || splice.start < 0 || splice.start > inbox.length
+        || !Number.isSafeInteger(removedCount) || removedCount < 0 || splice.start + removedCount > inbox.length) {
+        throw new Error('splice 越界 start=' + String(splice.start) + ' removedCount=' + String(removedCount) + ' queue=' + inbox.length);
+      }
+      const next = [...inbox.slice(0, splice.start), ...(splice.inserted ?? []), ...inbox.slice(splice.start + removedCount)];
+      const ids = new Set();
+      const pool = splice.target === 'next-turn' ? [...next, ...state['next-step']] : [...state['next-turn'], ...next];
+      for (const message of pool) {
+        if (ids.has(message?.id)) throw new Error('message ' + String(message?.id) + ' 已处于 pending');
+        ids.add(message?.id);
+      }
+      state[splice.target] = next;
+    } catch (error) {
+      problems.push({ seq: event.seq, reason: String(error?.message ?? error) });
+      break;
+    }
+  }
+  return { problems, final: state };
+}
+
+/** 事件集里所有 agent/inbox/spliced 的 seq。 */
+export function inboxSpliceSeqs(events) {
+  return events.filter((e) => e?.type === 'agent/inbox/spliced').map((e) => e.seq);
+}
+
+/**
  * 判断一个表层事件是不是「轮次删除墓碑」。
  * - 只认插件自己的 source.kind（dsh-session-kit-*），非插件替换一律不碰；
  * - summary.regeneration 存在 = 重新生成，轮次还活着，**整轮删会毁掉新回答** → 跳过；
@@ -66,29 +109,6 @@ export function planPurge(events) {
   const remove = new Set();
   for (const turn of turnSet) for (const sq of seqsOfTurn(events, turn)) remove.add(sq);
 
-  /* 孤立的 agent/inbox/spliced：它记录的 user 消息已经被物理删除，但被问的文本
-     还留在这条日志事件里（Timeline/文件都还看得见）。判别用 rpcId 引用次数：
-     仍活着的消息其 rpcId 在整份日志里出现 2 次（spliced + user/message），
-     被删掉的只剩 1 次 —— 实测已验证（3590 出现 2 次仍在，3606/3609 只剩 1 次）。
-     只在本次确实要删轮次时才顺带清理，避免误伤「消息发出但轮次从未运行」的场景。 */
-  if (turnSet.size > 0) {
-    const rpcCounts = new Map();
-    for (const event of events) {
-      for (const m of JSON.stringify(event).matchAll(/"rpcId":"([^"]+)"/g)) {
-        rpcCounts.set(m[1], (rpcCounts.get(m[1]) ?? 0) + 1);
-      }
-    }
-    for (const event of events) {
-      if (event.type !== 'agent/inbox/spliced') continue;
-      const inserted = Array.isArray(event.data?.inserted) ? event.data.inserted : [];
-      if (inserted.length === 0) continue;
-      const orphan = inserted.every((ins) => {
-        const id = ins?.source?.rpcId;
-        return typeof id === 'string' && (rpcCounts.get(id) ?? 0) <= 1;
-      });
-      if (orphan) remove.add(event.seq);
-    }
-  }
   return { remove: [...remove].sort((a, b) => a - b), turns: [...turnSet].sort((a, b) => a - b), skipped };
 }
 
@@ -129,6 +149,21 @@ export function purgeSessionFile(file, sid, options = {}) {
   if (!v.ok) {
     out.status = 'skipped';
     out.problems = (v.problems ?? []).slice(0, 6).map(String);
+    return out;
+  }
+  /* 护栏一：inbox splice 是顺序状态机，进删除集就拒绝（它会连带打乱后续 splice）。 */
+  const spliceSeqs = inboxSpliceSeqs(events);
+  const spliceHit = plan.remove.filter((s) => spliceSeqs.includes(s));
+  if (spliceHit.length > 0) {
+    out.status = 'skipped';
+    out.notes.push('refused: 删除集会命中 agent/inbox/spliced ' + JSON.stringify(spliceHit) + '（顺序状态机，删中间一条会让后续 splice 错位 → 宿主报 invalid persisted inbox splice）');
+    return out;
+  }
+  /* 护栏二：切除后的结果必须能通过 inbox 状态机重放，否则拒绝写盘。 */
+  const inbox = checkInboxSplices(result.events);
+  if (inbox.problems.length > 0) {
+    out.status = 'skipped';
+    out.notes.push('refused: 切除后 inbox 状态机不通过 ' + JSON.stringify(inbox.problems[0]));
     return out;
   }
   out.status = 'planned';

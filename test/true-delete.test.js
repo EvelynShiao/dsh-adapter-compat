@@ -12,7 +12,7 @@ import {
   TRUE_DELETE_BACKUP_DIR,
   TRUE_DELETE_PENDING_FILE,
 } from '../index.js'
-import { classifyTombstoneCarrier, planPurge, purgeSessionFile, readPendingLedger } from '../purge.js'
+import { classifyTombstoneCarrier, planPurge, purgeSessionFile, readPendingLedger, checkInboxSplices, inboxSpliceSeqs } from '../purge.js'
 import { readSession } from '../true-delete.js'
 
 /** 真实素材（只读）：DeepSeek(1)，含 turn 595/596 两条真删除墓碑。 */
@@ -155,14 +155,44 @@ test('listSessionFiles：扫出 <home>/sessions/<ws>/<sid>/session.v4.jsonl.zstd
   }
 })
 
-test('installTrueDelete：config.trueDelete=false 完全不装', () => {
+test('installTrueDelete：默认关闭，写盘必须显式 config.trueDelete:true', () => {
   const ctx = { get: () => undefined }
+  assert.equal(installTrueDelete(ctx, {}), undefined, '默认不装——本层会重写会话文件，必须显式开启')
   assert.equal(installTrueDelete(ctx, { trueDelete: false }), undefined)
-  const ok = installTrueDelete(ctx, {})
+  const ok = installTrueDelete(ctx, { trueDelete: true })
   assert.ok(ok?.run)
-  for (const t of ok.timers) {
-    if (typeof t === 'object' && typeof t[Symbol.toPrimitive] === 'function') clearTimeout(t)
-    else clearTimeout(t)
-    clearInterval(t)
-  }
+  for (const t of ok.timers) clearInterval(t)
+})
+
+test('checkInboxSplices：合法链通过；抽掉中间一条 splice 立刻不通过', () => {
+  const mk = (seq, target, start, removedCount, ids) => ({
+    type: 'agent/inbox/spliced', seq, data: { target, start, removedCount, inserted: ids.map((id) => ({ id })) },
+  })
+  // 追加式链：第 3 条要求队列长度 >= 2，抽掉中间那条就会越界
+  const chain = [
+    mk(1, 'next-turn', 0, 0, ['a']),
+    mk(2, 'next-turn', 1, 0, ['b']),
+    mk(3, 'next-turn', 0, 2, ['c']),
+  ]
+  assert.equal(checkInboxSplices(chain).problems.length, 0)
+  assert.deepEqual(checkInboxSplices(chain).final['next-turn'].map((m) => m.id), ['c'])
+  // 抽掉中间那条 → 后续 removedCount 越界（这正是宿主报
+  // invalid persisted inbox splice 的成因）
+  const broken = [chain[0], chain[2]]
+  const bad = checkInboxSplices(broken)
+  assert.equal(bad.problems.length, 1)
+  assert.match(bad.problems[0].reason, /越界|pending/)
+  // 重复 id 也要被抓到
+  const dup = [mk(1, 'next-turn', 0, 0, ['a']), mk(2, 'next-step', 0, 0, ['a'])]
+  assert.equal(checkInboxSplices(dup).problems.length, 1)
+})
+
+test('inboxSpliceSeqs：列出全部 spliced 的 seq（护栏一的判定输入）', () => {
+  const events = [
+    { type: 'user/message', seq: 0, data: {} },
+    { type: 'agent/inbox/spliced', seq: 1, data: {} },
+    { type: 'turn/start', seq: 2, data: {} },
+    { type: 'agent/inbox/spliced', seq: 3, data: {} },
+  ]
+  assert.deepEqual(inboxSpliceSeqs(events), [1, 3])
 })
