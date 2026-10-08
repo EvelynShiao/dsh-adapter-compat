@@ -900,6 +900,11 @@ export async function purgeTombstones(ctx, options = {}) {
   const write = options.write === true
   const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR
   const ledger = readPendingLedger(home)
+  /* 审计用：扫描前记下每个会话的事件数，收尾时对账。
+     对不上的（没被本插件写过却变了）= 外部改动（同步下载 / 别的插件 / 手工拷贝），
+     记一行日志，避免再出现"莫名其妙就好了/坏了"。 */
+  const seenBefore = Object.assign({}, ledger.seen)
+  const writtenIds = new Set()
   /* 只清「上一次扫描之后新增的」墓碑；首次运行把窗口起点设成现在，
      于是历史墓碑（很久以前删的）永远不会被动到。 */
   const sinceMs = Number.isFinite(options.sinceMs)
@@ -914,6 +919,7 @@ export async function purgeTombstones(ctx, options = {}) {
          内存与文件保持对齐。assistant 回复与思考过程等非 live 时再由 excise 彻底拔。 */
       const red = redactSessionFile(entry.file, entry.id, { sinceMs, write, backupDir })
       if (red.status === 'redacted') {
+        writtenIds.add(entry.id)
         delete ledger.pending[entry.id]
         try { rmSync(home + '/storages/session_projcache/sessions/' + entry.id + '.json', { force: true }) } catch { /* ignore */ }
         results.push(red)
@@ -925,6 +931,7 @@ export async function purgeTombstones(ctx, options = {}) {
     }
     const r = purgeSessionFile(entry.file, entry.id, { write, backupDir, sinceMs })
     if (r.status === 'written') {
+      writtenIds.add(entry.id)
       delete ledger.pending[entry.id]
       try { rmSync(home + '/storages/session_projcache/sessions/' + entry.id + '.json', { force: true }) } catch { /* ignore */ }
     } else if (r.status === 'planned') {
@@ -935,6 +942,22 @@ export async function purgeTombstones(ctx, options = {}) {
       try { options.onResult(r) } catch { /* ignore */ }
     }
   }
+  /* 外部改动审计：把当前事件数与扫描前对比。 */
+  try {
+    const seen = {}
+    const changed = []
+    for (const info of listSessionFiles(home)) {
+      let count = -1
+      try { count = readSession(info.file).events.length } catch { count = -1 }
+      seen[info.id] = count
+      const before = seenBefore[info.id]
+      if (typeof before === 'number' && before >= 0 && count >= 0 && before !== count && !writtenIds.has(info.id)) {
+        changed.push(info.id.slice(0, 18) + '(' + before + '->' + count + ')')
+      }
+    }
+    ledger.seen = seen
+    if (changed.length > 0) appendCompatLog('external-change detected: ' + changed.join(' '), home)
+  } catch { /* 审计失败不影响清理 */ }
   ledger.lastScanMs = Date.now()
   if (write) writePendingLedger(home, ledger)
   return { write, results, pending: Object.keys(ledger.pending).length, sinceMs }
