@@ -374,6 +374,41 @@ export const RESIDUE_TYPES = new Set(['assistant/attempt', 'llm/retry', 'llm/ret
  *   - tool/result 的 content/result/output、以及各种 data.text
  * 保留 type/seq/time/surfaceOp/sourceEventSeqs —— 结构不变，才能安全写回。
  */
+/**
+ * 擦掉内嵌提供方流里的文本。**这是关键**：assistant/message 的推理与正文实际存放在
+ * data.stream[i].texts[]（紧凑 chunk 流）里，只清 data.message.content 根本没用——
+ * 实测 Timeline 残留就是从这儿来的。只把字符串置空、数组长度与 dt/chunk 结构不动，
+ * 保证宿主仍能解析。
+ */
+/** 文本类字段名（不管嵌套多深、容器是数组还是对象，都按这些 key 擦）。 */
+export const TEXT_KEYS = new Set(['text', 'texts', 'delta', 'deltas', 'reasoning', 'reasoning_content', 'reasoningContent', 'thinking'])
+
+/**
+ * 按 key 名递归擦文本。**这是关键**：assistant/message 的推理与正文实际存放在
+ * data.stream[i].texts（对象，数值键）里，只清 data.message.content 根本没用——
+ * 实测 Timeline 残留就是从这儿来的。只把字符串置空，结构（键、数组长度、dt）不动，
+ * 保证宿主仍能解析；不碰 id/role/kind/type 这类结构性字符串。
+ */
+export function scrubDeep(node, depth = 0) {
+  if (depth > 14 || node === null || typeof node !== 'object') return node
+  for (const key of Object.keys(node)) {
+    const value = node[key]
+    if (TEXT_KEYS.has(key)) {
+      if (typeof value === 'string') node[key] = ''
+      else if (Array.isArray(value)) node[key] = value.map((x) => (typeof x === 'string' ? '' : x))
+      else if (value && typeof value === 'object') {
+        for (const inner of Object.keys(value)) if (typeof value[inner] === 'string') value[inner] = ''
+      }
+      continue
+    }
+    if (value && typeof value === 'object') scrubDeep(value, depth + 1)
+  }
+  return node
+}
+
+export function scrubStream(stream) {
+  return scrubDeep({ stream })
+}
 export function redactEventPayload(event) {
   if (!event || typeof event !== 'object' || !event.data || typeof event.data !== 'object') return event
   if (RESIDUE_TYPES.has(event.type)) {
@@ -396,6 +431,11 @@ export function redactEventPayload(event) {
   if (typeof data.result === 'string') data.result = ''
   if (data.output && typeof data.output === 'object') data.output = {}
   if (typeof data.output === 'string') data.output = ''
+  /* 关键补充：按 key 名深度擦（内嵌提供方流 data.stream.*.texts 就在里面） */
+  scrubDeep(data)
+  if (typeof data.reasoning === 'string') data.reasoning = ''
+  if (typeof data.reasoningContent === 'string') data.reasoningContent = ''
+  if (typeof data.thinking === 'string') data.thinking = ''
   return { ...event, data }
 }
 
