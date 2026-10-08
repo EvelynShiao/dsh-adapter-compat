@@ -840,6 +840,14 @@ export function apply(ctx, config = {}) {
       const projections = ctx.sessionProjections ?? ctx.get?.('sessionProjections')
       const patchedNow = calibrateContextPressure(projections)
       if (patchedNow > 0) {
+        /* 落盘铁证：既报装了几个投影单元，也报一次算术自证。
+           合成状态 pressure=200000 / surface=150000 / sampled=100000（倍率 2）：
+           官方公式给 200000+50000=250000，校准后应为 300000。 */
+        const probe = calibratePressureView(
+          { pressureTokens: 200000, surfaceTokens: 150000, sampledSurfaceTokens: 100000 },
+          { pressureTokens: 200000, projectedTokens: 250000 },
+        )
+        appendCompatLog(`contextPressure calibrated units=${patchedNow} probeProjected=${String(probe?.projectedTokens)}`)
         ctx.logger?.info?.(`[adapter-compat] contextPressure calibrated: units=${patchedNow}`)
       }
     } catch {
