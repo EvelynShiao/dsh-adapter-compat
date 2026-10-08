@@ -80,6 +80,7 @@ export const name = 'adapter-compat'
 
 import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, watch } from 'node:fs'
 import { purgeSessionFile, readPendingLedger, writePendingLedger } from './purge.js'
+import { redactSessionFile } from './purge.js'
 
 export const inject = ['llm']
 
@@ -908,11 +909,17 @@ export async function purgeTombstones(ctx, options = {}) {
   for (const entry of listSessionFiles(home)) {
     if (options.only !== undefined && options.only !== entry.id) continue
     if (isSessionLive(ctx, entry.id)) {
-      // live：只干跑判定是否**有**墓碑，有就记台账供开机补清
-      const dry = purgeSessionFile(entry.file, entry.id, { sinceMs })
-      if (dry.status === 'planned') {
-        ledger.pending[entry.id] = { turns: dry.turns, removed: dry.removed, at: new Date().toISOString(), why: 'live' }
-        results.push({ ...dry, status: 'live-skipped' })
+      /* live 会话不能整轮切除（内存事件数组会与文件错位），改走**就地擦文本**：
+         清掉被删轮次里用户自己的消息正文，Timeline 立刻不再显示；seq/事件数不变，
+         内存与文件保持对齐。assistant 回复与思考过程等非 live 时再由 excise 彻底拔。 */
+      const red = redactSessionFile(entry.file, entry.id, { sinceMs, write, backupDir })
+      if (red.status === 'redacted') {
+        delete ledger.pending[entry.id]
+        try { rmSync(home + '/storages/session_projcache/sessions/' + entry.id + '.json', { force: true }) } catch { /* ignore */ }
+        results.push(red)
+      } else if (red.status === 'planned' || red.status === 'skipped') {
+        ledger.pending[entry.id] = { removed: red.removed, at: new Date().toISOString(), why: 'live', note: red.notes[0] }
+        results.push({ ...red, status: 'live-skipped' })
       }
       continue
     }
@@ -939,6 +946,7 @@ export function installTrueDelete(ctx, config = {}) {
   const home = dshHomeDir()
   const summarise = (tag, r) => {
     const written = r.results.filter((x) => x.status === 'written')
+    const redacted = r.results.filter((x) => x.status === 'redacted')
     const liveSkipped = r.results.filter((x) => x.status === 'live-skipped')
     const failed = r.results.filter((x) => x.status === 'failed')
     if (written.length === 0 && liveSkipped.length === 0 && failed.length === 0) return

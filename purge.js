@@ -357,6 +357,47 @@ export function purgeSessionFile(file, sid, options = {}) {
 }
 
 /** 待清理台账：记录「有墓碑但当时是 live（不能动文件）」的会话，供下次开机补清。 */
+/**
+ * 就地擦文本（live 会话专用，绝不改 seq 与事件数）：
+ * 把被删轮次的 user/message 正文清空（空 content 与墓碑载体同款，保证宿主能加载）。
+ * 只擦「用户自己发的文本」——这是 Timeline 里最刺眼的残留；assistant 回复与思考过程
+ * 需要整轮物理切除（非 live 时走 excise 那条路）才能彻底拔掉。
+ */
+export function redactEventsText(events, removeSeqs) {
+  const doomed = new Set(removeSeqs);
+  return events.map((event) => {
+    if (!doomed.has(event.seq)) return event;
+    if (event.type !== 'user/message') return event;
+    const clone = structuredClone(event);
+    if (Array.isArray(clone.data?.content)) clone.data.content = [];
+    return clone;
+  });
+}
+
+/** 对单个会话文件做就地擦文本（可选写盘，带备份 + 读回复核）。 */
+export function redactSessionFile(file, sid, options = {}) {
+  const out = { sid, status: 'clean', removed: 0, verify: false, notes: [] };
+  let doc;
+  try { doc = readSession(file) } catch (error) { out.status = 'failed'; out.notes.push(String(error?.message ?? error).slice(0, 120)); return out; }
+  const plan = planPurge(doc.events, { sinceMs: options.sinceMs });
+  if (plan.remove.length === 0) return out;
+  const redacted = redactEventsText(doc.events, plan.remove);
+  const v = verify(doc.header, redacted);
+  out.removed = plan.remove.length;
+  if (!v.ok) { out.status = 'skipped'; out.notes.push('redact 后 verify 不过，不动文件：' + JSON.stringify((v.problems ?? []).slice(0, 2))); return out; }
+  if (options.write !== true) { out.status = 'planned'; out.verify = true; return out; }
+  try {
+    if (options.backupDir) { mkdirSync(options.backupDir, { recursive: true }); copyFileSync(file, join(options.backupDir, sid + '.redact.zstd')); }
+    writeSession(file, doc.header, redacted);
+    const back = readSession(file);
+    const v2 = verify(back.header, back.events);
+    out.verify = v2.ok === true;
+    out.status = v2.ok === true ? 'redacted' : 'failed';
+    out.after = back.events.length;
+  } catch (error) { out.status = 'failed'; out.notes.push('write: ' + String(error?.message ?? error).slice(0, 160)); }
+  return out;
+}
+
 export function readPendingLedger(home) {
   try {
     const j = JSON.parse(readFileSync(join(home, 'dsh-true-delete-pending.json'), 'utf8'));
