@@ -78,7 +78,8 @@
 
 export const name = 'adapter-compat'
 
-import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, watch } from 'node:fs'
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs'
+import { zstdCompressSync, constants as zstdConstants, zstdDecompressSync } from 'node:zlib'
 import { purgeSessionFile, readPendingLedger, writePendingLedger } from './purge.js'
 import { redactSessionFile } from './purge.js'
 
@@ -1002,7 +1003,203 @@ export function installTrueDelete(ctx, config = {}) {
   return { run, timers }
 }
 
+/* ============ 第七层：会话改工作区（move-session） ===========
+ *
+ * 诉求：把一条会话从当前工作区挪到另一个工作区（例如把抢救来的对话搬回 Evelyn）。
+ * 会话的可见性由三处联动决定，缺一不可：
+ *   1. 文件目录名 = projectKey(header.cwd)（宿主编码：非 ASCII→~XXXX、':'剔除、'\'→'-'）；
+ *   2. header.cwd 指向目标工作区路径；
+ *   3. workspace.json 注册表把 id 放进目标工作区的 sessionIds。
+ * 缺任何一处 = 会话在列表里凭空消失或出现在错误位置。
+ *
+ * 流程：活体守卫（live 拒动，防内存/文件错位）→ 改头帧 cwd（体帧原字节）→
+ * 写入目标目录并读回校验 → 注册表迁移（备份 workspace.json）→ 删旧目录 →
+ * 废弃投影（cwd 身份变化必须冷重建）→ sessions.refresh() 通知列表。
+ *
+ * 路由：POST /dsh-adapter-compat/move-session  {sessionId, target:<工作区标题>}
+ * 关掉：config.moveSession === false。
+ */
+
+/** 宿主 projectKey 编码（与 dsh-session-persistence-jsonl 逐字符对齐）。 */
+export function projectKeyOf(workspacePath) {
+  let out = ''
+  for (const ch of String(workspacePath)) {
+    const c = ch.codePointAt(0)
+    if (c > 127) out += '~' + c.toString(16).toUpperCase().padStart(4, '0')
+    else if (ch === '\\') out += '-'
+    else if (ch === ':') continue
+    else out += ch
+  }
+  return out
+}
+
+/** 帧扫描（zstd magic）。 */
+function scanFramesZstd(buf) {
+  const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+  const idx = []
+  let i = -1
+  while ((i = buf.indexOf(magic, i + 1)) !== -1) idx.push(i)
+  idx.push(buf.length)
+  return idx
+}
+
+/**
+ * 把一条会话挪到目标工作区（纯函数式主体，可独立测试）。
+ * @param {object} options - {sessionId, targetTitle, home, workspaces（注册表数组快照）}
+ *   workspaces: [{title, path, sessionIds}] 由调用方提供（读写 workspace.json 也在调用方），
+ *   便于测试注入。返回 {from, to, file, newFile}，由调用方做注册表迁移与清理。
+ * @returns {{fromTitle, toTitle, targetPath, targetDir, file, newFile, header}}
+ */
+export function planMoveSession(options) {
+  const { sessionId, targetTitle, home = dshHomeDir(), workspaces } = options || {}
+  if (typeof sessionId !== 'string' || !sessionId.startsWith('session-')) throw new Error('invalid-session-id')
+  const target = (workspaces || []).find((w) => w?.title === targetTitle)
+  if (!target) throw new Error(`target workspace not found: ${targetTitle}`)
+  const from = (workspaces || []).find((w) => Array.isArray(w?.sessionIds) && w.sessionIds.includes(sessionId))
+  const located = listSessionFiles(home).find((x) => x.id === sessionId)
+  if (!located) throw new Error('session file not found')
+  const b = readFileSync(located.file)
+  const idx = scanFramesZstd(b)
+  if (idx.length < 2) throw new Error('session log has no complete frame')
+  const header = JSON.parse(zstdDecompressSync(b.subarray(0, idx[1])).toString('utf8'))
+  if (header.id !== sessionId) throw new Error('header id mismatch')
+  const targetPath = target.path
+  const key = projectKeyOf(targetPath)
+  const targetDir = `${home}/sessions/${key}/${sessionId}`
+  const newFile = `${targetDir}/session.v4.jsonl.zstd`
+  // 重写头帧（体帧原字节保留，cwd 是唯一变化）
+  header.cwd = targetPath
+  const newHeader = zstdCompressSync(Buffer.from(JSON.stringify(header) + '\n', 'utf8'), {
+    params: { [zstdConstants.ZSTD_c_checksumFlag]: 1 },
+  })
+  const movedBuf = Buffer.concat([newHeader, b.subarray(idx[1])])
+  return {
+    fromTitle: from?.title ?? '(未注册)',
+    toTitle: target.title,
+    targetPath,
+    targetDir,
+    file: located.file,
+    movedBuf,
+    header,
+  }
+}
+
+/**
+ * 执行搬家：文件 → 注册表 → 清理（全部成功才返回 ok）。
+ * @param {object} ctx - cordis 上下文。
+ * @param {object} options - {sessionId, targetTitle, home}
+ */
+export async function moveSessionToWorkspace(ctx, options = {}) {
+  const home = options.home ?? dshHomeDir()
+  const { sessionId, targetTitle } = options
+  const wsPath = `${home}/storages/workspace.json`
+  if (!existsSync(wsPath)) throw new Error('workspace.json not found')
+  // 活体守卫：live 会话挪家会让内存 cwd/文件路径错位
+  if (isSessionLive(ctx, sessionId)) throw Object.assign(new Error('session is live'), { code: 'SESSION_LIVE' })
+  const doc = JSON.parse(readFileSync(wsPath, 'utf8'))
+  const workspaces = Object.values(doc?.tables?.workspaces ?? {})
+  const plan = planMoveSession({ sessionId, targetTitle, home, workspaces })
+  plan.srcDir = plan.file.replace(/\/session\.v4\.jsonl\.zstd$/, '')
+  plan.sameDir = plan.srcDir === plan.targetDir
+  return await finishMove(ctx, { plan, doc, wsPath, sessionId, home })
+}
+
+/** 实际写盘 + 注册表迁移 + 清理。 */
+async function finishMove(ctx, { plan, doc, wsPath, sessionId, home }) {
+  // 1) 写目标（同目录=已在目标，跳过文件动作，只对齐注册表）
+  if (!plan.sameDir) {
+    try { rmSync(plan.targetDir, { recursive: true, force: true }) } catch { /* ignore */ }
+    mkdirSync(plan.targetDir, { recursive: true })
+    writeFileSync(`${plan.targetDir}/session.v4.jsonl.zstd`, plan.movedBuf)
+    const back = readFileSync(`${plan.targetDir}/session.v4.jsonl.zstd`)
+    const bidx = scanFramesZstd(back)
+    if (bidx.length < 2) throw new Error('verify failed: no frame')
+    const hdr2 = JSON.parse(zstdDecompressSync(back.subarray(0, bidx[1])).toString('utf8'))
+    if (hdr2.id !== sessionId || hdr2.cwd !== plan.targetPath) {
+      try { rmSync(plan.targetDir, { recursive: true, force: true }) } catch { /* ignore */ }
+      throw new Error('verify failed after write')
+    }
+  }
+  // 2) 注册表迁移（带备份）
+  copyFileSync(wsPath, `${wsPath}.bak-move`)
+  let from = plan.fromTitle
+  for (const w of Object.values(doc.tables.workspaces)) {
+    if (Array.isArray(w.sessionIds) && w.sessionIds.includes(sessionId)) {
+      w.sessionIds = w.sessionIds.filter((x) => x !== sessionId)
+      from = w.title
+    }
+  }
+  const target = Object.values(doc.tables.workspaces).find((w) => w.title === plan.toTitle)
+  if (!target) throw new Error('target workspace vanished')
+  if (!target.sessionIds.includes(sessionId)) target.sessionIds.unshift(sessionId)
+  target.updatedAt = new Date().toISOString()
+  writeFileSync(wsPath, JSON.stringify(doc, null, 2))
+  // 3) 删旧目录（仅当确实跨目录）
+  if (!plan.sameDir) {
+    try { rmSync(plan.srcDir, { recursive: true, force: true }) } catch { /* 源删失败不致命：注册表已迁，最多留孤目录 */ }
+  }
+  // 4) 废弃投影（cwd 身份变化必须冷重建）
+  try { rmSync(`${home}/storages/session_projcache/sessions/${sessionId}.json`, { force: true }) } catch { /* ignore */ }
+  // 5) 通知列表
+  let refreshed = false
+  try {
+    const sessions = serviceOf(ctx, 'sessions')
+    if (typeof sessions?.refresh === 'function') { await sessions.refresh(); refreshed = true }
+  } catch { /* 列表刷新失败：文件与注册表已就位 */ }
+  appendCompatLog(`move-session ${sessionId.slice(0, 18)}: ${from} -> ${plan.toTitle} (sameDir=${plan.sameDir}, refreshed=${refreshed})`)
+  return { ok: true, from, to: plan.toTitle, sameDir: plan.sameDir, refreshed }
+}
+
+/** 注册 move 路由（POST JSON）。 */
+export function installMoveRoute(ctx, config = {}) {
+  if (config?.moveSession === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') return false
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/move-session',
+      handler: async (req, res) => {
+        const reply = (status, obj) => {
+          try {
+            res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+            res.end(JSON.stringify(obj))
+          } catch { /* ignore */ }
+        }
+        if (req.method !== 'POST') return reply(405, { ok: false, error: 'method-not-allowed' })
+        let body = ''
+        try {
+          for await (const chunk of req) {
+            body += chunk
+            if (body.length > 65536) throw new Error('body too large')
+          }
+          const parsed = JSON.parse(body || '{}')
+          const result = await moveSessionToWorkspace(ctx, parsed)
+          appendCompatLog(`move-session route ok: ${JSON.stringify(result).slice(0, 200)}`)
+          return reply(200, result)
+        } catch (error) {
+          const msg = String(error?.message ?? error)
+          const code = error?.code === 'SESSION_LIVE' ? 409 : /not found/i.test(msg) ? 404 : 400
+          appendCompatLog(`move-session route FAILED(${code}): ${msg.slice(0, 200)}`)
+          return reply(code, { ok: false, error: msg })
+        }
+      },
+    })
+    appendCompatLog('move-session route registered')
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function apply(ctx, config = {}) {
+  // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
+  try {
+    installMoveRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
   // -1) 会话盘监视 + 标题投影预热（不依赖 llm，必须排在 llm 早退之前）
   try {
     installTitleWarm(ctx, config)
