@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -12,7 +12,8 @@ import {
   installSessionWatch,
   installTitleWarm,
   SESSION_WATCH,
-  SESSION_WATCH_INTERVAL_MS,
+  SESSION_POLL_INTERVAL_MS,
+  SESSION_WATCH_DEBOUNCE_MS,
   TITLE_WARM_MAX_PER_PASS,
 } from '../index.js'
 
@@ -212,11 +213,11 @@ test('installSessionWatch：指纹变化后触发 refresh + 预热，且幂等�
   const refreshCalls = []
   const ctx = fakeCtx({ home, coldCalls, refreshCalls })
   try {
-    const state = installSessionWatch(ctx, { home, intervalMs: 20 })
+    const state = installSessionWatch(ctx, { home, intervalMs: 20, debounceMs: 20 })
     assert.ok(state[SESSION_WATCH])
     assert.equal(ctx.__adapterCompatSessionWatch, state)
     // 幂等：二次调用返回同一 state
-    assert.equal(installSessionWatch(ctx, { home, intervalMs: 20 }), state)
+    assert.equal(installSessionWatch(ctx, { home, intervalMs: 20, debounceMs: 20 }), state)
     // 制造一次"外部落盘"
     mkdirSync(join(home, 'sessions', '--ws--', 'session-b'), { recursive: true })
     writeFileSync(join(home, 'sessions', '--ws--', 'session-b', 'session.v4.jsonl.zstd'), Buffer.from('z'))
@@ -243,6 +244,53 @@ test('installTitleWarm：config.titleWarm:false 时完全不装', () => {
 })
 
 test('常量与默认值稳定', () => {
-  assert.equal(SESSION_WATCH_INTERVAL_MS, 5000)
+  assert.equal(SESSION_POLL_INTERVAL_MS, 60000) // 主路径是 fs.watch，轮询只兜底
+  assert.equal(SESSION_WATCH_DEBOUNCE_MS, 1500)
   assert.equal(TITLE_WARM_MAX_PER_PASS, 200)
+})
+
+test('rescanAndWarm：先 warm 再 refresh（顺序不能反，否则列表刷到旧标题）', async () => {
+  const home = fakeHome({ sessions: [['--ws--', 'session-a']] })
+  const order = []
+  const ctx = {
+    get(name) {
+      if (name === 'sessionProjectionCache') {
+        return {
+          coldSnapshot: () => {
+            order.push('warm')
+            mkdirSync(join(home, 'storages', 'session_projcache', 'sessions'), { recursive: true })
+            writeFileSync(
+              join(home, 'storages', 'session_projcache', 'sessions', 'session-a.json'),
+              JSON.stringify({ version: 1, record: { rows: { title: { ver: 1, seq: 1, val: 'T' } } } }),
+            )
+          },
+        }
+      }
+      if (name === 'sessionPersistence') {
+        return {
+          async list() { return [{ header: { id: 'session-a' } }] },
+          async open() { return { read: async () => ({ events: [{ type: 'session/title' }] }), close: async () => {} } },
+        }
+      }
+      if (name === 'sessions') {
+        return {
+          async refresh() {
+            order.push('refresh')
+            // refresh 时标题必须已经在缓存里
+            assert.ok(existsSync(join(home, 'storages', 'session_projcache', 'sessions', 'session-a.json')))
+          },
+        }
+      }
+      return undefined
+    },
+  }
+  try {
+    const rescanAndWarm = (await import('../index.js')).rescanAndWarm
+    const result = await rescanAndWarm(ctx, { home })
+    assert.deepEqual(order, ['warm', 'refresh'])
+    assert.equal(result.warmed.rebuilt, 1)
+    assert.equal(result.refreshed, true)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
 })

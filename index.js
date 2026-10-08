@@ -78,7 +78,7 @@
 
 export const name = 'adapter-compat'
 
-import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, watch } from 'node:fs'
 
 export const inject = ['llm']
 
@@ -485,12 +485,14 @@ export function calibrateContextPressure(projections) {
  *   实测（2026-10-08）：磁盘 95 个会话，projcache 只剩 39 条。
  *
  * 修法：把预热从一次性改成事件驱动——
- *   1. 每 5 秒对 $DSH_HOME/sessions 做廉价指纹（会话文件数 + 最新 mtime）；
- *   2. 指纹变化且连续两轮稳定 → 判定一次外部落盘（下载/手机同步/手工拷入），
- *      随即 sessions.refresh() 强制重扫列表 + 全盘补齐 projcache；
- *   3. 补齐来源是**磁盘扫描**而不是工作区注册表：注册表可能还没收录刚下载的
- *      会话，只信它会漏掉它们（这正是旧实现只补到一部分的原因）；
- *   4. 顺带修「记录在但标题为空」的会话（repairUntitled，默认开，有配额上限）。
+ *   1. 递归 fs.watch 监听 $DSH_HOME/sessions（Windows 走 ReadDirectoryChangesW，
+ *      事件驱动、几乎零成本），事件后延迟 1.5 秒复核一次指纹，确认落盘已稳定；
+ *   2. 另加 60 秒慢轮询兜底，防止 watch 漏事件；
+ *   3. 稳定后：先按**磁盘扫描**全盘补齐 projcache，再 sessions.refresh() 让列表
+ *      重读——顺序不能反，先刷新会把「还没标题」的状态刷进列表；
+ *   4. 补齐来源是磁盘扫描而不是工作区注册表：注册表可能还没收录刚下载的会话，
+ *      只信它会漏掉它们（这正是旧实现只补到一部分的原因）；
+ *   5. 顺带修「记录在但标题为空」的会话（repairUntitled，默认开，有配额上限）。
  *
  * 全程 fail-soft：任何一步失败只写日志，绝不影响 DSH 本体。
  * 落盘日志：$DSH_HOME/dsh-adapter-compat.log。关掉：config.titleWarm: false。
@@ -498,8 +500,10 @@ export function calibrateContextPressure(projections) {
 
 /** 关闭本层的 config 键。 */
 export const TITLE_WARM_DISABLED_KEY = 'titleWarm'
-/** 指纹轮询间隔（ms）。 */
-export const SESSION_WATCH_INTERVAL_MS = 5000
+/** 慢轮询兜底间隔（ms）。主路径是递归 fs.watch，事件驱动、几乎零成本。 */
+export const SESSION_POLL_INTERVAL_MS = 60000
+/** 检测到变化后，再等多久复核一次才算稳定（避开同步写到一半）。 */
+export const SESSION_WATCH_DEBOUNCE_MS = 1500
 /** 每轮最多重建多少条（防止一次下载后长时间占满 I/O）。 */
 export const TITLE_WARM_MAX_PER_PASS = 200
 /** 会话监视标记。 */
@@ -687,9 +691,11 @@ export async function warmProjectionTitles(ctx, options = {}) {
   return stats
 }
 
-/** 一次「外部落盘」响应：强制重扫列表 + 全盘补标题投影。 */
+/** 一次「外部落盘」响应：先全盘补标题投影，再让列表重读。
+ *  顺序很关键——先 refresh 会把「还没有标题」的状态刷进列表，等于白刷。 */
 export async function rescanAndWarm(ctx, options = {}) {
   const result = { refreshed: false, warmed: null }
+  result.warmed = await warmProjectionTitles(ctx, options)
   try {
     const sessions = serviceOf(ctx, 'sessions')
     if (typeof sessions?.refresh === 'function') {
@@ -699,8 +705,6 @@ export async function rescanAndWarm(ctx, options = {}) {
   } catch (error) {
     appendCompatLog(`rescan refresh FAILED: ${String(error?.message ?? error).slice(0, 160)}`)
   }
-  // refresh 之后 registry 才可能收录新会话，故 warm 放在后面
-  result.warmed = await warmProjectionTitles(ctx, options)
   return result
 }
 
@@ -712,9 +716,21 @@ export function installSessionWatch(ctx, options = {}) {
   } catch {
     /* ctx 不可读则继续安装 */
   }
-  const intervalMs = Number.isFinite(options.intervalMs) ? options.intervalMs : SESSION_WATCH_INTERVAL_MS
-  const state = { last: sessionsFingerprint(home).key, pending: null, busy: false }
-  const tick = () => {
+  const pollMs = Number.isFinite(options.pollIntervalMs)
+    ? options.pollIntervalMs
+    : (Number.isFinite(options.intervalMs) ? options.intervalMs : SESSION_POLL_INTERVAL_MS)
+  const debounceMs = Number.isFinite(options.debounceMs) ? options.debounceMs : SESSION_WATCH_DEBOUNCE_MS
+  const state = { last: sessionsFingerprint(home).key, pendingKey: null, busy: false, timer: null, watcher: null }
+  let check
+  const schedule = (delay) => {
+    if (state.timer !== null) return
+    state.timer = setTimeout(() => {
+      state.timer = null
+      check()
+    }, delay)
+    if (typeof state.timer.unref === 'function') state.timer.unref()
+  }
+  check = () => {
     if (state.busy) return
     let key
     try {
@@ -722,16 +738,21 @@ export function installSessionWatch(ctx, options = {}) {
     } catch {
       return
     }
-    if (key === state.last) return
-    // 变化出现后先记下，等下一轮仍是这个值再动手——避免下载写到一半就预热
-    if (state.pending !== key) {
-      state.pending = key
+    if (key === state.last) {
+      state.pendingKey = null
       return
     }
-    state.pending = null
+    // 第一次看到变化 → 只记下并延后再核一次（避开下载写到一半）
+    if (key !== state.pendingKey) {
+      state.pendingKey = key
+      schedule(debounceMs)
+      return
+    }
+    // 稳定了：动手。先 warm 后 refresh（顺序不能反，见 rescanAndWarm 注释）
+    state.pendingKey = null
     state.last = key
     state.busy = true
-    appendCompatLog(`sessions changed (${key}) -> rescan + title warm`, home)
+    appendCompatLog(`sessions changed (${key}) -> title warm + rescan`, home)
     Promise.resolve()
       .then(() => rescanAndWarm(ctx, options))
       .catch(() => {})
@@ -744,10 +765,30 @@ export function installSessionWatch(ctx, options = {}) {
         }
       })
   }
-  const timer = setInterval(tick, intervalMs)
+  // 主路径：递归 fs.watch（Windows 走 ReadDirectoryChangesW，事件驱动、几乎零成本）
+  try {
+    const watcher = watch(`${home}/sessions`, { recursive: true }, () => schedule(debounceMs))
+    if (typeof watcher.unref === 'function') watcher.unref()
+    state.watcher = watcher
+  } catch {
+    // 平台不支持递归 watch：只剩下面的慢轮询兜底
+  }
+  // 兜底：慢轮询（默认 60s），防止 watch 漏事件/权限受限
+  const timer = setInterval(check, pollMs)
   if (typeof timer.unref === 'function') timer.unref()
   state[SESSION_WATCH] = true
-  state.dispose = () => clearInterval(timer)
+  state.dispose = () => {
+    clearInterval(timer)
+    if (state.timer !== null) {
+      clearTimeout(state.timer)
+      state.timer = null
+    }
+    try {
+      state.watcher?.close()
+    } catch {
+      /* ignore */
+    }
+  }
   try {
     Object.defineProperty(ctx, '__adapterCompatSessionWatch', { value: state, configurable: true })
   } catch {
