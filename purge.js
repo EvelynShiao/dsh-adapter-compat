@@ -363,15 +363,45 @@ export function purgeSessionFile(file, sid, options = {}) {
  * 只擦「用户自己发的文本」——这是 Timeline 里最刺眼的残留；assistant 回复与思考过程
  * 需要整轮物理切除（非 live 时走 excise 那条路）才能彻底拔掉。
  */
+/** 残余事件类型：只保留定位标量，内容全擦（移植自 dsh-delete-turn，生产已验证）。 */
+export const RESIDUE_TYPES = new Set(['assistant/attempt', 'llm/retry', 'llm/retry-started'])
+
+/**
+ * 擦掉一条事件的正文（移植自 dsh-delete-turn/src/index.js 的 redactEventPayload，
+ * 那套规则在真机上跑通过）。除了 user/message，还覆盖：
+ *   - assistant/message → data.message.content = []（助手回复正文，Timeline 里的主要残留）
+ *   - assistant/attempt / llm/retry* → 只留 turn/step/retryId/attemptId/reason（思考过程就是它）
+ *   - tool/result 的 content/result/output、以及各种 data.text
+ * 保留 type/seq/time/surfaceOp/sourceEventSeqs —— 结构不变，才能安全写回。
+ */
+export function redactEventPayload(event) {
+  if (!event || typeof event !== 'object' || !event.data || typeof event.data !== 'object') return event
+  if (RESIDUE_TYPES.has(event.type)) {
+    const d = event.data
+    const keep = {}
+    for (const k of ['turn', 'step', 'retryId', 'attemptId', 'reason']) if (d[k] !== undefined) keep[k] = d[k]
+    return { ...event, data: keep }
+  }
+  const data = { ...event.data }
+  if (Array.isArray(data.content)) data.content = []
+  if (data.message && typeof data.message === 'object') {
+    const msg = { ...data.message }
+    if (Array.isArray(msg.content)) msg.content = []
+    if (typeof msg.text === 'string') msg.text = ''
+    if (typeof msg.reasoning_content === 'string') msg.reasoning_content = ''
+    if (typeof msg.reasoning === 'string') msg.reasoning = ''
+    data.message = msg
+  }
+  if (typeof data.text === 'string') data.text = ''
+  if (typeof data.result === 'string') data.result = ''
+  if (data.output && typeof data.output === 'object') data.output = {}
+  if (typeof data.output === 'string') data.output = ''
+  return { ...event, data }
+}
+
 export function redactEventsText(events, removeSeqs) {
   const doomed = new Set(removeSeqs);
-  return events.map((event) => {
-    if (!doomed.has(event.seq)) return event;
-    if (event.type !== 'user/message') return event;
-    const clone = structuredClone(event);
-    if (Array.isArray(clone.data?.content)) clone.data.content = [];
-    return clone;
-  });
+  return events.map((event) => (doomed.has(event.seq) ? redactEventPayload(structuredClone(event)) : event));
 }
 
 /** 对单个会话文件做就地擦文本（可选写盘，带备份 + 读回复核）。 */

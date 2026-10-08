@@ -949,7 +949,7 @@ export function installTrueDelete(ctx, config = {}) {
     const redacted = r.results.filter((x) => x.status === 'redacted')
     const liveSkipped = r.results.filter((x) => x.status === 'live-skipped')
     const failed = r.results.filter((x) => x.status === 'failed')
-    if (written.length === 0 && liveSkipped.length === 0 && failed.length === 0) return
+    if (written.length === 0 && redacted.length === 0 && liveSkipped.length === 0 && failed.length === 0) return
     appendCompatLog(
       'true-delete[' + tag + '] written=' + written.length + ' liveSkipped=' + liveSkipped.length
         + ' failed=' + failed.length + ' pending=' + r.pending
