@@ -89,13 +89,17 @@ export function classifyTombstoneCarrier(event) {
  * 算出一个会话要物理删除的事件 seq 集（只针对真删除墓碑）。
  * @returns {{remove:number[], turns:number[], skipped:object[]}}
  */
-export function planPurge(events) {
+export function planPurge(events, options = {}) {
+  const sinceMs = Number.isFinite(options.sinceMs) ? options.sinceMs : undefined;
   const byseq = new Map(events.map((e) => [e.seq, e]));
   const turnSet = new Set();
   const skipped = [];
   for (const e of events) {
     const c = classifyTombstoneCarrier(e);
     if (!c) continue;
+    /* 只认「刚新增的墓碑」：历史墓碑代表很久以前的删除，动它们会删掉用户
+       并不打算删的内容（实测踩过：把两年前的删除当成"刚删的"）。 */
+    if (sinceMs !== undefined && !(Number.isFinite(e.time) && e.time >= sinceMs)) continue;
     if (c.skip) { skipped.push({ seq: e.seq, why: c.why }); continue }
     if (c.needsNodeLookup) {
       for (const sq of c.sourcesFor) {
@@ -253,7 +257,7 @@ export function purgeSessionFile(file, sid, options = {}) {
   }
   const { header, events } = doc;
   out.events = events.length;
-  const plan = planPurge(events);
+  const plan = planPurge(events, { sinceMs: options.sinceMs });
   out.turns = plan.turns;
   if (plan.remove.length === 0) {
     if (plan.skipped.length > 0) out.notes.push(`skipped=${JSON.stringify(plan.skipped.slice(0, 4))}`);
@@ -324,7 +328,8 @@ export function purgeSessionFile(file, sid, options = {}) {
 export function readPendingLedger(home) {
   try {
     const j = JSON.parse(readFileSync(join(home, 'dsh-true-delete-pending.json'), 'utf8'));
-    return j && typeof j === 'object' && j.pending && typeof j.pending === 'object' ? j : { pending: {} };
+    if (!j || typeof j !== 'object' || !j.pending || typeof j.pending !== 'object') return { pending: {} };
+    return j;
   } catch {
     return { pending: {} };
   }

@@ -155,12 +155,11 @@ test('listSessionFiles：扫出 <home>/sessions/<ws>/<sid>/session.v4.jsonl.zstd
   }
 })
 
-test('installTrueDelete：默认关闭，写盘必须显式 config.trueDelete:true', () => {
+test('installTrueDelete：默认开启（靠时间窗+护栏兜底），config.trueDelete:false 可关', () => {
   const ctx = { get: () => undefined }
-  assert.equal(installTrueDelete(ctx, {}), undefined, '默认不装——本层会重写会话文件，必须显式开启')
-  assert.equal(installTrueDelete(ctx, { trueDelete: false }), undefined)
-  const ok = installTrueDelete(ctx, { trueDelete: true })
-  assert.ok(ok?.run)
+  assert.equal(installTrueDelete(ctx, { trueDelete: false }), undefined, '显式关闭')
+  const ok = installTrueDelete(ctx, {})
+  assert.ok(ok?.run, '默认应当装上')
   for (const t of ok.timers) clearInterval(t)
 })
 

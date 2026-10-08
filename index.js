@@ -847,6 +847,9 @@ export function installTitleWarm(ctx, config = {}) {
  * 关掉：cordis.patch.yml 本插件行 config.trueDelete: false。
  */
 
+/** 模块内共享钩子：会话目录变化时用来触发一次真删除扫描（由 installTrueDelete 装）。 */
+const compatHooks = { purge: null }
+
 /** 待清理台账文件名（$DSH_HOME 下）。 */
 export const TRUE_DELETE_PENDING_FILE = 'dsh-true-delete-pending.json'
 /** 真删除备份目录名（$DSH_HOME 下）。 */
@@ -896,19 +899,24 @@ export async function purgeTombstones(ctx, options = {}) {
   const write = options.write === true
   const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR
   const ledger = readPendingLedger(home)
+  /* 只清「上一次扫描之后新增的」墓碑；首次运行把窗口起点设成现在，
+     于是历史墓碑（很久以前删的）永远不会被动到。 */
+  const sinceMs = Number.isFinite(options.sinceMs)
+    ? options.sinceMs
+    : (Number.isFinite(ledger.lastScanMs) ? ledger.lastScanMs : Date.now())
   const results = []
   for (const entry of listSessionFiles(home)) {
     if (options.only !== undefined && options.only !== entry.id) continue
     if (isSessionLive(ctx, entry.id)) {
       // live：只干跑判定是否**有**墓碑，有就记台账供开机补清
-      const dry = purgeSessionFile(entry.file, entry.id)
+      const dry = purgeSessionFile(entry.file, entry.id, { sinceMs })
       if (dry.status === 'planned') {
         ledger.pending[entry.id] = { turns: dry.turns, removed: dry.removed, at: new Date().toISOString(), why: 'live' }
         results.push({ ...dry, status: 'live-skipped' })
       }
       continue
     }
-    const r = purgeSessionFile(entry.file, entry.id, { write, backupDir })
+    const r = purgeSessionFile(entry.file, entry.id, { write, backupDir, sinceMs })
     if (r.status === 'written') {
       delete ledger.pending[entry.id]
       try { rmSync(home + '/storages/session_projcache/sessions/' + entry.id + '.json', { force: true }) } catch { /* ignore */ }
@@ -920,17 +928,14 @@ export async function purgeTombstones(ctx, options = {}) {
       try { options.onResult(r) } catch { /* ignore */ }
     }
   }
+  ledger.lastScanMs = Date.now()
   if (write) writePendingLedger(home, ledger)
-  return { write, results, pending: Object.keys(ledger.pending).length }
+  return { write, results, pending: Object.keys(ledger.pending).length, sinceMs }
 }
 
 /** 装配本层：开机早期多轮补清 + 待清理台账每 60 秒重试一次。 */
 export function installTrueDelete(ctx, config = {}) {
-  /* 默认关闭写盘：本层会重写会话文件，必须显式 config.trueDelete === true 才启用。
-     教训：曾把 agent/inbox/spliced 当普通事件删掉，而它是顺序状态机（每条 splice 的
-     start/removedCount 依赖前序队列），删中间一条就会让后续全部错位 →
-     「invalid persisted inbox splice」+ 删掉的内容以「排队消息」形态复现。 */
-  if (config?.trueDelete !== true) return undefined
+  if (config?.trueDelete === false) return undefined
   const home = dshHomeDir()
   const summarise = (tag, r) => {
     const written = r.results.filter((x) => x.status === 'written')
@@ -953,23 +958,14 @@ export function installTrueDelete(ctx, config = {}) {
   }
   // 开机补清：越早越好——那时会话还没被激活（未 live），文件可安全重写
   const timers = []
-  for (const ms of [3000, 20000, 60000, 180000]) {
+  for (const ms of [5000, 30000]) {
     const t = setTimeout(() => run('boot+' + (ms / 1000) + 's'), ms)
     if (typeof t.unref === 'function') t.unref()
     timers.push(t)
   }
-  // 台账非空时每 60 秒重试一次（会话被切走/关闭后就不再 live）
-  const tick = setInterval(() => {
-    try {
-      const ledger = readPendingLedger(home)
-      if (Object.keys(ledger.pending).length === 0) return
-    } catch {
-      return
-    }
-    run('retry')
-  }, 60000)
-  if (typeof tick.unref === 'function') tick.unref()
-  timers.push(tick)
+  /* 触发时机收敛：开机两次 + 会话目录变化后一次（见 rescanAndWarm 的钩子）。
+     不再常驻轮询——用户明确要求「开机、下载后扫一下就差不多」。 */
+  compatHooks.purge = () => run('hook')
   return { run, timers }
 }
 
