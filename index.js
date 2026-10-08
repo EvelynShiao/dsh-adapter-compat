@@ -37,6 +37,26 @@
  *   恢复官方行为：cordis.patch.yml 本插件行 config 设 autoGate: false 并重启。
  *
  *   需要重启 DSH 才加载本层（插件代码在 composition 构建时读取一次）。
+ *
+ * ============ 第三层：settings null-Config 防崩守卫（9999.9.9） ===========
+ *   根因（2026-10-06/08 两度实锤）：插件加载期竞态（dsh-sync require schemastery
+ *   撞 cosmokit 动态 import）会让 module.exports.Config 停在 null，cordis 注册期
+ *   把它固化进 runtime.Config；宿主 dsh-settings 的 schema() 只判 `!== undefined`
+ *   不防 null → `('toJSON' in null)` 抛 TypeError → describe()/write() 遍历全体
+ *   插件条目时一崩全崩。三个症状同源：
+ *     ✗ 模型页「加载提供商目录失败」
+ *     ✗ 代码工作工具保存失败（write 收尾的 describe 被炸）
+ *     ✗ Agent 预设切换器不可用（developerTools 镜像读不出 → 开关视为关）
+ *
+ *   修法（只补缺不覆盖，任何已有 schema 一律不动）：
+ *     1. normalizeRuntimeConfigs：扫 cordis registry，把 Config===null 归一成
+ *        undefined —— 宿主对 undefined 的语义就是「无 Config，安全跳过该条目」；
+ *     2. guardSettingsSchema：给 settings 服务实例的 schema() 套一层，每次调用
+ *        先把该条目 runtime 的 null 归一 —— 兜住晚于本插件注册的条目
+ *        （bundles 顺序里 dsh-sync 排在本插件之后，apply 时它还没注册）；
+ *     3. 1s/3s/8s 延迟补扫双保险。
+ *   与 dsh-sync 版本完全解耦：pnpm install 把 sync-plugin 装回旧版也照样生效。
+ *   dsh-sync 自身设置面板走 writeProfileFileSync 直写兜底，不受影响。
  */
 
 export const name = 'adapter-compat'
@@ -48,6 +68,9 @@ const WRAPPED = Symbol.for('dsh-adapter-compat.wrapped')
 
 /** 自动压缩硬闸标记：挂在替换后的 compactIfNeeded 上。 */
 export const GATED = Symbol.for('dsh-adapter-compat.compaction-gate')
+
+/** settings schema 守卫标记：防止热重载后二次包装。 */
+export const SCHEMA_GUARDED = Symbol.for('dsh-adapter-compat.settings-schema-guard')
 
 /**
  * 镜像自 @deepseek-ai/dsh-llm `LlmAdapter` 基类的默认实现（lib/index.js）。
@@ -220,6 +243,100 @@ export function armGate(ctx) {
   }
 }
 
+/**
+ * 把一个 cordis runtime 上被固化为 null 的 Config 归一成 undefined。
+ * 宿主 dsh-settings 的 schema() 对 undefined 的语义 = 「无 Config，跳过该条目」；
+ * 对 null 则是 `('toJSON' in null)` 直接抛崩。只补缺：undefined/真 schema 一律不动。
+ * @returns {boolean} 本次是否实际归一。
+ */
+export function normalizeRuntime(runtime) {
+  try {
+    if (runtime && runtime.Config === null) {
+      runtime.Config = undefined
+      return true
+    }
+  } catch {
+    // 冻结/只读对象：跳过，垫片绝不能反过来弄挂宿主
+  }
+  return false
+}
+
+/**
+ * 扫全部 runtime 记录，归一 null Config。三个来源依次兜底（任一可用即可，
+ * 与宿主 describe() 访问的是同一批 fiber.runtime 对象）：
+ *   1. registry —— cordis 的 runtime 记录册（内部就用 ctx.registry.values() 遍历）；
+ *   2. configEditor.entries() —— 宿主 describe/write 的原始访问路径；
+ *   3. loader.entries()。
+ * 幂等：已归一/本就健康的条目返回不动，重复调用返回 0。
+ * @returns {number} 实际归一条数。
+ */
+export function normalizeRuntimeConfigs(ctx) {
+  let fixed = 0
+  const visit = (runtime) => {
+    if (normalizeRuntime(runtime)) fixed++
+  }
+  const eachEntry = (holder) => {
+    for (const entry of holder.entries()) visit(entry?.fiber?.runtime)
+  }
+  // 源1：registry（cordis runtime 记录册）
+  try {
+    const reg = ctx.registry ?? ctx.get?.('registry')
+    if (reg && typeof reg.values === 'function') {
+      for (const runtime of reg.values()) visit(runtime)
+    }
+  } catch {
+    /* 无 registry 面：走回落 */
+  }
+  if (fixed > 0) return fixed
+  // 源2：configEditor —— 与宿主 describe()/write() 同一条路径
+  try {
+    const ce = ctx.configEditor ?? ctx.get?.('configEditor')
+    if (ce && typeof ce.entries === 'function') eachEntry(ce)
+  } catch {
+    /* 走回落 */
+  }
+  if (fixed > 0) return fixed
+  // 源3：loader
+  try {
+    const ld = ctx.loader ?? ctx.get?.('loader')
+    if (ld && typeof ld.entries === 'function') eachEntry(ld)
+  } catch {
+    /* 全部不可用：垫片静默，schema 守卫与延迟补扫仍兜底 */
+  }
+  return fixed
+}
+
+/**
+ * 给 settings 服务实例的 schema() 套一层（own-property 遮蔽原型方法）：
+ * 每次宿主调用 schema(entry) 前，先把该条目 runtime 的 null 归一。
+ * 这样就算条目晚于本插件注册（bundles 里 dsh-sync 在后），describe/write
+ * 第一次碰到它时也已被修好。幂等（SCHEMA_GUARDED 打标）。
+ * @returns {boolean} 是否成功装上（已装过也返回 true）。
+ */
+export function guardSettingsSchema(ctx) {
+  try {
+    const settings = ctx.settings ?? ctx.get?.('settings')
+    if (!settings || typeof settings.schema !== 'function') return false
+    if (settings.schema[SCHEMA_GUARDED]) return true
+    const original = settings.schema
+    const wrapped = function (entry) {
+      try {
+        normalizeRuntime(entry?.fiber?.runtime)
+      } catch {
+        /* 单条失败不拖垮整次 describe */
+      }
+      return original.call(this, entry)
+    }
+    wrapped[SCHEMA_GUARDED] = true
+    wrapped.original = original
+    settings.schema = wrapped
+    return true
+  } catch {
+    // 实例不可扩展等极端形态：只剩 registry 归一 + 延迟补扫两层
+    return false
+  }
+}
+
 export function apply(ctx, config = {}) {
   const llm = ctx.llm
   if (!llm) return
@@ -266,7 +383,31 @@ export function apply(ctx, config = {}) {
     /* 内核无该事件面时静默 */
   }
 
-  // 4) 自动压缩硬闸（默认开；cordis.patch.yml 本插件行 config.autoGate:false 可恢复官方行为）
+  // 4) settings null-Config 防崩守卫（与 autoGate 开关无关，无条件执行）
+  let guardInstalled = false
+  try {
+    guardInstalled = guardSettingsSchema(ctx)
+    const normalized = normalizeRuntimeConfigs(ctx)
+    if (guardInstalled || normalized > 0) {
+      ctx.logger?.info?.(`[adapter-compat] settings null-Config guard: schemaWrapped=${guardInstalled} normalized=${normalized}`)
+    }
+  } catch {
+    // 守卫失败不影响其余两层
+  }
+  // 延迟补扫：兜住晚注册条目（dsh-sync 在 bundles 中排本插件之后）与守卫未装上的极端形态
+  for (const ms of [1000, 3000, 8000]) {
+    const t = setTimeout(() => {
+      try {
+        guardSettingsSchema(ctx)
+        normalizeRuntimeConfigs(ctx)
+      } catch {
+        /* 幂等静默 */
+      }
+    }, ms)
+    if (typeof t.unref === 'function') t.unref()
+  }
+
+  // 5) 自动压缩硬闸（默认开；cordis.patch.yml 本插件行 config.autoGate:false 可恢复官方行为）
   if (config?.autoGate === false) return
   armGate(ctx)
 }

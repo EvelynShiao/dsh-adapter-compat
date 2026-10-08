@@ -1,7 +1,7 @@
 {
   "name": "dsh-adapter-compat",
-  "version": "1.1.0",
-  "description": "DSH LLM adapter 兼容垫片 + 自动压缩硬闸：回填缺失的 LlmAdapter 基类默认方法（imageRequestPricing 等）修复 /compact 静默失败；并把引擎 compactIfNeeded 恒置为无需压缩，从代码层彻底关闭自动压缩（手动 /compact 不受影响）。独立于任何被保护插件——不改它的文件，它的自更新/强制更新无法移除本修复；也与配置文件无关，cordis.patch.yml 被覆盖也不失效。",
+  "version": "9999.9.9",
+  "description": "DSH LLM adapter 兼容垫片三合一（回填 LlmAdapter 基类方法 / 自动压缩硬闸 / settings null-Config 防崩守卫）：修复 imageRequestPricing 缺失导致的 /compact 静默失败；从代码层关闭自动压缩（手动 /compact 不受影响）；把 cordis 固化的 null runtime.Config 归一为 undefined，修复模型页打不开、设置保存失败、Agent 预设切换不可用（宿主 describe/write 一崩全崩）。独立于任何被保护插件——不改它的文件，pnpm install 装回旧版也照样生效；也与配置文件无关，cordis.patch.yml 被覆盖也不失效。",
   "type": "module",
   "main": "index.js",
   "exports": {
