@@ -57,6 +57,13 @@
  *     3. 1s/3s/8s 延迟补扫双保险。
  *   与 dsh-sync 版本完全解耦：pnpm install 把 sync-plugin 装回旧版也照样生效。
  *   dsh-sync 自身设置面板走 writeProfileFileSync 直写兜底，不受影响。
+ *
+ * ============ 第四层：上下文占用中文化校准（9999.9.9） ===========
+ *   症状：仪表盘显示「还剩 10%+」，一发消息却报超过 contextWindow（1M）上限。
+ *   根因：官方 contextPressure 用启发式增量外推真实占用，而启发式对中文大约
+ *   少算一半（实测倍率 2.15），于是显示远低于真实请求规模。
+ *   修法：按实测倍率校正 projectedTokens，只改 view 输出值。详见下方
+ *   calibratePressureView / calibrateContextPressure 的说明。
  */
 
 export const name = 'adapter-compat'
@@ -337,7 +344,141 @@ export function guardSettingsSchema(ctx) {
   }
 }
 
+/* ============ 第四层：上下文占用中文化校准 ===========
+ *
+ * 症状：仪表盘显示「还剩 10%+」，一发消息就报超过 contextWindow（1M）上限。
+ *
+ * 根因（官方 dsh-token-meter 的 contextPressure 外推公式）：
+ *   projectedTokens = pressureTokens + surfaceTokens - sampledSurfaceTokens
+ * 这里两个数不是一回事：
+ *   - pressureTokens        = 提供方真实报告的 prompt 规模（真数）
+ *   - surfaceTokens         = 按字符的启发式估算（假数）
+ *   - sampledSurfaceTokens  = 上一次真实采样那一刻的启发式值
+ * 于是「采样之后的增长」只按启发式增量往上加。而启发式对中文大约少算一半——
+ * 实测某会话启发式 215111 对真实 462816，倍率 2.15。结果：真实请求已经越过
+ * contextWindow，仪表盘还按半个身位在加，看着还剩一大截。
+ *
+ * 修法：用「实测倍率」校正启发式增量，其余一律不动：
+ *   ratio = pressureTokens / sampledSurfaceTokens
+ *   projectedTokens = pressureTokens + (surfaceTokens - sampledSurfaceTokens) * ratio
+ * 只改 view 的输出值——不动 state 机、不动 apply、不动 surfaceTokens 本身，
+ * 因此 projcache 里已存的 state 不需要失效，stateVersion 不变。
+ * 样本不足（sampledSurfaceTokens 太小）或倍率异常（<=0 或 >8）时原样退回官方值，
+ * 绝不比官方更离谱。
+ *
+ * 挂接点：sessionProjections.register() 会把 wire 对象按引用捕获
+ * （`view: state => wire.view(state)`），所以包裹 def.wire.view 即可生效；
+ * 无论 token-meter 早于还是晚于本插件注册，两条路径都覆盖。
+ */
+
+/** 占用校准标记：防止热重载后二次包装。 */
+export const PRESSURE_CALIBRATED = Symbol.for('dsh-adapter-compat.pressure-calibration')
+
+/** 可信倍率的下限样本量与上限，越界一律退回官方原值。 */
+export const PRESSURE_MIN_SAMPLE = 2000
+export const PRESSURE_MAX_RATIO = 8
+
+/**
+ * 纯函数：把官方 view 的输出按实测倍率校正 projectedTokens。
+ * @param {object|undefined} state - 投影单元 state（含 pressureTokens/surfaceTokens/sampledSurfaceTokens）。
+ * @param {object|undefined} out - 官方 view 的产物。
+ * @returns {object|undefined} 校正后的产物；不满足条件时原样返回。
+ */
+export function calibratePressureView(state, out) {
+  try {
+    if (!out || typeof out !== 'object') return out
+    const pressure = state?.pressureTokens
+    const total = state?.surfaceTokens
+    const sampled = state?.sampledSurfaceTokens
+    if (!Number.isFinite(pressure) || !Number.isFinite(total) || !Number.isFinite(sampled)) return out
+    if (pressure <= 0 || sampled < PRESSURE_MIN_SAMPLE) return out
+    const ratio = pressure / sampled
+    if (!Number.isFinite(ratio) || ratio <= 0 || ratio > PRESSURE_MAX_RATIO) return out
+    const projected = Math.max(0, Math.round(pressure + (total - sampled) * ratio))
+    if (projected === out.projectedTokens) return out
+    return { ...out, projectedTokens: projected }
+  } catch {
+    // 校准失败必须退回官方值，垫片绝不能反过来弄坏占用显示
+    return out
+  }
+}
+
+/**
+ * 给 contextPressure 投影单元的 wire.view 套一层校准（幂等）。
+ * @param {object} projections - ctx.sessionProjections 服务实例。
+ * @returns {number} 本次新包装的单元数。
+ */
+export function calibrateContextPressure(projections) {
+  if (!projections || typeof projections !== 'object') return 0
+  let patched = 0
+  const patchWire = (wire) => {
+    if (!wire || typeof wire.view !== 'function' || wire.view[PRESSURE_CALIBRATED]) return false
+    const original = wire.view
+    const wrapped = function (state) {
+      return calibratePressureView(state, original.call(this, state))
+    }
+    wrapped[PRESSURE_CALIBRATED] = true
+    wrapped.original = original
+    try {
+      wire.view = wrapped
+      return true
+    } catch {
+      return false
+    }
+  }
+  const patchDef = (def) => {
+    if (!def || def.key !== 'contextPressure') return false
+    return patchWire(def.wire)
+  }
+  // a) 已经注册的单元（token-meter 早于本插件加载时走这条）
+  try {
+    for (const registration of projections.registrations?.values?.() ?? []) {
+      if (patchDef(registration?.def)) patched += 1
+    }
+  } catch {
+    /* 无 registrations 面：只靠 register 包装 */
+  }
+  // b) 包装 register：将来注册（token-meter 晚于本插件加载时走这条）
+  if (typeof projections.register === 'function' && !projections.register[PRESSURE_CALIBRATED]) {
+    const original = projections.register.bind(projections)
+    const wrapped = (definition) => {
+      try {
+        patchDef(definition)
+      } catch {
+        /* 单个定义失败不拦注册 */
+      }
+      return original(definition)
+    }
+    wrapped[PRESSURE_CALIBRATED] = true
+    wrapped.original = original
+    try {
+      projections.register = wrapped
+    } catch {
+      /* 服务对象不可写时只剩 (a) 路径 */
+    }
+  }
+  return patched
+}
+
 export function apply(ctx, config = {}) {
+  // 0) 上下文占用校准（不依赖 llm，必须排在下面的 llm 早退之前）
+  const installPressureCalibration = () => {
+    try {
+      const projections = ctx.sessionProjections ?? ctx.get?.('sessionProjections')
+      const patchedNow = calibrateContextPressure(projections)
+      if (patchedNow > 0) {
+        ctx.logger?.info?.(`[adapter-compat] contextPressure calibrated: units=${patchedNow}`)
+      }
+    } catch {
+      /* 无投影面时静默：这是显示校准，不是硬功能 */
+    }
+  }
+  installPressureCalibration()
+  for (const ms of [1000, 3000, 8000]) {
+    const t = setTimeout(installPressureCalibration, ms)
+    if (typeof t.unref === 'function') t.unref()
+  }
+
   const llm = ctx.llm
   if (!llm) return
 
