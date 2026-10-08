@@ -1020,17 +1020,29 @@ export function installTrueDelete(ctx, config = {}) {
  * 关掉：config.moveSession === false。
  */
 
-/** 宿主 projectKey 编码（与 dsh-session-persistence-jsonl 逐字符对齐）。 */
+/** 宿主 projectKey 编码——与 dsh-session-persistence-jsonl:875 及 dsh-sync
+ *  encodeWorkspaceDir 逐字符对齐（分隔符连跑折叠单 '-'、非安全字符 ~XXXX、
+ *  去前导杠后 `--…--` 包边、251 截断）。冒烟基准：
+ *  work\学习 → --C-Users-Evelyn-AppData-Local-DeepSeekHarness-.dsh-work-~5B66~4E60-- */
 export function projectKeyOf(workspacePath) {
-  let out = ''
-  for (const ch of String(workspacePath)) {
-    const c = ch.codePointAt(0)
-    if (c > 127) out += '~' + c.toString(16).toUpperCase().padStart(4, '0')
-    else if (ch === '\\') out += '-'
-    else if (ch === ':') continue
-    else out += ch
+  const cwd = String(workspacePath)
+  let readable = ''
+  let separatorRun = false
+  for (let i = 0; i < cwd.length; i++) {
+    const code = cwd.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch === '/' || ch === '\\' || ch === ':') {
+      if (!separatorRun) readable += '-'
+      separatorRun = true
+    } else if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+      readable += ch
+      separatorRun = false
+    } else {
+      readable += '~' + code.toString(16).toUpperCase().padStart(4, '0')
+      separatorRun = false
+    }
   }
-  return out
+  return `--${(readable.replace(/^-+/, '') || 'root').slice(0, 251)}--`
 }
 
 /** 帧扫描（zstd magic）。 */
