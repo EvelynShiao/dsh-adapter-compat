@@ -119,6 +119,130 @@ export function planPurge(events) {
  * @param {object} options - { write, backupDir, onNote }
  * @returns {object} 结果摘要（status: clean|planned|skipped|failed|written）
  */
+
+/**
+ * 重写整条 inbox splice 链，使它在「删掉若干事件之后」依然自洽。
+ *
+ * 依据（dsh-agent-loop 的 inboxProjectionDefinition）：inbox 的**唯一**驱动是
+ * agent/inbox/spliced；连"取走队列"（claim）也是写一条 start=0/removedCount=n/
+ * inserted=[] 的 splice。所以整条链就是一个纯函数式的队列操作序列：
+ *     next = queue.toSpliced(start, removedCount, ...inserted)
+ * 既然能从头 forge 出这样的序列，就能把它**重算**成等价的、在新队列上自洽的序列。
+ *
+ * 算法：
+ *   1. 原样重放一遍，记下每条 splice 执行前的队列快照；
+ *   2. 收集「将被删除的消息 id」（被删事件里的 message.id / inserted[].id）；
+ *   3. 对每条**存活**的 splice，把它的操作区间按"剔除已删消息"投影到新队列上：
+ *        anchor = 区间之后第一个存活元素（在新队列里的下标即插入点）
+ *        newStart = anchor 的下标；newRemoved = 区间内仍存活且仍在队列里的条数
+ *        newInserted = inserted 里剔除已删消息
+ *      （原区间是连续的，删除只做减法 → 存活成员在新队列里仍连续，故投影自洽）
+ *   4. 只改这些 splice 的 data，不改事件条数、不改 seq —— 与切除/重编号正交。
+ *
+ * @param {object[]} events - 原始事件（未切除）
+ * @param {number[]} removeSeqs - 将被物理删除的事件 seq
+ * @returns {{rewrites: Map<number, object>, deletedIds: Set<string>, stats: object}}
+ */
+export function planInboxRewrite(events, removeSeqs) {
+  const removeSet = new Set(removeSeqs);
+
+  // 1) 原样重放一遍，记下每条 splice 的「执行前队列」快照
+  const before = new Map();
+  const queue = { 'next-turn': [], 'next-step': [] };
+  for (const event of events) {
+    if (event?.type !== 'agent/inbox/spliced') continue;
+    before.set(event.seq, { 'next-turn': [...queue['next-turn']], 'next-step': [...queue['next-step']] });
+    const s = event.data;
+    const q = queue[s.target];
+    if (!Array.isArray(q)) continue;
+    const removedCount = Number.isSafeInteger(s.removedCount) ? s.removedCount : 0;
+    if (!Number.isSafeInteger(s.start) || s.start < 0 || s.start > q.length || s.start + removedCount > q.length) continue;
+    queue[s.target] = [...q.slice(0, s.start), ...(s.inserted ?? []), ...q.slice(s.start + removedCount)];
+  }
+
+  /* 2) 收集将被删除的消息 id。三类：
+     a) 被删事件自身携带的 message（表层 user/assistant 消息体）；
+     b) 被删 splice 插入的消息；
+     c) **被删 splice 从队列里移除掉的消息** —— 那是被删轮次 claim 走的输入；
+        漏掉 c) 它们就会留在新队列里，界面上就是"删掉的东西还挂在排队消息"。 */
+  const deletedIds = new Set();
+  const collect = (message) => { if (message && typeof message.id === 'string') deletedIds.add(message.id) };
+  for (const event of events) {
+    if (!removeSet.has(event.seq)) continue;
+    collect(event.data?.message);
+    if (Array.isArray(event.data?.inserted)) for (const m of event.data.inserted) collect(m);
+    if (typeof event.data?.id === 'string' && (event.type === 'user/message' || event.type === 'assistant/message')) deletedIds.add(event.data.id);
+    if (event?.type === 'agent/inbox/spliced') {
+      const snapshot = before.get(event.seq)?.[event.data?.target];
+      if (Array.isArray(snapshot)) {
+        const rc = Number.isSafeInteger(event.data.removedCount) ? event.data.removedCount : 0;
+        if (Number.isSafeInteger(event.data.start) && event.data.start >= 0 && event.data.start + rc <= snapshot.length) {
+          for (const m of snapshot.slice(event.data.start, event.data.start + rc)) collect(m);
+        }
+      }
+    }
+  }
+
+  // 3) 投影到新队列
+  const rewrites = new Map();
+  const newQueue = { 'next-turn': [], 'next-step': [] };
+  let touched = 0;
+  for (const event of events) {
+    if (event?.type !== 'agent/inbox/spliced') continue;
+    const s = event.data;
+    const target = s.target;
+    const oldQ = before.get(event.seq)?.[target];
+    if (!Array.isArray(oldQ)) continue;
+    const newQ = newQueue[target];
+    const removedCount = Number.isSafeInteger(s.removedCount) ? s.removedCount : 0;
+    if (!Number.isSafeInteger(s.start) || s.start < 0 || s.start > oldQ.length || s.start + removedCount > oldQ.length) continue;
+    const range = oldQ.slice(s.start, s.start + removedCount);
+    const survivingRange = range.filter((m) => !deletedIds.has(m?.id));
+    /* 插入点 = 区间内第一个存活元素在新队列里的下标；
+       区间内全被删则取「区间之前最后一个存活元素」的下标 + 1；
+       都找不到就落在队首。 */
+    let newStart = -1;
+    for (const m of survivingRange) {
+      const idx = newQ.findIndex((x) => x?.id === m?.id);
+      if (idx >= 0) { newStart = idx; break }
+    }
+    if (newStart < 0) {
+      for (let i = s.start - 1; i >= 0; i--) {
+        if (deletedIds.has(oldQ[i]?.id)) continue;
+        const idx = newQ.findIndex((x) => x?.id === oldQ[i]?.id);
+        newStart = idx >= 0 ? idx + 1 : 0;
+        break;
+      }
+    }
+    if (newStart < 0) newStart = 0;
+    if (newStart > newQ.length) newStart = newQ.length;
+    // 仍在新队列里的「区间存活成员」条数（连续，故可直接 toSpliced）
+    let newRemoved = survivingRange.filter((m) => newQ.some((x) => x?.id === m?.id)).length;
+    if (newStart + newRemoved > newQ.length) {
+      newRemoved = survivingRange.filter((m) => newQ.slice(newStart).some((x) => x?.id === m?.id)).length;
+      if (newStart + newRemoved > newQ.length) newRemoved = Math.max(0, newQ.length - newStart);
+    }
+    const newInserted = (s.inserted ?? []).filter((m) => !deletedIds.has(m?.id));
+    newQueue[target] = [...newQ.slice(0, newStart), ...newInserted, ...newQ.slice(newStart + newRemoved)];
+    const changed = newStart !== s.start || newRemoved !== removedCount || newInserted.length !== (s.inserted ?? []).length;
+    if (changed) {
+      touched += 1;
+      rewrites.set(event.seq, { target, start: newStart, removedCount: newRemoved, inserted: newInserted });
+    }
+  }
+  return { rewrites, deletedIds, stats: { splices: before.size, rewritten: touched, deletedIds: deletedIds.size } };
+}
+
+/** 把 planInboxRewrite 的结果应用到事件副本上（只改 splice 的 data）。 */
+export function applyInboxRewrite(events, rewrites) {
+  if (!rewrites || rewrites.size === 0) return events;
+  return events.map((event) => {
+    const next = rewrites.get(event.seq);
+    if (!next) return event;
+    return { ...event, data: { ...event.data, target: next.target, start: next.start, removedCount: next.removedCount, inserted: next.inserted } };
+  });
+}
+
 export function purgeSessionFile(file, sid, options = {}) {
   const out = { sid, status: 'clean', events: 0, removed: 0, turns: [], verify: false, problems: [], notes: [] };
   let doc;
@@ -135,12 +259,17 @@ export function purgeSessionFile(file, sid, options = {}) {
     if (plan.skipped.length > 0) out.notes.push(`skipped=${JSON.stringify(plan.skipped.slice(0, 4))}`);
     return out;
   }
+  /* inbox 链条重写：**必须在 excise 之前**应用——rewrites 以「原始 seq」为键，
+     而 excise 会重编号；顺序反了就会整体错位（实测：链条看似通过，被删消息
+     实际还挂在队列上）。 */
+  const inboxRewrite = planInboxRewrite(events, plan.remove);
+  const inputEvents = applyInboxRewrite(events, inboxRewrite.rewrites);
   let result;
   try {
-    result = excise(header, events, plan.remove, { expandToWholeTurns: true });
+    result = excise(header, inputEvents, plan.remove, { expandToWholeTurns: true });
   } catch (error) {
     out.status = 'failed';
-    out.notes.push(`excise: ${String(error?.message ?? error).slice(0, 200)}`);
+    out.notes.push('excise: ' + String(error?.message ?? error).slice(0, 200));
     return out;
   }
   const v = verify(result.header, result.events);
@@ -151,23 +280,27 @@ export function purgeSessionFile(file, sid, options = {}) {
     out.problems = (v.problems ?? []).slice(0, 6).map(String);
     return out;
   }
-  /* 护栏一：inbox splice 是顺序状态机，进删除集就拒绝（它会连带打乱后续 splice）。 */
-  const spliceSeqs = inboxSpliceSeqs(events);
-  const spliceHit = plan.remove.filter((s) => spliceSeqs.includes(s));
-  if (spliceHit.length > 0) {
-    out.status = 'skipped';
-    out.notes.push('refused: 删除集会命中 agent/inbox/spliced ' + JSON.stringify(spliceHit) + '（顺序状态机，删中间一条会让后续 splice 错位 → 宿主报 invalid persisted inbox splice）');
-    return out;
-  }
-  /* 护栏二：切除后的结果必须能通过 inbox 状态机重放，否则拒绝写盘。 */
+  /* 后置条件一：inbox 状态机必须能在结果上完整重放（否则宿主打不开会话）。 */
   const inbox = checkInboxSplices(result.events);
   if (inbox.problems.length > 0) {
     out.status = 'skipped';
     out.notes.push('refused: 切除后 inbox 状态机不通过 ' + JSON.stringify(inbox.problems[0]));
     return out;
   }
-  out.status = 'planned';
-  if (options.write !== true) return out;
+  /* 后置条件二：被删消息 id 不得在任何存活事件里残留（否则界面上会以
+     「排队消息」/标题引用等形态复现）。命中即拒绝，绝不产出半干净的文件。 */
+  if (inboxRewrite.deletedIds.size > 0) {
+    const blob = JSON.stringify(result.events);
+    const residue = [...inboxRewrite.deletedIds].filter((id) => blob.includes(id));
+    if (residue.length > 0) {
+      out.status = 'skipped';
+      out.notes.push('refused: 被删消息 id 仍有 ' + residue.length + ' 个残留在结果里 ' + JSON.stringify(residue.slice(0, 5)));
+      return out;
+    }
+  }
+  if (inboxRewrite.stats.rewritten > 0) {
+    out.notes.push('inbox-chain rewritten: ' + JSON.stringify(inboxRewrite.stats));
+  }
   try {
     if (options.backupDir) {
       mkdirSync(options.backupDir, { recursive: true });
