@@ -19,6 +19,12 @@ import { readSession } from '../true-delete.js'
 const REAL = 'C:/Users/Evelyn/AppData/Local/DeepSeekHarness/.dsh/sessions/--C-Users-Evelyn-AppData-Local-DeepSeekHarness-.dsh-work-Evelyn--/session-bee75240-acce-4502-b577-9f9f5ce28d9d/session.v4.jsonl.zstd'
 const SID = 'session-bee75240-acce-4502-b577-9f9f5ce28d9d'
 const haveReal = existsSync(REAL)
+/** 真实素材是可变的（真删除会把它清空）——依赖它的用例必须能优雅跳过。 */
+const skipReason = !haveReal
+  ? '缺少真实素材（换机器/被删）'
+  : (planPurge(readSession(REAL).events).remove.length === 0
+    ? '真实素材里的墓碑已被物理清理（这正是本功能生效的证据）；写盘路径的覆盖由 _truedelete/test-excision.mjs 的合成用例保证'
+    : false)
 
 /** 把真实会话文件复制成 <tmp>/sessions/--ws--/<sid>/session.v4.jsonl.zstd。 */
 function fakeHome(sid = SID) {
@@ -64,7 +70,7 @@ test('classifyTombstoneCarrier：无 summary 的旧载体走节点反推，拿�
   assert.equal(noSources.skip, true)
 })
 
-test('真实素材：planPurge 只挑出 595/596，且不含 regeneration 载体', { skip: !haveReal }, () => {
+test('真实素材：planPurge 只挑出 595/596，且不含 regeneration 载体', { skip: skipReason }, () => {
   const doc = readSession(REAL)
   const plan = planPurge(doc.events)
   assert.deepEqual(plan.turns, [595, 596])
@@ -72,7 +78,7 @@ test('真实素材：planPurge 只挑出 595/596，且不含 regeneration 载体
   assert.equal(plan.skipped.length, 0)
 })
 
-test('真实素材：purgeSessionFile 干跑 verify=true，且不动原文件', { skip: !haveReal }, () => {
+test('真实素材：purgeSessionFile 干跑 verify=true，且不动原文件', { skip: skipReason }, () => {
   const before = statSync(REAL).size
   const mtime = statSync(REAL).mtimeMs
   const r = purgeSessionFile(REAL, SID, {})
@@ -84,7 +90,7 @@ test('真实素材：purgeSessionFile 干跑 verify=true，且不动原文件', 
   assert.equal(statSync(REAL).mtimeMs, mtime, '干跑连 mtime 都不能变')
 })
 
-test('端到端：对副本真写盘 —— 事件变少、备份生成、台账清空、读回 verify', { skip: !haveReal }, async () => {
+test('端到端：对副本真写盘 —— 事件变少、备份生成、台账清空、读回 verify', { skip: skipReason }, async () => {
   const home = fakeHome()
   try {
     const file = join(home, 'sessions', '--ws--', SID, 'session.v4.jsonl.zstd')
@@ -111,7 +117,7 @@ test('端到端：对副本真写盘 —— 事件变少、备份生成、台账
   }
 })
 
-test('live 会话绝不写盘，只记台账', { skip: !haveReal }, async () => {
+test('live 会话绝不写盘，只记台账', { skip: skipReason }, async () => {
   const home = fakeHome()
   try {
     const file = join(home, 'sessions', '--ws--', SID, 'session.v4.jsonl.zstd')
@@ -137,7 +143,7 @@ test('isSessionLive 判定不了就保守当作 live', () => {
   assert.equal(isSessionLive(allLiveCtx, 'x'), true)
 })
 
-test('listSessionFiles：扫出 <home>/sessions/<ws>/<sid>/session.v4.jsonl.zstd', { skip: !haveReal }, () => {
+test('listSessionFiles：扫出 <home>/sessions/<ws>/<sid>/session.v4.jsonl.zstd', { skip: skipReason }, () => {
   const home = fakeHome()
   try {
     const files = listSessionFiles(home)
