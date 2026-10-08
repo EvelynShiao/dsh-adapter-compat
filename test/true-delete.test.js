@@ -67,7 +67,11 @@ test('classifyTombstoneCarrier：无 summary 的旧载体走节点反推，拿�
     surfaceOp: { op: 'replace', startSeq: 1, endSeq: 2 },
     data: { source: { kind: 'dsh-session-kit-turns-del' } },
   })
-  assert.equal(noSources.skip, true)
+  // 连 sourceEventSeqs 都没有的老墓碑：改走「按 surfaceOp 端点（表层节点 seq）反查」，
+  // 不再直接跳过——否则 10/7 那类删除永远清不掉（见 legacy-surfacepos-fallback）。
+  assert.equal(noSources.needsNodeLookup, true)
+  assert.deepEqual(noSources.sourcesFor, [])
+  assert.deepEqual(noSources.surfaceRange, { start: 1, end: 2 })
 })
 
 test('真实素材：planPurge 只挑出 595/596，且不含 regeneration 载体', { skip: skipReason }, () => {
