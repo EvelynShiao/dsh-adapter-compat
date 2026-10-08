@@ -64,9 +64,21 @@
  *   少算一半（实测倍率 2.15），于是显示远低于真实请求规模。
  *   修法：按实测倍率校正 projectedTokens，只改 view 输出值。详见下方
  *   calibratePressureView / calibrateContextPressure 的说明。
+ *
+ * ============ 第五层：会话盘监视 + 全盘标题投影预热（9999.9.9） ===========
+ *   症状：dsh-sync「下载」之后标题集体变成工作区名，要重启才看得到；重启后
+ *   也只有手动点开过的会话有标题。
+ *   根因：列表标题走 projcache；下载用远端 storages 覆盖本地 → projcache 大批
+ *   消失；而预热只在启动后 12 秒跑一次，下载发生在启动之后 → 没人再补。
+ *   实测 2026-10-08：磁盘 95 个会话，projcache 只剩 39 条。
+ *   修法：轮询 sessions 目录指纹，外部落盘稳定后 → sessions.refresh() 重扫 +
+ *   按**磁盘扫描**（不只信注册表）全盘补齐 projcache。详见下方
+ *   warmProjectionTitles / installSessionWatch 的说明。
  */
 
 export const name = 'adapter-compat'
+
+import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 
 export const inject = ['llm']
 
@@ -460,7 +472,327 @@ export function calibrateContextPressure(projections) {
   return patched
 }
 
+/* ============ 第五层：会话盘变化监视 + 全盘标题投影预热 ===========
+ *
+ * 症状：跑 dsh-sync「下载」之后，侧边栏标题集体变成工作区名，要重启才能看；
+ *       而重启后也只有「手动点开过的」那些会话有标题。
+ *
+ * 根因：列表标题走 projcache 的零 I/O 读（storages/session_projcache/sessions/<id>.json）。
+ *   - 同步下载会用远端 storages 覆盖本地 → projcache 大批消失；
+ *   - 标题于是回落到工作区名（DSH 对无标题会话的默认显示）；
+ *   - 点开会话会冷重建该会话的投影 → 只有点过的那些有标题；
+ *   - 既有预热只在「启动后 12 秒」跑一次；下载发生在启动之后 → 没人再补。
+ *   实测（2026-10-08）：磁盘 95 个会话，projcache 只剩 39 条。
+ *
+ * 修法：把预热从一次性改成事件驱动——
+ *   1. 每 5 秒对 $DSH_HOME/sessions 做廉价指纹（会话文件数 + 最新 mtime）；
+ *   2. 指纹变化且连续两轮稳定 → 判定一次外部落盘（下载/手机同步/手工拷入），
+ *      随即 sessions.refresh() 强制重扫列表 + 全盘补齐 projcache；
+ *   3. 补齐来源是**磁盘扫描**而不是工作区注册表：注册表可能还没收录刚下载的
+ *      会话，只信它会漏掉它们（这正是旧实现只补到一部分的原因）；
+ *   4. 顺带修「记录在但标题为空」的会话（repairUntitled，默认开，有配额上限）。
+ *
+ * 全程 fail-soft：任何一步失败只写日志，绝不影响 DSH 本体。
+ * 落盘日志：$DSH_HOME/dsh-adapter-compat.log。关掉：config.titleWarm: false。
+ */
+
+/** 关闭本层的 config 键。 */
+export const TITLE_WARM_DISABLED_KEY = 'titleWarm'
+/** 指纹轮询间隔（ms）。 */
+export const SESSION_WATCH_INTERVAL_MS = 5000
+/** 每轮最多重建多少条（防止一次下载后长时间占满 I/O）。 */
+export const TITLE_WARM_MAX_PER_PASS = 200
+/** 会话监视标记。 */
+export const SESSION_WATCH = Symbol.for('dsh-adapter-compat.session-watch')
+
+/** DSH 主目录：与宿主/其他插件同一套推导（DSH_HOME 优先）。 */
+export function dshHomeDir(env = process.env) {
+  const fromEnv = env?.DSH_HOME
+  if (typeof fromEnv === 'string' && fromEnv.length > 0) return fromEnv
+  const home = env?.USERPROFILE ?? env?.HOME
+  return home ? `${String(home).replace(/[\\/]+$/u, '')}/.dsh` : '.dsh'
+}
+
+/** 追加一行到本插件的落盘日志（永不抛）。 */
+export function appendCompatLog(line, home = dshHomeDir()) {
+  try {
+    appendFileSync(`${home}/dsh-adapter-compat.log`, `${new Date().toISOString()} ${line}\n`)
+  } catch {
+    /* 日志失败绝不外抛 */
+  }
+}
+
+/**
+ * 扫描 $DSH_HOME/sessions/<workspace>/<sessionId>/session.v4.jsonl.zstd。
+ * @returns {{ids: string[], newest: number}} 会话 id 列表与最新 mtimeMs。
+ */
+export function scanSessionFiles(home = dshHomeDir()) {
+  const ids = []
+  let newest = 0
+  try {
+    const root = `${home}/sessions`
+    for (const workspace of readdirSync(root, { withFileTypes: true })) {
+      if (!workspace.isDirectory()) continue
+      const wsDir = `${root}/${workspace.name}`
+      let sessions = []
+      try {
+        sessions = readdirSync(wsDir, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const session of sessions) {
+        if (!session.isDirectory()) continue
+        const file = `${wsDir}/${session.name}/session.v4.jsonl.zstd`
+        try {
+          if (!existsSync(file)) continue
+          const stat = statSync(file)
+          if (stat.mtimeMs > newest) newest = stat.mtimeMs
+          ids.push(session.name)
+        } catch {
+          /* 单个会话读不到就跳过 */
+        }
+      }
+    }
+  } catch {
+    /* 根目录不可读：空快照 */
+  }
+  return { ids, newest }
+}
+
+/** 廉价指纹：会话文件数 + 最新 mtime。变化即意味着有外部落盘。 */
+export function sessionsFingerprint(home = dshHomeDir()) {
+  const { ids, newest } = scanSessionFiles(home)
+  return { count: ids.length, newest, key: `${ids.length}:${newest}` }
+}
+
+/** 探一个服务：优先 ctx.get，退回属性访问（都不抛）。 */
+function serviceOf(ctx, name) {
+  try {
+    const viaGet = ctx?.get?.(name)
+    if (viaGet !== undefined && viaGet !== null) return viaGet
+  } catch {
+    /* 未注入时 get 可能抛：退回属性 */
+  }
+  try {
+    return ctx?.[name]
+  } catch {
+    return undefined
+  }
+}
+
+/** 读一份持久化会话的完整事件（复刻宿主的 handle 风格读取）。 */
+async function readPersistedEvents(persistence, sessionId) {
+  if (typeof persistence?.open === 'function') {
+    let handle
+    try {
+      handle = await persistence.open(sessionId, 'read')
+      return await handle.read(0, Number.MAX_SAFE_INTEGER)
+    } finally {
+      if (handle !== undefined) {
+        try {
+          await handle.close()
+        } catch {
+          /* close 失败不掩盖读取结果 */
+        }
+      }
+    }
+  }
+  if (typeof persistence?.readFrom === 'function') return persistence.readFrom(sessionId, 0)
+  return undefined
+}
+
+/**
+ * 全盘补齐标题投影（幂等）。只重建「projcache 缺失」以及（可选）「标题为空」的会话。
+ * @param {object} ctx - cordis 上下文。
+ * @param {object} [options] - { max, repairUntitled, verbose, home }
+ * @returns {Promise<object>} 统计。
+ */
+export async function warmProjectionTitles(ctx, options = {}) {
+  const stats = { scanned: 0, cached: 0, rebuilt: 0, repaired: 0, missing: 0, failed: 0 }
+  const home = options.home ?? dshHomeDir()
+  try {
+    const cache = serviceOf(ctx, 'sessionProjectionCache')
+    const persistence = serviceOf(ctx, 'sessionPersistence')
+    if (typeof cache?.coldSnapshot !== 'function') return stats
+    const byId = new Map()
+    if (typeof persistence?.list === 'function') {
+      const entries = (await persistence.list().catch(() => [])) ?? []
+      for (const entry of entries) {
+        const header = entry?.header ?? entry
+        if (header?.id) byId.set(header.id, entry)
+      }
+    }
+    const projDir = `${home}/storages/session_projcache/sessions`
+    const { ids } = scanSessionFiles(home)
+    stats.scanned = ids.length
+    const budget = Number.isFinite(options.max) ? options.max : TITLE_WARM_MAX_PER_PASS
+    const repairUntitled = options.repairUntitled !== false
+    for (const sid of ids) {
+      if (stats.rebuilt + stats.repaired >= budget) break
+      const file = `${projDir}/${sid}.json`
+      const exists = existsSync(file)
+      if (exists) {
+        stats.cached += 1
+        if (!repairUntitled) continue
+        try {
+          const record = JSON.parse(readFileSync(file, 'utf8'))
+          const title = (record?.record ?? record)?.rows?.title?.val
+          if (typeof title === 'string' && title.length > 0) continue
+        } catch {
+          /* 记录损坏：当作需要重建 */
+        }
+      }
+      try {
+        const entry = byId.get(sid)
+        const header = entry?.header ?? entry
+        if (header?.id !== sid) {
+          stats.missing += 1
+          continue
+        }
+        const read = await readPersistedEvents(persistence, sid)
+        const events = read?.events
+        if (!Array.isArray(events) || events.length === 0) {
+          stats.missing += 1
+          continue
+        }
+        if (exists) {
+          // 已存在的记录只在日志里真有标题事件时才重建，避免无谓 I/O
+          if (!events.some((event) => event?.type === 'session/title')) continue
+          const inheritedRepair = Number(entry?.inheritedEventCount ?? header?.inheritedEventCount ?? 0) || 0
+          cache.coldSnapshot(header, inheritedRepair, events)
+          stats.repaired += 1
+        } else {
+          const inherited = Number(entry?.inheritedEventCount ?? header?.inheritedEventCount ?? 0) || 0
+          cache.coldSnapshot(header, inherited, events)
+          stats.rebuilt += 1
+        }
+        await new Promise((resolve) => setTimeout(resolve, 120))
+      } catch {
+        stats.failed += 1
+      }
+    }
+    if (stats.rebuilt > 0 || stats.repaired > 0 || options.verbose) {
+      appendCompatLog(
+        `title-warm scanned=${stats.scanned} cached=${stats.cached} rebuilt=${stats.rebuilt} repaired=${stats.repaired} missing=${stats.missing} failed=${stats.failed}`,
+        home,
+      )
+      ctx.logger?.info?.(
+        `[adapter-compat] title warm: rebuilt ${stats.rebuilt}, repaired ${stats.repaired} / scanned ${stats.scanned}`,
+      )
+    }
+  } catch (error) {
+    stats.failed += 1
+    appendCompatLog(`title-warm FAILED: ${String(error?.message ?? error).slice(0, 200)}`, home)
+  }
+  return stats
+}
+
+/** 一次「外部落盘」响应：强制重扫列表 + 全盘补标题投影。 */
+export async function rescanAndWarm(ctx, options = {}) {
+  const result = { refreshed: false, warmed: null }
+  try {
+    const sessions = serviceOf(ctx, 'sessions')
+    if (typeof sessions?.refresh === 'function') {
+      await sessions.refresh()
+      result.refreshed = true
+    }
+  } catch (error) {
+    appendCompatLog(`rescan refresh FAILED: ${String(error?.message ?? error).slice(0, 160)}`)
+  }
+  // refresh 之后 registry 才可能收录新会话，故 warm 放在后面
+  result.warmed = await warmProjectionTitles(ctx, options)
+  return result
+}
+
+/** 安装会话盘监视：轮询指纹，变化且稳定后触发重扫 + 预热。幂等。 */
+export function installSessionWatch(ctx, options = {}) {
+  const home = options.home ?? dshHomeDir()
+  try {
+    if (ctx?.__adapterCompatSessionWatch?.[SESSION_WATCH]) return ctx.__adapterCompatSessionWatch
+  } catch {
+    /* ctx 不可读则继续安装 */
+  }
+  const intervalMs = Number.isFinite(options.intervalMs) ? options.intervalMs : SESSION_WATCH_INTERVAL_MS
+  const state = { last: sessionsFingerprint(home).key, pending: null, busy: false }
+  const tick = () => {
+    if (state.busy) return
+    let key
+    try {
+      key = sessionsFingerprint(home).key
+    } catch {
+      return
+    }
+    if (key === state.last) return
+    // 变化出现后先记下，等下一轮仍是这个值再动手——避免下载写到一半就预热
+    if (state.pending !== key) {
+      state.pending = key
+      return
+    }
+    state.pending = null
+    state.last = key
+    state.busy = true
+    appendCompatLog(`sessions changed (${key}) -> rescan + title warm`, home)
+    Promise.resolve()
+      .then(() => rescanAndWarm(ctx, options))
+      .catch(() => {})
+      .finally(() => {
+        state.busy = false
+        try {
+          state.last = sessionsFingerprint(home).key
+        } catch {
+          /* ignore */
+        }
+      })
+  }
+  const timer = setInterval(tick, intervalMs)
+  if (typeof timer.unref === 'function') timer.unref()
+  state[SESSION_WATCH] = true
+  state.dispose = () => clearInterval(timer)
+  try {
+    Object.defineProperty(ctx, '__adapterCompatSessionWatch', { value: state, configurable: true })
+  } catch {
+    /* ctx 不可写时仍保留 interval（进程级） */
+  }
+  try {
+    ctx.effect?.(() => state.dispose, 'adapter-compat: session watch')
+  } catch {
+    /* 无 effect 面：交给进程退出回收 */
+  }
+  return state
+}
+
+/** 装配本层：监视 + 启动补跑（一次性预热不够，故启动后多补几轮）。 */
+export function installTitleWarm(ctx, config = {}) {
+  if (config?.[TITLE_WARM_DISABLED_KEY] === false) return undefined
+  const options = {
+    repairUntitled: config?.titleWarmRepairUntitled !== false,
+    max: Number.isFinite(config?.titleWarmMax) ? config.titleWarmMax : undefined,
+  }
+  const watch = installSessionWatch(ctx, options)
+  // 启动补跑：12s 全盘补齐；60s 再补一次（覆盖启动后立刻发生的下载）
+  const timers = []
+  const at = (ms, fn) => {
+    const t = setTimeout(() => {
+      Promise.resolve()
+        .then(fn)
+        .catch(() => {})
+    }, ms)
+    if (typeof t.unref === 'function') t.unref()
+    timers.push(t)
+  }
+  at(12000, () => warmProjectionTitles(ctx, options))
+  at(60000, () => rescanAndWarm(ctx, options))
+  return { watch, timers }
+}
+
 export function apply(ctx, config = {}) {
+  // -1) 会话盘监视 + 标题投影预热（不依赖 llm，必须排在 llm 早退之前）
+  try {
+    installTitleWarm(ctx, config)
+  } catch {
+    /* 预热失败绝不拖垮 apply */
+  }
+
   // 0) 上下文占用校准（不依赖 llm，必须排在下面的 llm 早退之前）
   const installPressureCalibration = () => {
     try {
