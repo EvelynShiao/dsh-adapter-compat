@@ -835,19 +835,35 @@ export function apply(ctx, config = {}) {
   }
 
   // 0) 上下文占用校准（不依赖 llm，必须排在下面的 llm 早退之前）
-  const installPressureCalibration = () => {
+  const installPressureCalibration = (final = false) => {
     try {
       const projections = ctx.sessionProjections ?? ctx.get?.('sessionProjections')
       const patchedNow = calibrateContextPressure(projections)
-      if (patchedNow > 0) {
-        /* 落盘铁证：既报装了几个投影单元，也报一次算术自证。
-           合成状态 pressure=200000 / surface=150000 / sampled=100000（倍率 2）：
-           官方公式给 200000+50000=250000，校准后应为 300000。 */
-        const probe = calibratePressureView(
-          { pressureTokens: 200000, surfaceTokens: 150000, sampledSurfaceTokens: 100000 },
-          { pressureTokens: 200000, projectedTokens: 250000 },
+      /* 落盘铁证：既报走了哪条挂接路径，也报一次算术自证。
+         合成状态 pressure=200000 / surface=150000 / sampled=100000（倍率 2）：
+         官方公式给 200000+50000=250000，校准后必须是 300000。 */
+      const probe = calibratePressureView(
+        { pressureTokens: 200000, surfaceTokens: 150000, sampledSurfaceTokens: 100000 },
+        { pressureTokens: 200000, projectedTokens: 250000 },
+      )
+      const registerWrapped = projections?.register?.[PRESSURE_CALIBRATED] === true
+      let unitWrapped = false
+      try {
+        for (const registration of projections?.registrations?.values?.() ?? []) {
+          if (registration?.def?.key === 'contextPressure') {
+            unitWrapped = registration.def.wire?.view?.[PRESSURE_CALIBRATED] === true
+          }
+        }
+      } catch {
+        /* 无 registrations 面 */
+      }
+      // 最后一次重试必写一行，其余只在有变化时写——启动最多 4 行，不刷屏
+      if (final || patchedNow > 0 || registerWrapped || unitWrapped) {
+        appendCompatLog(
+          `contextPressure calibration: patchedNow=${patchedNow} registerWrapped=${String(registerWrapped)} unitWrapped=${String(unitWrapped)} probeProjected=${String(probe?.projectedTokens)}`,
         )
-        appendCompatLog(`contextPressure calibrated units=${patchedNow} probeProjected=${String(probe?.projectedTokens)}`)
+      }
+      if (patchedNow > 0) {
         ctx.logger?.info?.(`[adapter-compat] contextPressure calibrated: units=${patchedNow}`)
       }
     } catch {
@@ -856,7 +872,7 @@ export function apply(ctx, config = {}) {
   }
   installPressureCalibration()
   for (const ms of [1000, 3000, 8000]) {
-    const t = setTimeout(installPressureCalibration, ms)
+    const t = setTimeout(() => installPressureCalibration(ms === 8000), ms)
     if (typeof t.unref === 'function') t.unref()
   }
 
