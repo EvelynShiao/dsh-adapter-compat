@@ -7,7 +7,7 @@
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { readSession, writeSession, excise, verify, seqsOfTurn, decodeSeqRanges } from './true-delete.js';
+import { readSession, writeSession, excise, verify, seqsOfTurn, decodeSeqRanges, foldSurfaceLoose } from './true-delete.js';
 
 /** 会写盘的调用方必须显式传 write:true；默认干跑。 */
 export const PURGE_DEFAULTS = Object.freeze({ write: false, only: undefined, home: undefined });
@@ -77,7 +77,12 @@ export function classifyTombstoneCarrier(event) {
     for (let t = summary.turn; t <= end; t++) turns.add(t);
   }
   if (turns.size === 0) {
-    if (!Array.isArray(event.sourceEventSeqs)) return { skip: true, why: 'no-summary-no-sources' };
+    if (!Array.isArray(event.sourceEventSeqs)) {
+      const op = event.surfaceOp;
+      const surfaceRange = op && Number.isSafeInteger(op.startSeq) && Number.isSafeInteger(op.endSeq)
+        ? { start: op.startSeq, end: op.endSeq } : undefined;
+      return { needsNodeLookup: true, sourcesFor: [], turns, surfaceRange };
+    }
     let sourcesFor = [];
     try { sourcesFor = decodeSeqRanges(event.sourceEventSeqs) } catch { sourcesFor = [] }
     return { needsNodeLookup: true, sourcesFor, turns };
@@ -102,9 +107,36 @@ export function planPurge(events, options = {}) {
     if (sinceMs !== undefined && !(Number.isFinite(e.time) && e.time >= sinceMs)) continue;
     if (c.skip) { skipped.push({ seq: e.seq, why: c.why }); continue }
     if (c.needsNodeLookup) {
+      /* legacy-turn-fallback：旧格式墓碑没有 summary.turn，两步反推：
+         ① 被遮蔽的表层节点自带的 data.turn；
+         ② 兜底：这些节点里最早那个 seq 之前最近的 turn/start。 */
+      let earliest = Infinity;
       for (const sq of c.sourcesFor) {
         const node = byseq.get(sq);
         if (node && Number.isSafeInteger(node.data?.turn)) turnSet.add(node.data.turn);
+        if (Number.isFinite(sq) && sq < earliest) earliest = sq;
+      }
+      /* legacy-surfacepos-fallback：更老的墓碑连 sourceEventSeqs 都没有，只有
+         surfaceOp.{startSeq,endSeq} —— 那是**表层位置**（surface 节点数组下标），
+         用容错 fold 取出对应节点再推轮号。 */
+      if (c.sourcesFor.length === 0 && c.surfaceRange !== undefined) {
+        let nodes = [];
+        try { nodes = [...foldSurfaceLoose(events).nodes] } catch { nodes = [] }
+        /* 注意：surfaceOp.startSeq/endSeq 是**表层节点的 seq**（源码用 nodes.indexOf(op.startSeq) 定位），不是数组下标。 */
+        const from = nodes.includes(c.surfaceRange.start) ? c.surfaceRange.start : undefined;
+        const to = nodes.includes(c.surfaceRange.end) ? c.surfaceRange.end : undefined;
+        if (Number.isSafeInteger(from) && Number.isSafeInteger(to)) {
+          for (const sq of [from, to]) {
+            const node = byseq.get(sq);
+            if (node && Number.isSafeInteger(node.data?.turn)) turnSet.add(node.data.turn);
+            if (Number.isFinite(sq) && sq < earliest) earliest = sq;
+          }
+        }
+      }
+      if (turnSet.size === 0 && Number.isFinite(earliest)) {
+        const starts = events.filter((e) => e.type === 'turn/start' && e.seq < earliest && Number.isSafeInteger(e.data?.turn));
+        const last = starts[starts.length - 1];
+        if (last) turnSet.add(last.data.turn);
       }
       continue;
     }
