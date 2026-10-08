@@ -79,6 +79,7 @@
 export const name = 'adapter-compat'
 
 import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, watch } from 'node:fs'
+import { purgeSessionFile, readPendingLedger, writePendingLedger } from './purge.js'
 
 export const inject = ['llm']
 
@@ -826,12 +827,161 @@ export function installTitleWarm(ctx, config = {}) {
   return { watch, timers }
 }
 
+/* ============ 第六层：真删除（物理切除墓碑） ===========
+ *
+ * 症状（用户长期诉求）：删掉的东西 Timeline 还在、被删轮次的「思考过程」残留、
+ * 界面上还留一个「已删除」占位行。根因是删除只遮蔽表层节点，原始事件一行没少，
+ * 而 Timeline（块索引）直读原始事件。
+ *
+ * 本层把 _truedelete/excision.mjs（52/52 自测通过、真实副本 verify.ok）接进来：
+ *   1. 扫全部会话，只认插件自己的真删除墓碑（regeneration 载体会跳过——那种轮次
+ *      还活着，整轮删会毁掉新回答）；
+ *   2. 算整轮事件集 → excise（物理切除 + seq 重编号 + 引用重映射）→ verify；
+ *   3. verify 通过才写盘：先备份到 backup-true-delete/，写完读回再 verify；
+ *   4. 删 projcache（投影会冷重建；文件物理身份变化也让块索引自动重建 → Timeline 跟上）。
+ *
+ * **live 会话绝不写文件**：内存里的事件数组与文件必须对齐，只改文件不重编号会让
+ * 下一次 flush 把内容写回并把 seq 写错 → 日志损坏。live 的记进待清理台账
+ * dsh-true-delete-pending.json，开机早期（会话还没被激活）自动补清。
+ *
+ * 关掉：cordis.patch.yml 本插件行 config.trueDelete: false。
+ */
+
+/** 待清理台账文件名（$DSH_HOME 下）。 */
+export const TRUE_DELETE_PENDING_FILE = 'dsh-true-delete-pending.json'
+/** 真删除备份目录名（$DSH_HOME 下）。 */
+export const TRUE_DELETE_BACKUP_DIR = 'backup-true-delete'
+
+/** 列出全部会话文件 [{id, file}]。 */
+export function listSessionFiles(home = dshHomeDir()) {
+  const out = []
+  try {
+    for (const workspace of readdirSync(home + '/sessions', { withFileTypes: true })) {
+      if (!workspace.isDirectory()) continue
+      const wsDir = home + '/sessions/' + workspace.name
+      let sessions = []
+      try { sessions = readdirSync(wsDir, { withFileTypes: true }) } catch { continue }
+      for (const session of sessions) {
+        if (!session.isDirectory()) continue
+        const file = wsDir + '/' + session.name + '/session.v4.jsonl.zstd'
+        try { if (existsSync(file)) out.push({ id: session.name, file }) } catch { /* skip */ }
+      }
+    }
+  } catch { /* 根目录不可读 */ }
+  return out
+}
+
+/**
+ * 该会话此刻是不是 live。**判定不了就返回 true**（当作 live = 拒绝写文件）：
+ * 这个方向的错误只是「晚点再清」，反方向的错误是把日志写坏。
+ */
+export function isSessionLive(ctx, sessionId) {
+  try {
+    const sessions = serviceOf(ctx, 'sessions')
+    if (!sessions || typeof sessions.get !== 'function') return true
+    return sessions.get(sessionId) !== undefined
+  } catch {
+    return true
+  }
+}
+
+/**
+ * 扫描并清理真删除墓碑。默认干跑；write:true 才写盘（带备份 + 读回复核）。
+ * @param {object} ctx - cordis 上下文（只用于 live 判定）。
+ * @param {object} [options] - { write, only, home, onResult }
+ * @returns {Promise<{write:boolean, results:object[], pending:number}>}
+ */
+export async function purgeTombstones(ctx, options = {}) {
+  const home = options.home ?? dshHomeDir()
+  const write = options.write === true
+  const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR
+  const ledger = readPendingLedger(home)
+  const results = []
+  for (const entry of listSessionFiles(home)) {
+    if (options.only !== undefined && options.only !== entry.id) continue
+    if (isSessionLive(ctx, entry.id)) {
+      // live：只干跑判定是否**有**墓碑，有就记台账供开机补清
+      const dry = purgeSessionFile(entry.file, entry.id)
+      if (dry.status === 'planned') {
+        ledger.pending[entry.id] = { turns: dry.turns, removed: dry.removed, at: new Date().toISOString(), why: 'live' }
+        results.push({ ...dry, status: 'live-skipped' })
+      }
+      continue
+    }
+    const r = purgeSessionFile(entry.file, entry.id, { write, backupDir })
+    if (r.status === 'written') {
+      delete ledger.pending[entry.id]
+      try { rmSync(home + '/storages/session_projcache/sessions/' + entry.id + '.json', { force: true }) } catch { /* ignore */ }
+    } else if (r.status === 'planned') {
+      ledger.pending[entry.id] = { turns: r.turns, removed: r.removed, at: new Date().toISOString(), why: 'dry-run' }
+    }
+    results.push(r)
+    if (typeof options.onResult === 'function') {
+      try { options.onResult(r) } catch { /* ignore */ }
+    }
+  }
+  if (write) writePendingLedger(home, ledger)
+  return { write, results, pending: Object.keys(ledger.pending).length }
+}
+
+/** 装配本层：开机早期多轮补清 + 待清理台账每 60 秒重试一次。 */
+export function installTrueDelete(ctx, config = {}) {
+  if (config?.trueDelete === false) return undefined
+  const home = dshHomeDir()
+  const summarise = (tag, r) => {
+    const written = r.results.filter((x) => x.status === 'written')
+    const liveSkipped = r.results.filter((x) => x.status === 'live-skipped')
+    const failed = r.results.filter((x) => x.status === 'failed')
+    if (written.length === 0 && liveSkipped.length === 0 && failed.length === 0) return
+    appendCompatLog(
+      'true-delete[' + tag + '] written=' + written.length + ' liveSkipped=' + liveSkipped.length
+        + ' failed=' + failed.length + ' pending=' + r.pending
+        + (written.length > 0 ? ' ids=' + written.map((x) => x.sid.slice(0, 16) + '(' + x.events + '->' + x.after + ')').join(' ') : '')
+        + (failed.length > 0 ? ' failedIds=' + failed.map((x) => x.sid.slice(0, 16)).join(' ') : ''),
+      home,
+    )
+  }
+  const run = (tag) => {
+    Promise.resolve()
+      .then(() => purgeTombstones(ctx, { home, write: true }))
+      .then((r) => summarise(tag, r))
+      .catch((e) => appendCompatLog('true-delete[' + tag + '] FAILED: ' + String(e?.message ?? e).slice(0, 160), home))
+  }
+  // 开机补清：越早越好——那时会话还没被激活（未 live），文件可安全重写
+  const timers = []
+  for (const ms of [3000, 20000, 60000, 180000]) {
+    const t = setTimeout(() => run('boot+' + (ms / 1000) + 's'), ms)
+    if (typeof t.unref === 'function') t.unref()
+    timers.push(t)
+  }
+  // 台账非空时每 60 秒重试一次（会话被切走/关闭后就不再 live）
+  const tick = setInterval(() => {
+    try {
+      const ledger = readPendingLedger(home)
+      if (Object.keys(ledger.pending).length === 0) return
+    } catch {
+      return
+    }
+    run('retry')
+  }, 60000)
+  if (typeof tick.unref === 'function') tick.unref()
+  timers.push(tick)
+  return { run, timers }
+}
+
 export function apply(ctx, config = {}) {
   // -1) 会话盘监视 + 标题投影预热（不依赖 llm，必须排在 llm 早退之前）
   try {
     installTitleWarm(ctx, config)
   } catch {
     /* 预热失败绝不拖垮 apply */
+  }
+
+  // -2) 真删除：物理切除墓碑（不依赖 llm，必须排在 llm 早退之前）
+  try {
+    installTrueDelete(ctx, config)
+  } catch {
+    /* 清理失败绝不拖垮 apply */
   }
 
   // 0) 上下文占用校准（不依赖 llm，必须排在下面的 llm 早退之前）

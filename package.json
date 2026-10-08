@@ -1,7 +1,7 @@
 {
   "name": "dsh-adapter-compat",
   "version": "9999.9.9",
-  "description": "DSH LLM adapter 兼容垫片五合一（回填 LlmAdapter 基类方法 / 自动压缩硬闸 / settings null-Config 防崩守卫 / 上下文占用中文化校准 / 会话盘监视+标题投影预热）：修复 imageRequestPricing 缺失导致的 /compact 静默失败；从代码层关闭自动压缩（手动 /compact 不受影响）；把 cordis 固化的 null runtime.Config 归一为 undefined，修复模型页打不开、设置保存失败、Agent 预设切换不可用（宿主 describe/write 一崩全崩）；把 contextPressure 的启发式外推按实测倍率校准，修中文会话「显示还剩 10% 却报超 1M 上限」；监视 sessions 目录，dsh-sync 下载落盘后自动重扫列表并全盘补齐会话标题投影，不用再重启。独立于任何被保护插件——不改它的文件，pnpm install 装回旧版也照样生效；也与配置文件无关，cordis.patch.yml 被覆盖也不失效。",
+  "description": "DSH LLM adapter 兼容垫片六合一（回填 LlmAdapter 基类方法 / 自动压缩硬闸 / settings null-Config 防崩守卫 / 上下文占用中文化校准 / 会话盘监视+标题投影预热）：修复 imageRequestPricing 缺失导致的 /compact 静默失败；从代码层关闭自动压缩（手动 /compact 不受影响）；把 cordis 固化的 null runtime.Config 归一为 undefined，修复模型页打不开、设置保存失败、Agent 预设切换不可用（宿主 describe/write 一崩全崩）；把 contextPressure 的启发式外推按实测倍率校准，修中文会话「显示还剩 10% 却报超 1M 上限」；监视 sessions 目录，dsh-sync 下载落盘后自动重扫列表并全盘补齐会话标题投影，不用再重启。独立于任何被保护插件——不改它的文件，pnpm install 装回旧版也照样生效；也与配置文件无关，cordis.patch.yml 被覆盖也不失效。",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -13,7 +13,9 @@
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
-    "test"
+    "test",
+    "true-delete.js",
+    "purge.js"
   ],
   "keywords": [
     "deepseek-harness",
