@@ -981,16 +981,18 @@ export function installTrueDelete(ctx, config = {}) {
       home,
     )
   }
-  const run = (tag) => {
+  /* sinceMs=0 → 全量积压清理（把所有能映射的墓碑都处理掉）。
+     钩子（目录变化）走增量：用台账里的 lastScanMs 只处理刚新增的。 */
+  const run = (tag, options = {}) => {
     Promise.resolve()
-      .then(() => purgeTombstones(ctx, { home, write: true }))
+      .then(() => purgeTombstones(ctx, { home, write: true, ...options }))
       .then((r) => summarise(tag, r))
       .catch((e) => appendCompatLog('true-delete[' + tag + '] FAILED: ' + String(e?.message ?? e).slice(0, 160), home))
   }
   // 开机补清：越早越好——那时会话还没被激活（未 live），文件可安全重写
   const timers = []
   for (const ms of [5000, 30000]) {
-    const t = setTimeout(() => run('boot+' + (ms / 1000) + 's'), ms)
+    const t = setTimeout(() => run('boot+' + (ms / 1000) + 's', { sinceMs: 0 }), ms)
     if (typeof t.unref === 'function') t.unref()
     timers.push(t)
   }

@@ -409,19 +409,44 @@ export function scrubDeep(node, depth = 0) {
 export function scrubStream(stream) {
   return scrubDeep({ stream })
 }
+/**
+ * 只清「文本/推理」块，保留 tool_use 等结构化块。
+ * 教训：直接把 data.message.content 置空会把**工具调用块**一起抹掉，
+ * 于是后续 tool/call 找不到生命周期 → verify 报「没有对应的 tool 生命周期」→ 护栏拒绝。
+ */
+export function emptyTextBlocks(blocks) {
+  if (!Array.isArray(blocks)) return blocks
+  return blocks.map((b) => {
+    if (!b || typeof b !== 'object') return b
+    const c = { ...b }
+    if (typeof c.text === 'string') c.text = ''
+    if (c.text && typeof c.text === 'object' && !Array.isArray(c.text)) {
+      for (const k of Object.keys(c.text)) if (typeof c.text[k] === 'string') c.text[k] = ''
+    }
+    if (typeof c.reasoning === 'string') c.reasoning = ''
+    if (typeof c.reasoning_content === 'string') c.reasoning_content = ''
+    if (typeof c.thinking === 'string') c.thinking = ''
+    return c
+  })
+}
+
 export function redactEventPayload(event) {
   if (!event || typeof event !== 'object' || !event.data || typeof event.data !== 'object') return event
   if (RESIDUE_TYPES.has(event.type)) {
-    const d = event.data
-    const keep = {}
-    for (const k of ['turn', 'step', 'retryId', 'attemptId', 'reason']) if (d[k] !== undefined) keep[k] = d[k]
-    return { ...event, data: keep }
+    /* 只删「文本载体」字段，其余（turn/step/retryId/attemptId/reason 以及任何
+       序号/计数标量）全部保留。用白名单会丢掉 llm/retry 的**策略重试序号**，
+       校验器随即报「跳过了策略重试序号」。 */
+    const d = { ...event.data }
+    for (const k of ['content', 'text', 'stream', 'messages', 'prompt', 'reasoning', 'reasoning_content', 'thinking']) {
+      if (d[k] !== undefined) delete d[k]
+    }
+    return { ...event, data: d }
   }
   const data = { ...event.data }
-  if (Array.isArray(data.content)) data.content = []
+  if (Array.isArray(data.content)) data.content = emptyTextBlocks(data.content)
   if (data.message && typeof data.message === 'object') {
     const msg = { ...data.message }
-    if (Array.isArray(msg.content)) msg.content = []
+    if (Array.isArray(msg.content)) msg.content = emptyTextBlocks(msg.content)
     if (typeof msg.text === 'string') msg.text = ''
     if (typeof msg.reasoning_content === 'string') msg.reasoning_content = ''
     if (typeof msg.reasoning === 'string') msg.reasoning = ''
