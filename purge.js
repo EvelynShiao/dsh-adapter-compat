@@ -65,6 +65,30 @@ export function planPurge(events) {
   }
   const remove = new Set();
   for (const turn of turnSet) for (const sq of seqsOfTurn(events, turn)) remove.add(sq);
+
+  /* 孤立的 agent/inbox/spliced：它记录的 user 消息已经被物理删除，但被问的文本
+     还留在这条日志事件里（Timeline/文件都还看得见）。判别用 rpcId 引用次数：
+     仍活着的消息其 rpcId 在整份日志里出现 2 次（spliced + user/message），
+     被删掉的只剩 1 次 —— 实测已验证（3590 出现 2 次仍在，3606/3609 只剩 1 次）。
+     只在本次确实要删轮次时才顺带清理，避免误伤「消息发出但轮次从未运行」的场景。 */
+  if (turnSet.size > 0) {
+    const rpcCounts = new Map();
+    for (const event of events) {
+      for (const m of JSON.stringify(event).matchAll(/"rpcId":"([^"]+)"/g)) {
+        rpcCounts.set(m[1], (rpcCounts.get(m[1]) ?? 0) + 1);
+      }
+    }
+    for (const event of events) {
+      if (event.type !== 'agent/inbox/spliced') continue;
+      const inserted = Array.isArray(event.data?.inserted) ? event.data.inserted : [];
+      if (inserted.length === 0) continue;
+      const orphan = inserted.every((ins) => {
+        const id = ins?.source?.rpcId;
+        return typeof id === 'string' && (rpcCounts.get(id) ?? 0) <= 1;
+      });
+      if (orphan) remove.add(event.seq);
+    }
+  }
   return { remove: [...remove].sort((a, b) => a - b), turns: [...turnSet].sort((a, b) => a - b), skipped };
 }
 

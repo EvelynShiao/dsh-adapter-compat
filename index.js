@@ -987,7 +987,7 @@ export function apply(ctx, config = {}) {
   // 0) 上下文占用校准（不依赖 llm，必须排在下面的 llm 早退之前）
   const installPressureCalibration = (final = false) => {
     try {
-      const projections = ctx.sessionProjections ?? ctx.get?.('sessionProjections')
+      const projections = serviceOf(ctx, 'sessionProjections')
       const patchedNow = calibrateContextPressure(projections)
       /* 落盘铁证：既报走了哪条挂接路径，也报一次算术自证。
          合成状态 pressure=200000 / surface=150000 / sampled=100000（倍率 2）：
