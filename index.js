@@ -1249,7 +1249,24 @@ export async function slimSessionFile(ctx, sessionId, options = {}) {
   return result
 }
 
-/** 注册瘦身路由（POST JSON {sessionId, write}）。 */
+/** 列出会话（含体积与标题）供瘦身面板挑选，按体积降序。 */
+export function slimListSessions(home = dshHomeDir()) {
+  const out = []
+  for (const entry of listSessionFiles(home)) {
+    let size = 0
+    try { size = statSync(entry.file).size } catch { /* ignore */ }
+    let title = null
+    try {
+      const pc = JSON.parse(readFileSync(home + '/storages/session_projcache/sessions/' + entry.id + '.json', 'utf8'))
+      title = pc?.record?.title ?? pc?.title ?? null
+    } catch { /* 无投影缓存 */ }
+    out.push({ id: entry.id, title, sizeBytes: size })
+  }
+  out.sort((a, b) => b.sizeBytes - a.sizeBytes)
+  return out
+}
+
+/** 注册瘦身路由（POST JSON {sessionId, write}）+ 瘦身列表路由（GET）。 */
 export function installSlimRoute(ctx, config = {}) {
   if (config?.slimSession === false) return false
   try {
@@ -1280,6 +1297,22 @@ export function installSlimRoute(ctx, config = {}) {
       },
     })
     appendCompatLog('slim route registered')
+    // 瘦身列表（GET）：供设置页面板挑选会话
+    try {
+      web.register({
+        kind: 'exact',
+        path: '/dsh-adapter-compat/slim-list',
+        handler: async (req, res) => {
+          const reply = (status, obj) => {
+            try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+          }
+          if (req.method !== 'GET') return reply(405, { ok: false, error: 'method-not-allowed' })
+          try { return reply(200, { ok: true, value: slimListSessions() }) }
+          catch (e) { return reply(500, { ok: false, error: String(e?.message ?? e) }) }
+        },
+      })
+      appendCompatLog('slim-list route registered')
+    } catch { /* 列表路由失败不影响瘦身路由 */ }
     return true
   } catch { return false }
 }
