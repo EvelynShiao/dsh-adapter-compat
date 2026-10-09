@@ -81,7 +81,9 @@ export const name = 'adapter-compat'
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs'
 import { zstdCompressSync, constants as zstdConstants, zstdDecompressSync } from 'node:zlib'
 import { purgeSessionFile, readPendingLedger, writePendingLedger } from './purge.js'
-import { redactSessionFile } from './purge.js'
+import { redactEventPayload, redactSessionFile } from './purge.js'
+import { readSession, writeSession, verify as verifySessionEvents } from './true-delete.js'
+import { slimSession } from './slim.js'
 
 export const inject = ['llm']
 
@@ -1204,10 +1206,95 @@ export function installMoveRoute(ctx, config = {}) {
   }
 }
 
+/**
+ * 瘦身一个会话：定位 → live 判定 → 瘦身 → verify → 备份 → 写 → 读回复核 → 清 projcache → 刷新。
+ * live 会话拒写（内存事件数组与文件错位，下次 flush 把原文写回 + seq 错乱）——照 session-kit
+ * repairCurrentSession 的权威范式：409 让用户切走再操作。
+ * @param {object} ctx - cordis 上下文（只用于 live 判定与列表刷新）。
+ * @param {string} sessionId - 目标会话 id。
+ * @param {{write?:boolean, home?:string}} options - write:true 才落盘（默认干跑）。
+ */
+export async function slimSessionFile(ctx, sessionId, options = {}) {
+  const home = options.home ?? dshHomeDir()
+  const write = options.write === true
+  const located = listSessionFiles(home).find((x) => x.id === sessionId)
+  if (!located) throw Object.assign(new Error('session file not found'), { code: 'NOT_FOUND' })
+  if (isSessionLive(ctx, sessionId)) {
+    throw Object.assign(new Error('session is open in the host; switch to another conversation first'), { code: 'SESSION_LIVE' })
+  }
+  const r = slimSession(located.file)
+  if (!r.ok) {
+    throw Object.assign(new Error('slim verify failed: ' + (r.problems?.[0] ?? '')), { code: 'VERIFY_FAILED', problems: r.problems })
+  }
+  const result = { ok: true, write, id: sessionId, before: r.before, after: r.after, saved: r.saved, events: r.events }
+  if (!write) return result
+  // 备份（独立目录，别和真删除墓碑清理的备份混一起）
+  const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR + '-slim'
+  let backupPath = null
+  try { mkdirSync(backupDir, { recursive: true }); backupPath = backupDir + '/' + sessionId + '.jsonl.zstd'; copyFileSync(located.file, backupPath); result.backup = true } catch { result.backup = false }
+  // 写 + 读回复核（不过就回滚）
+  writeSession(located.file, r.header, r.slimmed)
+  const back = readSession(located.file)
+  const v2 = verifySessionEvents(back.header, back.events)
+  if (!v2.ok) {
+    try { if (backupPath) copyFileSync(backupPath, located.file) } catch { /* 尽力回滚 */ }
+    throw Object.assign(new Error('post-write verify failed; rolled back'), { code: 'VERIFY_FAILED' })
+  }
+  // 内容变了 → 投影要冷重建
+  try { rmSync(home + '/storages/session_projcache/sessions/' + sessionId + '.json', { force: true }) } catch { /* ignore */ }
+  // 刷新列表
+  try { const sessions = serviceOf(ctx, 'sessions'); if (typeof sessions?.refresh === 'function') await sessions.refresh() } catch { /* ignore */ }
+  try { result.bytes = statSync(located.file).size } catch { /* ignore */ }
+  appendCompatLog(`slim ${sessionId.slice(0, 18)}: ${r.before} -> ${r.after} (saved ${r.saved}, events ${r.events})`)
+  return result
+}
+
+/** 注册瘦身路由（POST JSON {sessionId, write}）。 */
+export function installSlimRoute(ctx, config = {}) {
+  if (config?.slimSession === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') return false
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/slim',
+      handler: async (req, res) => {
+        const reply = (status, obj) => {
+          try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+        }
+        if (req.method !== 'POST') return reply(405, { ok: false, error: 'method-not-allowed' })
+        let body = ''
+        try {
+          for await (const chunk of req) { body += chunk; if (body.length > 65536) throw new Error('body too large') }
+          const parsed = JSON.parse(body || '{}')
+          if (typeof parsed?.sessionId !== 'string' || !parsed.sessionId) return reply(400, { ok: false, error: 'sessionId required' })
+          const result = await slimSessionFile(ctx, parsed.sessionId, { write: parsed.write === true })
+          appendCompatLog(`slim route ok: ${JSON.stringify(result).slice(0, 200)}`)
+          return reply(200, result)
+        } catch (error) {
+          const msg = String(error?.message ?? error)
+          const code = error?.code === 'SESSION_LIVE' ? 409 : error?.code === 'NOT_FOUND' ? 404 : 400
+          appendCompatLog(`slim route FAILED(${code}): ${msg.slice(0, 200)}`)
+          return reply(code, { ok: false, error: msg, problems: error?.problems })
+        }
+      },
+    })
+    appendCompatLog('slim route registered')
+    return true
+  } catch { return false }
+}
+
 export function apply(ctx, config = {}) {
   // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
   try {
     installMoveRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.5) 会话瘦身：路由（不依赖 llm，排在早退之前）
+  try {
+    installSlimRoute(ctx, config)
   } catch {
     /* 路由注册失败绝不拖垮 apply */
   }
