@@ -85,7 +85,7 @@ import { redactEventPayload, redactSessionFile } from './purge.js'
 import { readSession, writeSession, verify as verifySessionEvents } from './true-delete.js'
 import { slimSession } from './slim.js'
 
-export const inject = ['llm']
+export const inject = ['llm', 'webServer']
 
 /** 标记已包装，防止热重载后二次包装。 */
 const WRAPPED = Symbol.for('dsh-adapter-compat.wrapped')
@@ -1271,7 +1271,10 @@ export function installSlimRoute(ctx, config = {}) {
   if (config?.slimSession === false) return false
   try {
     const web = serviceOf(ctx, 'webServer')
-    if (!web || typeof web.register !== 'function') return false
+    if (!web || typeof web.register !== 'function') {
+      appendCompatLog('slim route: webServer unavailable (web=' + typeof web + ', register=' + typeof web?.register + ')')
+      return false
+    }
     web.register({
       kind: 'exact',
       path: '/dsh-adapter-compat/slim',
@@ -1314,7 +1317,10 @@ export function installSlimRoute(ctx, config = {}) {
       appendCompatLog('slim-list route registered')
     } catch { /* 列表路由失败不影响瘦身路由 */ }
     return true
-  } catch { return false }
+  } catch (e) {
+    appendCompatLog('slim route FAILED: ' + String(e?.message ?? e).slice(0, 200))
+    return false
+  }
 }
 
 export function apply(ctx, config = {}) {
