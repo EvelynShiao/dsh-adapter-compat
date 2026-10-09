@@ -1249,21 +1249,51 @@ export async function slimSessionFile(ctx, sessionId, options = {}) {
   return result
 }
 
-/** 列出会话（含体积与标题）供瘦身面板挑选，按体积降序。 */
+/** 列出会话供瘦身面板挑选：照桌面 UI 的结构与顺序分组（工作区→会话），带标题与体积。
+ *  顺序取 workspace.json 的 global.workspaceIds（工作区）与 sessionIds（会话），与侧边栏一致。 */
 export function slimListSessions(home = dshHomeDir()) {
-  const out = []
+  // id -> {file, sizeBytes}
+  const fileById = new Map()
   for (const entry of listSessionFiles(home)) {
     let size = 0
     try { size = statSync(entry.file).size } catch { /* ignore */ }
-    let title = null
-    try {
-      const pc = JSON.parse(readFileSync(home + '/storages/session_projcache/sessions/' + entry.id + '.json', 'utf8'))
-      title = pc?.record?.title ?? pc?.title ?? null
-    } catch { /* 无投影缓存 */ }
-    out.push({ id: entry.id, title, sizeBytes: size })
+    fileById.set(entry.id, { file: entry.file, sizeBytes: size })
   }
-  out.sort((a, b) => b.sizeBytes - a.sizeBytes)
-  return out
+  const readTitle = (id) => {
+    try {
+      const pc = JSON.parse(readFileSync(home + '/storages/session_projcache/sessions/' + id + '.json', 'utf8'))
+      return pc?.record?.title ?? pc?.title ?? null
+    } catch { return null }
+  }
+  let doc = null
+  try { doc = JSON.parse(readFileSync(home + '/storages/workspace.json', 'utf8')) } catch { /* ignore */ }
+  const table = doc?.tables?.workspaces
+  const wsIds = Array.isArray(doc?.global?.workspaceIds) ? doc.global.workspaceIds : []
+  const groups = []
+  const seenIds = new Set()
+  const pushWs = (id) => {
+    const w = table?.[id]
+    if (!w || typeof w !== 'object') return
+    const sessions = []
+    for (const sid of (Array.isArray(w.sessionIds) ? w.sessionIds : [])) {
+      const f = fileById.get(sid)
+      if (!f) continue
+      seenIds.add(sid)
+      sessions.push({ id: sid, title: readTitle(sid), sizeBytes: f.sizeBytes })
+    }
+    if (sessions.length) groups.push({ workspaceTitle: w.title ?? '(未命名)', workspacePath: w.path ?? '', sessions })
+  }
+  for (const id of wsIds) pushWs(id)
+  // 表里有、但不在 workspaceIds 的悬空工作区也带上
+  for (const id of Object.keys(table ?? {})) if (!wsIds.includes(id)) pushWs(id)
+  // 完全没被 workspace.json 覆盖的孤儿会话兜底（避免漏）
+  const orphans = []
+  for (const [sid, f] of fileById) {
+    if (seenIds.has(sid)) continue
+    orphans.push({ id: sid, title: readTitle(sid), sizeBytes: f.sizeBytes })
+  }
+  if (orphans.length) groups.push({ workspaceTitle: '(未分组)', workspacePath: '', sessions: orphans })
+  return groups
 }
 
 /** 注册瘦身路由（POST JSON {sessionId, write}）+ 瘦身列表路由（GET）。 */
