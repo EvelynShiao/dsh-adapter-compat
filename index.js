@@ -1262,7 +1262,11 @@ export function slimListSessions(home = dshHomeDir()) {
   const readTitle = (id) => {
     try {
       const pc = JSON.parse(readFileSync(home + '/storages/session_projcache/sessions/' + id + '.json', 'utf8'))
-      return pc?.record?.title ?? pc?.title ?? null
+      // projcache 真实结构：record.rows.title = {ver, seq, val}，正文在 .val
+      const t = pc?.record?.rows?.title
+      if (typeof t === 'string' && t) return t
+      if (t && typeof t === 'object' && typeof t.val === 'string' && t.val) return t.val
+      return null
     } catch { return null }
   }
   let doc = null
