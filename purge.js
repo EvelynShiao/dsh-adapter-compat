@@ -437,8 +437,15 @@ export function redactEventPayload(event) {
        序号/计数标量）全部保留。用白名单会丢掉 llm/retry 的**策略重试序号**，
        校验器随即报「跳过了策略重试序号」。 */
     const d = { ...event.data }
-    for (const k of ['content', 'text', 'stream', 'messages', 'prompt', 'reasoning', 'reasoning_content', 'thinking']) {
+    for (const k of ['content', 'text', 'messages', 'prompt', 'reasoning', 'reasoning_content', 'thinking']) {
       if (d[k] !== undefined) delete d[k]
+    }
+    /* settlement 保留（2026-10-09 根治 34da7d62 三连环）：stream 是宿主种子校验的
+       必填字段——attempt 缺 stream 整个会话就打不开（gateway: invalid settlement
+       fields）。不能整条删；改为就地擦文本：数组与 chunk 结构保留（校验照过），
+       texts/delta 等内容照样清空（真删除语义不变，残余行隐藏仍归 windowExtras 台账）。 */
+    if (d.stream !== undefined) {
+      try { scrubDeep({ stream: d.stream }) } catch { /* 保结构优先，擦失败不阻断 */ }
     }
     return { ...event, data: d }
   }
