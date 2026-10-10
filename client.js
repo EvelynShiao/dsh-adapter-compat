@@ -192,14 +192,9 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
-      try {
-        ctx.slots.inject('settings.section', () => ctx.slots.register({
-          name: 'settings.section',
-          id: `${NS}-move`,
-          order: 36,
-          label: () => ZH.nav,
-        }, MoveSessionSection))
-      } catch { /* 设置区注入失败绝不拖垮宿主 */ }
+      /* 2026-10-10 用户定案：顶级「会话搬家」分区退役——唯一入口改为
+         设置 → 会话与提示词 → 会话搬家（批量）（session-kit 的批量面板）。
+         本客户端不再注册任何 UI；move-session 宿主路由照常服务批量面板。 */
     }
 
     exports.apply = apply
