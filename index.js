@@ -919,6 +919,7 @@ export async function purgeTombstones(ctx, options = {}) {
   const results = []
   for (const entry of listSessionFiles(home)) {
     if (options.only !== undefined && options.only !== entry.id) continue
+    if (options.pendingOnly === true && !ledger.pending[entry.id]) continue   // 重试只碰待清项
     if (isSessionLive(ctx, entry.id)) {
       /* live 会话不能整轮切除（内存事件数组会与文件错位），改走**就地擦文本**：
          清掉被删轮次里用户自己的消息正文，Timeline 立刻不再显示；seq/事件数不变，
@@ -926,13 +927,22 @@ export async function purgeTombstones(ctx, options = {}) {
       const red = redactSessionFile(entry.file, entry.id, { sinceMs, write, backupDir })
       if (red.status === 'redacted') {
         writtenIds.add(entry.id)
-        delete ledger.pending[entry.id]
         try { rmSync(home + '/storages/session_projcache/sessions/' + entry.id + '.json', { force: true }) } catch { /* ignore */ }
         results.push(red)
       } else if (red.status === 'planned' || red.status === 'skipped') {
-        ledger.pending[entry.id] = { removed: red.removed, at: new Date().toISOString(), why: 'live', note: red.notes[0] }
         results.push({ ...red, status: 'live-skipped' })
       }
+      /* 2026-10-10 死锁修复：live 轻擦后必须保留 pending（待整轮切除）——
+         此前 redact 成功即删台账 → 60s 重试认为完工 → 整轮切除永远排不上；
+         而重启后会话又是最先活过来的（自动恢复）→ 永远只有轻擦 →
+         Timeline 里留下 [图片或文件] 空壳墓碑。现在只要 plan 还有活就记账，
+         等首个非 live 窗口（60s 重试 / 下次开机前 5s 黄金窗）物理切除。 */
+      try {
+        const probe = planPurge(readSession(entry.file).events, { sinceMs: 0 })
+        if (probe.remove.length > 0) {
+          ledger.pending[entry.id] = { turns: probe.turns, removed: probe.remove.length, at: new Date().toISOString(), why: 'live', note: 'redact 已做，待非 live 整轮切除' }
+        }
+      } catch { /* 读不了就不动台账 */ }
       continue
     }
     const r = purgeSessionFile(entry.file, entry.id, { write, backupDir, sinceMs })
@@ -940,6 +950,8 @@ export async function purgeTombstones(ctx, options = {}) {
       writtenIds.add(entry.id)
       delete ledger.pending[entry.id]
       try { rmSync(home + '/storages/session_projcache/sessions/' + entry.id + '.json', { force: true }) } catch { /* ignore */ }
+    } else if (r.status === 'clean' || r.status === undefined) {
+      delete ledger.pending[entry.id]   // 无事可清 → 销账，重试链终止
     } else if (r.status === 'planned') {
       ledger.pending[entry.id] = { turns: r.turns, removed: r.removed, at: new Date().toISOString(), why: 'dry-run' }
     }
@@ -1016,7 +1028,7 @@ export function installTrueDelete(ctx, config = {}) {
   const retryTimer = setInterval(() => {
     try {
       const l = readPendingLedger(home)
-      if (l && l.pending && Object.keys(l.pending).length > 0) run('pending-retry', { sinceMs: 0 })
+      if (l && l.pending && Object.keys(l.pending).length > 0) run('pending-retry', { sinceMs: 0, pendingOnly: true })
     } catch { /* ignore */ }
   }, 60000)
   if (typeof retryTimer.unref === 'function') retryTimer.unref()
