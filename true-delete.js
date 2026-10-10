@@ -1268,8 +1268,9 @@ export function verify(header, events, opts = {}) {
     if (SURFACE_TYPES.has(event.type)) stats.carriers += 1;
   });
 
-  if (turn !== null) P(`末尾 turn 未关闭（turn ${turn}）`);
-  if (step !== null) P(`末尾 step 未关闭（step ${step}）`);
+  // 尾轮未闭合 ≠ 坏文件（2026-10-10 实证：ef191486 带 open tail 被宿主正常打开使用）。
+  // 曾作为 hard 拒绝 → 红action/切除永远过不了 verify → 墓碑残留永久卡死。降级为提示。
+  if (turn !== null || step !== null) stats.unclosedTail = { turn, step };
   if (protectedHead === undefined) P("没有任何受保护系统头（第一条表层事件必须是 system/message）");
   if (stats.replaces === 0) { /* 合法：没有 replace 的会话 */ }
   stats.systemHead = protectedHead ?? null;

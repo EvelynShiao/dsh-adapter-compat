@@ -761,6 +761,9 @@ export function installSessionWatch(ctx, options = {}) {
     Promise.resolve()
       .then(() => rescanAndWarm(ctx, options))
       .catch(() => {})
+      // 目录变化 → 真删除扫描（line 854 注释本该有的调用点，此前丢失 → pending 永不重试）。
+      // purge 幂等，写盘会再触发一轮 watcher，收敛后自然停（多跑一轮空扫）。
+      .then(() => { try { if (typeof compatHooks.purge === 'function') compatHooks.purge() } catch { /* ignore */ } })
       .finally(() => {
         state.busy = false
         try {
@@ -963,6 +966,8 @@ export async function purgeTombstones(ctx, options = {}) {
   } catch { /* 审计失败不影响清理 */ }
   ledger.lastScanMs = Date.now()
   if (write) writePendingLedger(home, ledger)
+  // 顺手清 Timeline 孤儿索引（文件已删的会话）——零墓碑第三条腿，幂等
+  try { pruneBlockOrphans(home) } catch { /* ignore */ }
   return { write, results, pending: Object.keys(ledger.pending).length, sinceMs }
 }
 
@@ -1003,6 +1008,50 @@ export function installTrueDelete(ctx, config = {}) {
      不再常驻轮询——用户明确要求「开机、下载后扫一下就差不多」。 */
   compatHooks.purge = () => run('hook')
   return { run, timers }
+}
+
+/* Timeline 块索引孤儿清理（三插件零墓碑的第三条腿）：
+   session-kit/easyrewrite 删掉整个会话后 session-blocks.db 里该会话的块还留着
+   → 右栏永远显示墓碑。文件消失即索引孤儿——每次真删除扫描顺手清（幂等）。
+   实证：手机端曾积 37 个孤儿（2026-10-09 手动清过），此前插件层无人清。 */
+export function pruneBlockOrphans(home) {
+  try {
+    const dbPath = home + '/session-blocks.db'
+    if (!existsSync(dbPath)) return 0
+    const { DatabaseSync } = require('node:sqlite')
+    const files = new Set(listSessionFiles(home).map((e) => e.id))
+    const db = new DatabaseSync(dbPath)
+    try {
+      try { db.exec('PRAGMA journal_mode=WAL') } catch { /* ignore */ }
+      const orphanIds = db.prepare('SELECT id FROM indexed_sessions').all().map((r) => r.id).filter((id) => !files.has(id))
+      if (orphanIds.length === 0) return 0
+      const run = (sql, args) => { try { db.prepare(sql).run(...args) } catch { /* 表可能不存在 */ } }
+      for (const id of orphanIds) {
+        // FTS 虚表须按 block_meta.fts_rowid 删（SQLite 标准删除法），先于 meta
+        let ftsRows = []
+        try { ftsRows = db.prepare('SELECT fts_rowid FROM block_meta WHERE session_id = ?').all(id).map((r) => r.fts_rowid) } catch {}
+        for (let i = 0; i < ftsRows.length; i += 400) {
+          const chunk = ftsRows.slice(i, i + 400)
+          run(`DELETE FROM block_fts WHERE rowid IN (${chunk.map(() => '?').join(',')})`, chunk)
+        }
+        let blockIds = []
+        try { blockIds = db.prepare('SELECT block_id FROM block_meta WHERE session_id = ?').all(id).map((r) => r.block_id) } catch {}
+        for (let i = 0; i < blockIds.length; i += 400) {
+          const chunk = blockIds.slice(i, i + 400)
+          run(`DELETE FROM block_text WHERE block_id IN (${chunk.map(() => '?').join(',')})`, chunk)
+        }
+        run('DELETE FROM attribute WHERE session_id = ?', [id])
+        run('DELETE FROM block_meta WHERE session_id = ?', [id])
+        run('DELETE FROM indexed_sessions WHERE id = ?', [id])
+      }
+      try { db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').run() } catch {}
+      try {
+        require('node:fs').appendFileSync(home + '/dsh-adapter-compat.log',
+          new Date().toISOString() + ' block-orphans pruned: ' + orphanIds.length + ' 个已删会话的索引\n')
+      } catch {}
+      return orphanIds.length
+    } finally { db.close() }
+  } catch { return 0 }
 }
 
 /* ============ 第七层：会话改工作区（move-session） ===========
