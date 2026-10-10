@@ -619,6 +619,24 @@ export function excise(header, events, removeSeqs, options = {}) {
     const ev = clone(e);
     ev.seq = finalMap.get(oldSeq);
 
+    // 7-pre. delivery throughSeq（session-log-deepseek 等插件的水位线）：宿主校验
+    // 「delivery throughSeq must precede its marker」。重映射到存活映射；目标已被
+    // 删除的夹到新 seq-1（水位线语义：宁可少承诺不越界）。2026-10-10 bee75240 实证：
+    // 漏了这步会致 throughSeq 恒 +82 越界、整个会话打不开。
+    if (ev.data && typeof ev.data === "object") {
+      const fixThroughSeq = (node) => {
+        if (!node || typeof node !== "object") return;
+        for (const [k, v] of Object.entries(node)) {
+          if (k === "throughSeq" && typeof v === "number") {
+            const mapped = finalMap.get(v);
+            const nv = mapped !== undefined && mapped < ev.seq ? mapped : ev.seq - 1;
+            if (nv !== v) { node[k] = nv; bump("throughSeq"); }
+          } else if (v && typeof v === "object") fixThroughSeq(v);
+        }
+      };
+      fixThroughSeq(ev.data);
+    }
+
     // 7a. turn 号
     if (ev.data && typeof ev.data === "object" && Object.hasOwn(ev.data, "turn") && typeof ev.data.turn === "number") {
       const nt = turnMap.get(ev.data.turn);
@@ -938,6 +956,18 @@ export function verify(header, events, opts = {}) {
     if (event.seq !== index) P(`seq 不 dense：第 ${index} 行 seq=${event.seq}`);
     if (typeof event.type !== "string") P(`事件 ${index} 缺 type`);
     if (!isSeq(event.time)) P(`事件 ${index}（${event.type}）缺合法 time`);
+    // throughSeq 通用规则（宿主 gateway：delivery throughSeq must precede its marker）——
+    // 对插件事件（session-log-deepseek 等）同样生效，放在类型早退之前。
+    if (isObj(event.data)) {
+      const chkTs = (node) => {
+        if (!isObj(node)) return;
+        for (const [k, v] of Object.entries(node)) {
+          if (k === "throughSeq" && typeof v === "number" && v >= event.seq) P(`事件 ${index}（${event.type}@${event.seq}）throughSeq ${v} 不早于自身`);
+          else if (isObj(v)) chkTs(v);
+        }
+      };
+      chkTs(event.data);
+    }
     for (const k of Object.keys(event)) if (!ENVELOPE_KEYS.has(k)) P(`事件 ${index}（${event.type}）信封出现多余键 ${k}`);
     if (event.ignorable !== undefined && event.ignorable !== true) P(`事件 ${index} ignorable 只能是 true`);
     if (!KNOWN_EVENT_TYPES.has(event.type) && event.ignorable !== true) P(`事件 ${index} 类型 ${event.type} 不在词汇表内且未标 ignorable`);
