@@ -7,7 +7,7 @@
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { readSession, writeSession, excise, verify, seqsOfTurn, decodeSeqRanges, foldSurfaceLoose } from './true-delete.js';
+import { readSession, writeSession, excise, verify, seqsOfTurn, decodeSeqRanges, foldSurfaceLoose, SURFACE_TYPES } from './true-delete.js';
 
 /** 会写盘的调用方必须显式传 write:true；默认干跑。 */
 export const PURGE_DEFAULTS = Object.freeze({ write: false, only: undefined, home: undefined });
@@ -98,15 +98,49 @@ export function planPurge(events, options = {}) {
   const sinceMs = Number.isFinite(options.sinceMs) ? options.sinceMs : undefined;
   const byseq = new Map(events.map((e) => [e.seq, e]));
   const turnSet = new Set();
+  const surgical = new Set();
   const skipped = [];
   for (const e of events) {
     const c = classifyTombstoneCarrier(e);
-    if (!c) continue;
+    if (!c) {
+      /* delete-turn 遮蔽（kind=plugin:dsh-delete-turn）：分类器只认 dsh-session-kit- 前缀
+         直接跳过它 → 其删除内容永不被物理切除（实测：测试会话 message2 残留的根因）。
+         外科摘除被遮蔽的节点段 startSeq..endSeq（表层节点=事件 seq），绝不动整轮。 */
+      const k = e.data?.source?.kind;
+      const op = e.surfaceOp;
+      if (k === 'plugin:dsh-delete-turn' && op && typeof op === 'object' && op.op === 'replace'
+          && Number.isFinite(op.startSeq) && Number.isFinite(op.endSeq) && op.endSeq >= op.startSeq) {
+        if (sinceMs !== undefined && !(Number.isFinite(e.time) && e.time >= sinceMs)) continue;
+        /* delete-turn 删的通常是「某轮的全部内容」（实测 Chrome turn13：用户+5步全在遮蔽里、
+           只剩 turn/start/step 边界骨架在外）——按轮号整轮摘（turnSet→seqsOfTurn）：
+           骨架随轮同去，无悬空 step/start/end；轮号由 excise 顺移补齐（12→14 变 12→13）。
+           单纯外科摘消息会留下「step/start 开了1、step/end 却关5」的算术残骸 → verify 拒。 */
+        let got = false;
+        for (let s = op.startSeq; s <= op.endSeq; s += 1) {
+          const node = byseq.get(s);
+          if (node && Number.isSafeInteger(node.data?.turn)) { turnSet.add(node.data.turn); got = true; }
+        }
+        if (!got) {
+          const starts = events.filter((x) => x.type === 'turn/start' && x.seq < op.startSeq && Number.isSafeInteger(x.data?.turn));
+          const last = starts[starts.length - 1];
+          if (last) turnSet.add(last.data.turn);
+        }
+      }
+      continue;
+    }
     /* 只认「刚新增的墓碑」：历史墓碑代表很久以前的删除，动它们会删掉用户
        并不打算删的内容（实测踩过：把两年前的删除当成"刚删的"）。 */
     if (sinceMs !== undefined && !(Number.isFinite(e.time) && e.time >= sinceMs)) continue;
     if (c.skip) { skipped.push({ seq: e.seq, why: c.why }); continue }
     if (c.needsNodeLookup) {
+      /* 记忆上下文快照轮换（kind=dsh-session-kit-memory-context 的 snapshot 替换）：
+         那是 session-kit 刷新自己的上下文快照，不是用户删轮——只外科摘除被遮蔽的旧快照
+         节点本身（孤儿 replace 标记由 excise 摘除逻辑自清），绝不整轮（整轮会吃掉轮内
+         真消息：Chrome 会话 turn15 实测 -6 用户 -1 AI）。 */
+      if (e.data?.source?.kind === 'dsh-session-kit-memory-context') {
+        for (const sq of c.sourcesFor) if (Number.isFinite(sq) && byseq.has(sq)) surgical.add(sq);
+        continue;
+      }
       /* legacy-turn-fallback：旧格式墓碑没有 summary.turn，两步反推：
          ① 被遮蔽的表层节点自带的 data.turn；
          ② 兜底：这些节点里最早那个 seq 之前最近的 turn/start。 */
@@ -144,7 +178,24 @@ export function planPurge(events, options = {}) {
   }
   const remove = new Set();
   for (const turn of turnSet) for (const sq of seqsOfTurn(events, turn)) remove.add(sq);
+  for (const sq of surgical) remove.add(sq);
 
+  /* 头序自愈（宿主 dsh-session-format-v3-to-v4 foldSurface 实测）：system/message 若在
+     其他 append 表层之后才出现（迟到）→ 宿主抛 "requires a protected first surface head"
+     整会话拒载。典型成因：切除清空系统头后 DSH 又在后续轮投递了 system（Chrome 会话实证）。
+     修法：拔光全部 system（宿主不罚缺失，无头=合法）。不设时间窗——违例即违例。 */
+  {
+    let surf = 0, protHead = undefined, late = false;
+    for (const e of events) {
+      if (!SURFACE_TYPES.has(e.type)) continue;
+      if (e.type === 'system/message' && surf > 0 && protHead === undefined) { late = true; break; }
+      if (e.surfaceOp === 'append') {
+        if (e.type === 'system/message' && surf === 0) protHead = e.seq;
+        surf += 1;
+      }
+    }
+    if (late) for (const e of events) if (e.type === 'system/message') remove.add(e.seq);
+  }
   return { remove: [...remove].sort((a, b) => a - b), turns: [...turnSet].sort((a, b) => a - b), skipped };
 }
 
@@ -302,7 +353,7 @@ export function purgeSessionFile(file, sid, options = {}) {
   const inputEvents = applyInboxRewrite(events, inboxRewrite.rewrites);
   let result;
   try {
-    result = excise(header, inputEvents, plan.remove, { expandToWholeTurns: true });
+    result = excise(header, inputEvents, plan.remove, { expandToWholeTurns: false }); // 外科摘除不得扩成整轮（2026-10-10 实测：扩展吃掉轮内真消息 turn15 -9用户-7AI；planPurge 的整轮计划本就自含整轮，扩展只对手术有害）
   } catch (error) {
     out.status = 'failed';
     out.notes.push('excise: ' + String(error?.message ?? error).slice(0, 200));

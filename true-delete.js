@@ -516,11 +516,11 @@ export function excise(header, events, removeSeqs, options = {}) {
       // 整轮删除：正常，不需要重编号，剩下的轮按顺序前移
       report.turnRenumber.push([t, null]);
     } else {
-      report.conflicts.push({
-        kind: "partially-removed-turn", turn: t, startSeq: rec.startSeq, endSeq: rec.endSeq,
-        removedInside, total: rec.endSeq - rec.startSeq + 1,
-        hint: "该 turn 只被删掉一部分：要么整轮删（推荐用 opts.expandToWholeTurns:true，会自动补上 turn/start 与 turn/end），要么别删",
-      });
+      /* 部分删除（2026-10-10 实测：头序自愈只拔一颗 system 而轮内其他事件存活）：
+         幸存事件仍以该轮自居——跳号会把后续轮压成重复号（turn20→19 → verify 序列炸）。
+         保留原轮号；只记 note 不阻断（整轮计划不受影响，planPurge 的正常产物仍走上面两支）。 */
+      turnMap.set(t, nextTurn++);
+      report.notes.push(`#${t} 轮被部分删除（${removedInside}/${rec.endSeq - rec.startSeq + 1}），保留原轮号`);
     }
   }
   for (const [o, n] of turnMap) if (n !== null && o !== n) report.turnRenumber.push([o, n]);
