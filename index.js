@@ -991,11 +991,15 @@ export function installTrueDelete(ctx, config = {}) {
   }
   /* sinceMs=0 → 全量积压清理（把所有能映射的墓碑都处理掉）。
      钩子（目录变化）走增量：用台账里的 lastScanMs 只处理刚新增的。 */
+  let inflight = false
   const run = (tag, options = {}) => {
+    if (inflight) return   // 防重入：目录钩子/定时器/开机可能交叠，绝不并发写盘
+    inflight = true
     Promise.resolve()
       .then(() => purgeTombstones(ctx, { home, write: true, ...options }))
       .then((r) => summarise(tag, r))
       .catch((e) => appendCompatLog('true-delete[' + tag + '] FAILED: ' + String(e?.message ?? e).slice(0, 160), home))
+      .finally(() => { inflight = false })
   }
   // 开机补清：越早越好——那时会话还没被激活（未 live），文件可安全重写
   const timers = []
@@ -1007,7 +1011,16 @@ export function installTrueDelete(ctx, config = {}) {
   /* 触发时机收敛：开机两次 + 会话目录变化后一次（见 rescanAndWarm 的钩子）。
      不再常驻轮询——用户明确要求「开机、下载后扫一下就差不多」。 */
   compatHooks.purge = () => run('hook')
-  return { run, timers }
+  /* 台账非空 → 60s 定点重试：清完即停，只在有待清项时存在（非常驻轮询）。
+     解决「开机时活体、窗口又错过 → 老墓碑永远等下次开机」的死角。 */
+  const retryTimer = setInterval(() => {
+    try {
+      const l = readPendingLedger(home)
+      if (l && l.pending && Object.keys(l.pending).length > 0) run('pending-retry', { sinceMs: 0 })
+    } catch { /* ignore */ }
+  }, 60000)
+  if (typeof retryTimer.unref === 'function') retryTimer.unref()
+  return { run, timers, retryTimer }
 }
 
 /* Timeline 块索引孤儿清理（三插件零墓碑的第三条腿）：

@@ -448,6 +448,18 @@ function turnTable(events) {
 export function excise(header, events, removeSeqs, options = {}) {
   const headerOut = clone(header) ?? header;
   const src = clone(events) ?? [];
+  /* 系统头级联（2026-10-10 宿主源码解码 dsh-session-format-v3-to-v4:599）：
+     宿主只罚「system/message 迟到」（首个 append 表层必须是它），不罚「完全没有」。
+     若切除波及任一 system/message，留下的后置 system 会变成迟到 → 宿主 foldSurface
+     抛 "requires a protected first surface head" 整会话打不开。故整族移除（无头合法）。
+     这些头带 turn/step 字段，单独保留会引用已删除轮号 → 必须同进同退。 */
+  if (Array.isArray(removeSeqs) && removeSeqs.length > 0) {
+    const hitSeqs = new Set(removeSeqs);
+    const hasSystemHit = src.some((e) => e.type === "system/message" && hitSeqs.has(e.seq));
+    if (hasSystemHit) {
+      for (const e of src) if (e.type === "system/message" && !hitSeqs.has(e.seq)) removeSeqs = [...removeSeqs, e.seq];
+    }
+  }
   const report = {
     input: { events: src.length, header: headerOut?.id ?? null },
     removed: { requested: 0, effective: 0, seqs: [], byType: {} },
@@ -1271,7 +1283,6 @@ export function verify(header, events, opts = {}) {
   // 尾轮未闭合 ≠ 坏文件（2026-10-10 实证：ef191486 带 open tail 被宿主正常打开使用）。
   // 曾作为 hard 拒绝 → 红action/切除永远过不了 verify → 墓碑残留永久卡死。降级为提示。
   if (turn !== null || step !== null) stats.unclosedTail = { turn, step };
-  if (protectedHead === undefined) P("没有任何受保护系统头（第一条表层事件必须是 system/message）");
   if (stats.replaces === 0) { /* 合法：没有 replace 的会话 */ }
   stats.systemHead = protectedHead ?? null;
   stats.surfaceNodes = surface.length;
