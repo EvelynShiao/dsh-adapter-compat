@@ -5,7 +5,7 @@
  * 本文件只负责「找哪些会话有可清理墓碑 → 算要删的事件 → 切除 → 校验 → 备份写盘」，
  * 不持有任何 DSH 状态；ctx 由调用方注入（只为拿 live 判定与 projcache 路径）。
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { readSession, writeSession, excise, verify, seqsOfTurn, decodeSeqRanges, foldSurfaceLoose, SURFACE_TYPES } from './true-delete.js';
 
@@ -340,6 +340,14 @@ export function purgeSessionFile(file, sid, options = {}) {
   }
   const { header, events } = doc;
   out.events = events.length;
+  /* 断口门（2026-10-10 seq 断口事故根治）：输入文件 seq 已不连续/act settle 不全 →
+     拒绝一切切除重写——在坏文件上做手术只会把坏扩散，原样保留交由台账报修。 */
+  const inGate = assertRowsDense(events);
+  if (!inGate.ok) {
+    out.status = 'blocked';
+    out.notes.push('输入文件 seq 已断口，拒绝动它（防扩散）: ' + inGate.problems.join('; ').slice(0, 300));
+    return out;
+  }
   const plan = planPurge(events, { sinceMs: options.sinceMs });
   out.turns = plan.turns;
   if (plan.remove.length === 0) {
@@ -393,18 +401,76 @@ export function purgeSessionFile(file, sid, options = {}) {
       mkdirSync(options.backupDir, { recursive: true });
       copyFileSync(file, join(options.backupDir, `${sid}.zstd`));
     }
-    writeSession(file, result.header, result.events);
-    const back = readSession(file);
-    const v2 = verify(back.header, back.events);
-    out.verify = v2.ok === true;
-    out.status = v2.ok === true ? 'written' : 'failed';
-    out.after = back.events.length;
-    if (v2.ok !== true) out.problems = (v2.problems ?? []).slice(0, 6).map(String);
+    /* 安全写盘：临时文件 → 读回复核 + 断口门 → 替换。此前是「先写正文再复核」，
+       复核不过时坏文件已经落盘（写后验尸）。现在任何一步不过 = 原文件分毫不动。 */
+    const w = writeSessionSafe(file, result.header, result.events);
+    out.verify = w.ok;
+    out.status = w.ok ? 'written' : w.status;
+    if (w.after !== undefined) out.after = w.after;
+    if (Array.isArray(w.problems) && w.problems.length > 0) out.problems = w.problems;
+    if (Array.isArray(w.notes)) for (const n of w.notes) out.notes.push(n);
   } catch (error) {
     out.status = 'failed';
     out.notes.push(`write: ${String(error?.message ?? error).slice(0, 200)}`);
   }
   return out;
+}
+
+/**
+ * 写盘完整性门：seq 必须自 0 起密集连续；attempt/message 的 settlement
+ * （turn/step 整数 + stream 必须是数组）必须齐全。任一不满足 = 不可写——
+ * 宁可原文件不动，也不把断口文件越写越坏（gateway 只认密集 + settlement，
+ * 缺一条就是整会话打不开：seed assistant/attempt invalid settlement fields /
+ * released v2 row has seq gap）。
+ */
+export function assertRowsDense(events) {
+  const problems = [];
+  if (!Array.isArray(events)) return { ok: false, problems: ['events 不是数组'] };
+  for (let i = 0; i < events.length; i += 1) {
+    const e = events[i];
+    if (!e || typeof e !== 'object') { problems.push(`行位 ${i} 不是对象`); break; }
+    if (!Number.isSafeInteger(e.seq)) { problems.push(`行位 ${i} 缺 seq`); break; }
+    if (e.seq !== i) problems.push(`seq 断口: 行位 ${i} 处 seq=${e.seq}`);
+    if (e.type === 'assistant/attempt' || e.type === 'assistant/message') {
+      const d = e.data ?? {};
+      if (!Number.isInteger(d.turn) || !Number.isInteger(d.step) || !Array.isArray(d.stream)) {
+        problems.push(`${e.type}@${e.seq} settlement 不完整(需 turn/step 整数 + stream 数组)`);
+      }
+    }
+    if (problems.length >= 5) break;
+  }
+  return { ok: problems.length === 0, problems };
+}
+
+/**
+ * 安全写盘：临时文件 → 读回复核 + 断口门 → 替换原文件。
+ * 任一步失败：删临时文件、原文件保持原样、返回原因（status: blocked|failed）。
+ */
+function writeSessionSafe(file, header, events) {
+  const gate = assertRowsDense(events);
+  if (!gate.ok) {
+    return { ok: false, status: 'blocked', notes: ['写盘门拦截(输出断口): ' + gate.problems.join('; ').slice(0, 300)], problems: gate.problems.slice(0, 6) };
+  }
+  const tmp = file + '.writing';
+  try {
+    writeSession(tmp, header, events);
+    const back = readSession(tmp);
+    const v = verify(back.header, back.events);
+    if (v.ok !== true) {
+      rmSync(tmp, { force: true });
+      return { ok: false, status: 'failed', notes: ['临时文件读回复核不过，原文件未动: ' + JSON.stringify((v.problems ?? []).slice(0, 3))], problems: (v.problems ?? []).slice(0, 6).map(String) };
+    }
+    const g2 = assertRowsDense(back.events);
+    if (!g2.ok) {
+      rmSync(tmp, { force: true });
+      return { ok: false, status: 'blocked', notes: ['临时文件断口门不过，原文件未动: ' + g2.problems.join('; ').slice(0, 300)], problems: g2.problems.slice(0, 6) };
+    }
+    renameSync(tmp, file);
+    return { ok: true, after: back.events.length };
+  } catch (error) {
+    try { rmSync(tmp, { force: true }); } catch { /* 清不掉就留作证据 */ }
+    return { ok: false, status: 'failed', notes: ['write: ' + String(error?.message ?? error).slice(0, 200)] };
+  }
 }
 
 /** 待清理台账：记录「有墓碑但当时是 live（不能动文件）」的会话，供下次开机补清。 */
@@ -532,6 +598,15 @@ export function redactSessionFile(file, sid, options = {}) {
   const out = { sid, status: 'clean', removed: 0, verify: false, notes: [] };
   let doc;
   try { doc = readSession(file) } catch (error) { out.status = 'failed'; out.notes.push(String(error?.message ?? error).slice(0, 120)); return out; }
+  /* 断口门（2026-10-10 根治）：输入文件 seq 已断口/settlement 不全 → 拒绝碰它。
+     否则 redact 会把坏文件原样写回、并以 'planned/skipped' 混进正常流程，
+     坏状态永远出不去（gateway 一开就报 seq gap / invalid settlement）。 */
+  const inGate = assertRowsDense(doc.events);
+  if (!inGate.ok) {
+    out.status = 'blocked';
+    out.notes.push('输入文件 seq 已断口，拒绝动它（防扩散）: ' + inGate.problems.join('; ').slice(0, 300));
+    return out;
+  }
   const plan = planPurge(doc.events, { sinceMs: options.sinceMs });
   if (plan.remove.length === 0) return out;
   const redacted = redactEventsText(doc.events, plan.remove);
@@ -541,12 +616,13 @@ export function redactSessionFile(file, sid, options = {}) {
   if (options.write !== true) { out.status = 'planned'; out.verify = true; return out; }
   try {
     if (options.backupDir) { mkdirSync(options.backupDir, { recursive: true }); copyFileSync(file, join(options.backupDir, sid + '.redact.zstd')); }
-    writeSession(file, doc.header, redacted);
-    const back = readSession(file);
-    const v2 = verify(back.header, back.events);
-    out.verify = v2.ok === true;
-    out.status = v2.ok === true ? 'redacted' : 'failed';
-    out.after = back.events.length;
+    /* 安全写盘（2026-10-10 根治）：临时文件 → 读回复核 + 断口门 → 替换。
+       此前是先写正文再复核，复核不过时坏文件已经落盘——写后验尸。 */
+    const w = writeSessionSafe(file, doc.header, redacted);
+    out.verify = w.ok;
+    out.status = w.ok ? 'redacted' : w.status;
+    if (w.after !== undefined) out.after = w.after;
+    if (Array.isArray(w.notes)) for (const n of w.notes) out.notes.push(n);
   } catch (error) { out.status = 'failed'; out.notes.push('write: ' + String(error?.message ?? error).slice(0, 160)); }
   return out;
 }

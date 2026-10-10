@@ -931,6 +931,13 @@ export async function purgeTombstones(ctx, options = {}) {
         results.push(red)
       } else if (red.status === 'planned' || red.status === 'skipped') {
         results.push({ ...red, status: 'live-skipped' })
+      } else if (red.status === 'blocked') {
+        /* 断口门拦下（2026-10-10 手机端缺口事故）：文件 seq 已断口/settlement 不全，
+           绝不碰它；台账亮红灯（why: seq-gap）等待人工修，同时跳过下面的 probe
+           （probe 会把这条记录覆盖成 why:'live'，丢失报警语义）。 */
+        ledger.pending[entry.id] = { at: new Date().toISOString(), why: 'seq-gap', note: red.notes[0] }
+        results.push(red)
+        continue
       }
       /* 2026-10-10 死锁修复：live 轻擦后必须保留 pending（待整轮切除）——
          此前 redact 成功即删台账 → 60s 重试认为完工 → 整轮切除永远排不上；
@@ -954,6 +961,9 @@ export async function purgeTombstones(ctx, options = {}) {
       delete ledger.pending[entry.id]   // 无事可清 → 销账，重试链终止
     } else if (r.status === 'planned') {
       ledger.pending[entry.id] = { turns: r.turns, removed: r.removed, at: new Date().toISOString(), why: 'dry-run' }
+    } else if (r.status === 'blocked') {
+      /* 断口门拦下（2026-10-10 手机端缺口事故）：坏文件不动，台账亮红灯等人工修 */
+      ledger.pending[entry.id] = { at: new Date().toISOString(), why: 'seq-gap', note: r.notes[0] }
     }
     results.push(r)
     if (typeof options.onResult === 'function') {
