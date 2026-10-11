@@ -1556,6 +1556,14 @@ export function apply(ctx, config = {}) {
     /* 清理失败绝不拖垮 apply */
   }
 
+  // -1.5) 受保护系统头守卫：补「无头哑弹」（真删除最容易把 system 头拔掉）
+  //       必须排在真删除之后：afterPurge 定向补扫要靠这里的 compatHooks.headGuard。
+  try {
+    installHeadGuard(ctx, config)
+  } catch {
+    /* 守卫失败绝不拖垮 apply */
+  }
+
   // 0) 上下文占用校准（不依赖 llm，必须排在下面的 llm 早退之前）
   const installPressureCalibration = (final = false) => {
     try {

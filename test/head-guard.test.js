@@ -8,11 +8,12 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, existsSync, readFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, mkdirSync, readFileSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { readSession, writeSession, verify, lateSystemAppends, excise } from '../true-delete.js'
 import { diagnoseProtectedHead, insertProtectedHead, guardSessionFile, probeProtectedHead } from '../head-guard.js'
+import { guardProtectedHeads, installHeadGuard } from '../index.js'
 
 const header = () => ({
   type: 'session',
@@ -181,6 +182,38 @@ test('excise 的系统头级联不再「删光全部 system」：受保护头与
   const v = verify(result.header, result.events)
   assert.equal(v.ok, true, v.problems?.join('; '))
   assert.equal(v.stats.systemHead, 2)
+})
+
+test('guardProtectedHeads：缺头的补上、live 的分毫不动', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'headguard-home-'))
+  const mk = (sid, events) => {
+    const dir = join(home, 'sessions', '--ws--', sid)
+    mkdirSync(dir, { recursive: true })
+    const file = join(dir, 'session.v4.jsonl.zstd')
+    writeSession(file, { ...header(), id: sid }, events)
+    return file
+  }
+  const headlessFile = mk('session-headless', headlessEvents())
+  const headedFile = mk('session-headed', headedEvents())
+  const headedBefore = readFileSync(headedFile)
+  const ctx = {
+    get: (n) => (n === 'sessions' ? { get: (id) => (id === 'session-headed' ? { id } : undefined) } : undefined),
+    logger: {},
+  }
+  const r = await guardProtectedHeads(ctx, { home, write: true })
+  assert.equal(r.scanned, 2)
+  assert.equal(r.liveSkipped, 1)
+  assert.equal(r.written, 1)
+  const back = readSession(headlessFile)
+  assert.equal(verify(back.header, back.events).stats.systemHead, 4)
+  assert.deepEqual(readFileSync(headedFile), headedBefore, 'live 会话必须分毫不动')
+})
+
+test('apply 必须真的装上受保护头守卫（定义 ≠ 接线）', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  assert.match(src, /installHeadGuard\(ctx, config\)/, 'apply() 没调用 installHeadGuard —— 守卫会变成死代码')
+  assert.match(src, /compatHooks\.headGuard\s*=/, 'installHeadGuard 没挂 compatHooks.headGuard —— 目录变化/切除后补扫不会发生')
+  assert.match(src, /compatHooks\.afterPurge/, '真删除写盘后没有定向补扫')
 })
 
 test('guardSessionFile：写盘前复核，写盘后回读，二次运行是 clean', () => {
