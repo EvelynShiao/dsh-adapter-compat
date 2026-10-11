@@ -62,7 +62,7 @@ export function inboxSpliceSeqs(events) {
  * - summary 缺失的旧载体：从被遮蔽的表层节点反推轮号（拿不到就保守跳过）。
  * @returns {{skip?:boolean, turns?:Set<number>, needsNodeLookup?:boolean, sourcesFor?:number[], why?:string}|undefined}
  */
-export function classifyTombstoneCarrier(event) {
+export function classifyTombstoneCarrier(event, options = {}) {
   const src = event?.data?.source ?? event?.data?.message?.source;
   const kind = src?.kind;
   if (typeof kind !== 'string' || !kind.startsWith('dsh-session-kit-')) return undefined;
@@ -70,7 +70,9 @@ export function classifyTombstoneCarrier(event) {
   if (!op || typeof op !== 'object' || op.op !== 'replace') return undefined;
   let summary = null;
   try { summary = JSON.parse(src.summary ?? 'null') } catch { summary = null }
-  if (summary && summary.regeneration !== undefined) return { skip: true, why: 'regenerate' };
+  /* 「删除并重新生成」留下的旧版本：默认按设计保留（能再生成/对比）。
+     purgeRegenerate:true 时当普通删除处理——用户明确要"删了就物理没了"（2026-10-11）。 */
+  if (summary && summary.regeneration !== undefined && options.purgeRegenerate !== true) return { skip: true, why: 'regenerate' };
   const turns = new Set();
   if (summary && Number.isSafeInteger(summary.turn)) {
     const end = Number.isSafeInteger(summary.endTurn) ? summary.endTurn : summary.turn;
@@ -96,12 +98,13 @@ export function classifyTombstoneCarrier(event) {
  */
 export function planPurge(events, options = {}) {
   const sinceMs = Number.isFinite(options.sinceMs) ? options.sinceMs : undefined;
+  const purgeRegenerate = options.purgeRegenerate === true;
   const byseq = new Map(events.map((e) => [e.seq, e]));
   const turnSet = new Set();
   const surgical = new Set();
   const skipped = [];
   for (const e of events) {
-    const c = classifyTombstoneCarrier(e);
+    const c = classifyTombstoneCarrier(e, { purgeRegenerate });
     if (!c) {
       /* delete-turn 遮蔽（kind=plugin:dsh-delete-turn）：分类器只认 dsh-session-kit- 前缀
          直接跳过它 → 其删除内容永不被物理切除（实测：测试会话 message2 残留的根因）。
@@ -340,7 +343,7 @@ export function purgeSessionFile(file, sid, options = {}) {
     out.notes.push('输入文件 seq 已断口，拒绝动它（防扩散）: ' + inGate.problems.join('; ').slice(0, 300));
     return out;
   }
-  const plan = planPurge(events, { sinceMs: options.sinceMs });
+  const plan = planPurge(events, { sinceMs: options.sinceMs, purgeRegenerate: options.purgeRegenerate });
   out.turns = plan.turns;
   if (plan.remove.length === 0) {
     if (plan.skipped.length > 0) out.notes.push(`skipped=${JSON.stringify(plan.skipped.slice(0, 4))}`);
@@ -630,7 +633,7 @@ export function redactSessionFile(file, sid, options = {}) {
     out.notes.push('输入文件 seq 已断口，拒绝动它（防扩散）: ' + inGate.problems.join('; ').slice(0, 300));
     return out;
   }
-  const plan = planPurge(doc.events, { sinceMs: options.sinceMs });
+  const plan = planPurge(doc.events, { sinceMs: options.sinceMs, purgeRegenerate: options.purgeRegenerate });
   if (plan.remove.length === 0) return out;
   const redacted = redactEventsText(doc.events, plan.remove);
   const v = verify(doc.header, redacted);

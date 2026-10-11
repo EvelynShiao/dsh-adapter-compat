@@ -84,6 +84,7 @@ import { purgeSessionFile, readPendingLedger, writePendingLedger } from './purge
 import { redactEventPayload, redactSessionFile } from './purge.js'
 import { readSession, writeSession, verify as verifySessionEvents } from './true-delete.js'
 import { guardSessionFile, probeProtectedHead } from './head-guard.js'
+import { installWireTap } from './wire-tap.js'
 import { slimSession } from './slim.js'
 
 export const inject = ['llm', 'webServer']
@@ -927,7 +928,7 @@ export async function purgeTombstones(ctx, options = {}) {
       /* live 会话不能整轮切除（内存事件数组会与文件错位），改走**就地擦文本**：
          清掉被删轮次里用户自己的消息正文，Timeline 立刻不再显示；seq/事件数不变，
          内存与文件保持对齐。assistant 回复与思考过程等非 live 时再由 excise 彻底拔。 */
-      const red = redactSessionFile(entry.file, entry.id, { sinceMs, write, backupDir })
+      const red = redactSessionFile(entry.file, entry.id, { sinceMs, write, backupDir, purgeRegenerate: options.purgeRegenerate })
       if (red.status === 'redacted') {
         writtenIds.add(entry.id)
         try { rmSync(home + '/storages/session_projcache/sessions/' + entry.id + '.json', { force: true }) } catch { /* ignore */ }
@@ -948,14 +949,14 @@ export async function purgeTombstones(ctx, options = {}) {
          Timeline 里留下 [图片或文件] 空壳墓碑。现在只要 plan 还有活就记账，
          等首个非 live 窗口（60s 重试 / 下次开机前 5s 黄金窗）物理切除。 */
       try {
-        const probe = planPurge(readSession(entry.file).events, { sinceMs: 0 })
+        const probe = planPurge(readSession(entry.file).events, { sinceMs: 0, purgeRegenerate: options.purgeRegenerate })
         if (probe.remove.length > 0) {
           ledger.pending[entry.id] = { turns: probe.turns, removed: probe.remove.length, at: new Date().toISOString(), why: 'live', note: 'redact 已做，待非 live 整轮切除' }
         }
       } catch { /* 读不了就不动台账 */ }
       continue
     }
-    const r = purgeSessionFile(entry.file, entry.id, { write, backupDir, sinceMs })
+    const r = purgeSessionFile(entry.file, entry.id, { write, backupDir, sinceMs, purgeRegenerate: options.purgeRegenerate })
     if (r.status === 'written') {
       writtenIds.add(entry.id)
       delete ledger.pending[entry.id]
@@ -1022,7 +1023,7 @@ export function installTrueDelete(ctx, config = {}) {
     if (inflight) return   // 防重入：目录钩子/定时器/开机可能交叠，绝不并发写盘
     inflight = true
     Promise.resolve()
-      .then(() => purgeTombstones(ctx, { home, write: true, ...options }))
+      .then(() => purgeTombstones(ctx, { home, write: true, purgeRegenerate: config?.purgeRegenerate !== false, ...options }))
       .then((r) => summarise(tag, r))
       .catch((e) => appendCompatLog('true-delete[' + tag + '] FAILED: ' + String(e?.message ?? e).slice(0, 160), home))
       .finally(() => { inflight = false })
@@ -1585,6 +1586,13 @@ export function apply(ctx, config = {}) {
     installTrueDelete(ctx, config)
   } catch {
     /* 清理失败绝不拖垮 apply */
+  }
+
+  // -1.4) 线级取证探针：把 provider 真正收到的 messages 结构落盘（llm-wire.jsonl）
+  try {
+    installWireTap(ctx, config)
+  } catch {
+    /* 探针失败绝不拖垮 apply */
   }
 
   // -1.5) 受保护系统头守卫：补「无头哑弹」（真删除最容易把 system 头拔掉）
