@@ -83,6 +83,7 @@ import { zstdCompressSync, constants as zstdConstants, zstdDecompressSync } from
 import { purgeSessionFile, readPendingLedger, writePendingLedger } from './purge.js'
 import { redactEventPayload, redactSessionFile } from './purge.js'
 import { readSession, writeSession, verify as verifySessionEvents } from './true-delete.js'
+import { guardSessionFile, probeProtectedHead } from './head-guard.js'
 import { slimSession } from './slim.js'
 
 export const inject = ['llm', 'webServer']
@@ -764,6 +765,8 @@ export function installSessionWatch(ctx, options = {}) {
       // 目录变化 → 真删除扫描（line 854 注释本该有的调用点，此前丢失 → pending 永不重试）。
       // purge 幂等，写盘会再触发一轮 watcher，收敛后自然停（多跑一轮空扫）。
       .then(() => { try { if (typeof compatHooks.purge === 'function') compatHooks.purge() } catch { /* ignore */ } })
+      // 目录变化同样可能是「外面下载/搬运进来一份无头会话」→ 补头守卫跟上
+      .then(() => { try { if (typeof compatHooks.headGuard === 'function') compatHooks.headGuard() } catch { /* ignore */ } })
       .finally(() => {
         state.busy = false
         try {
@@ -1003,6 +1006,7 @@ export function installTrueDelete(ctx, config = {}) {
     const liveSkipped = r.results.filter((x) => x.status === 'live-skipped')
     const failed = r.results.filter((x) => x.status === 'failed')
     if (written.length === 0 && redacted.length === 0 && liveSkipped.length === 0 && failed.length === 0) return
+    try { if (typeof compatHooks.afterPurge === 'function') compatHooks.afterPurge(written.map((x) => x.sid)) } catch { /* ignore */ }
     appendCompatLog(
       'true-delete[' + tag + '] written=' + written.length + ' liveSkipped=' + liveSkipped.length
         + ' failed=' + failed.length + ' pending=' + r.pending
@@ -1033,6 +1037,11 @@ export function installTrueDelete(ctx, config = {}) {
   /* 触发时机收敛：开机两次 + 会话目录变化后一次（见 rescanAndWarm 的钩子）。
      不再常驻轮询——用户明确要求「开机、下载后扫一下就差不多」。 */
   compatHooks.purge = () => run('hook')
+  /* 真删除写过的会话，立刻补一次头：切除最容易把 system 头拔掉（旧版会顺手删光全部
+     system/message，见 true-delete.js 的系统头级联）。定向补扫，不做全盘读。 */
+  compatHooks.afterPurge = (ids) => {
+    try { if (typeof compatHooks.headGuard === 'function' && ids !== undefined && ids.length > 0) compatHooks.headGuard(ids) } catch { /* ignore */ }
+  }
   /* 台账非空 → 60s 定点重试：清完即停，只在有待清项时存在（非常驻轮询）。
      解决「开机时活体、窗口又错过 → 老墓碑永远等下次开机」的死角。 */
   const retryTimer = setInterval(() => {
@@ -1045,8 +1054,85 @@ export function installTrueDelete(ctx, config = {}) {
   return { run, timers, retryTimer }
 }
 
-/* Timeline 块索引孤儿清理（三插件零墓碑的第三条腿）：
-   session-kit/easyrewrite 删掉整个会话后 session-blocks.db 里该会话的块还留着
+/** 受保护系统头守卫的备份目录名（$DSH_HOME 下）。 */
+export const HEAD_GUARD_BACKUP_DIR = 'backup-head-guard'
+
+/**
+ * 受保护系统头守卫：给「缺受保护头」的会话补一条空 system/message 占位头。
+ *
+ * 为什么非补不可：宿主 agent-loop 的 SystemPromptProjection 在「表层没有 system 节点」
+ * 时会把渲染好的系统提示词 append 成一条新的 system/message。若此刻表层非空、又没有
+ * 受保护头，宿主落盘的就是一份再也读不回来的日志：
+ *   system/message requires a protected first surface head
+ * 缺头状态本身还能读（这是 excise 旧"头序自愈"删光 system 的依据），但它是个哑弹——
+ * 下一次提示词变化（换模型/工具集/新会话系列）就炸。所以这里主动补头。
+ *
+ * 成本：先用 probeProtectedHead 只解前几帧预筛（首个表面节点永远在最前面几帧里），
+ * 只有确实缺头才整读整写。
+ * live 会话绝不碰（内存事件数组与文件必须对齐）。
+ * @param {object} ctx - cordis 上下文（只用于 live 判定）
+ * @param {object} [options] - { home, write, only, backupDir }
+ */
+export async function guardProtectedHeads(ctx, options = {}) {
+  const home = options.home ?? dshHomeDir()
+  const write = options.write === true
+  const backupDir = options.backupDir ?? `${home}/${HEAD_GUARD_BACKUP_DIR}`
+  const only = options.only instanceof Set ? options.only : undefined
+  const out = { write, scanned: 0, headless: 0, written: 0, liveSkipped: 0, failed: 0, results: [] }
+  for (const entry of listSessionFiles(home)) {
+    if (only !== undefined && !only.has(entry.id)) continue
+    out.scanned += 1
+    if (isSessionLive(ctx, entry.id)) { out.liveSkipped += 1; continue }
+    let probe
+    try {
+      probe = probeProtectedHead(entry.file)
+    } catch {
+      probe = undefined
+    }
+    if (probe === undefined || probe.ok) continue
+    out.headless += 1
+    const result = guardSessionFile(entry.file, { write, backupDir })
+    out.results.push({ id: entry.id, ...result })
+    if (result.status === 'written') out.written += 1
+    else if (result.status !== 'planned') out.failed += 1
+  }
+  return out
+}
+
+/** 安装受保护头守卫：开机两次全扫 + 真删除写盘后定向补扫。 */
+export function installHeadGuard(ctx, config = {}) {
+  if (config?.headGuard === false) return undefined
+  const home = dshHomeDir()
+  let inflight = false
+  const run = (tag, options = {}) => {
+    if (inflight) return // 防重入：守卫写盘期间绝不并发
+    inflight = true
+    Promise.resolve()
+      .then(() => guardProtectedHeads(ctx, { home, write: true, ...options }))
+      .then((r) => {
+        if (r.written === 0 && r.failed === 0) return
+        appendCompatLog(
+          'head-guard[' + tag + '] written=' + r.written + ' headless=' + r.headless
+            + ' liveSkipped=' + r.liveSkipped + ' failed=' + r.failed
+            + (r.written > 0 ? ' ids=' + r.results.filter((x) => x.status === 'written').map((x) => String(x.id).slice(0, 16) + '@' + x.insertedAt).join(' ') : ''),
+          home,
+        )
+        if (r.written > 0) ctx.logger?.info?.(`[adapter-compat] protected system head restored on ${r.written} session(s)`)
+      })
+      .catch((e) => appendCompatLog('head-guard[' + tag + '] FAILED: ' + String(e?.message ?? e).slice(0, 160), home))
+      .finally(() => { inflight = false })
+  }
+  const timers = []
+  for (const ms of [4000, 25000]) {
+    const t = setTimeout(() => run('boot+' + (ms / 1000) + 's'), ms)
+    if (typeof t.unref === 'function') t.unref()
+    timers.push(t)
+  }
+  compatHooks.headGuard = (ids) => run('hook', ids === undefined ? {} : { only: ids instanceof Set ? ids : new Set(ids) })
+  return { run, timers }
+}
+
+/* Timeline 块索引孤儿清理（三插件零墓碑的第三条腿）：   session-kit/easyrewrite 删掉整个会话后 session-blocks.db 里该会话的块还留着
    → 右栏永远显示墓碑。文件消失即索引孤儿——每次真删除扫描顺手清（幂等）。
    实证：手机端曾积 37 个孤儿（2026-10-09 手动清过），此前插件层无人清。 */
 export function pruneBlockOrphans(home) {

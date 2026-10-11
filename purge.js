@@ -7,7 +7,7 @@
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { readSession, writeSession, excise, verify, seqsOfTurn, decodeSeqRanges, foldSurfaceLoose, SURFACE_TYPES } from './true-delete.js';
+import { readSession, writeSession, excise, verify, seqsOfTurn, decodeSeqRanges, foldSurfaceLoose, lateSystemAppends, SURFACE_TYPES } from './true-delete.js';
 
 /** 会写盘的调用方必须显式传 write:true；默认干跑。 */
 export const PURGE_DEFAULTS = Object.freeze({ write: false, only: undefined, home: undefined });
@@ -181,21 +181,13 @@ export function planPurge(events, options = {}) {
   for (const sq of surgical) remove.add(sq);
 
   /* 头序自愈（宿主 dsh-session-format-v3-to-v4 foldSurface 实测）：system/message 若在
-     其他 append 表层之后才出现（迟到）→ 宿主抛 "requires a protected first surface head"
-     整会话拒载。典型成因：切除清空系统头后 DSH 又在后续轮投递了 system（Chrome 会话实证）。
-     修法：拔光全部 system（宿主不罚缺失，无头=合法）。不设时间窗——违例即违例。 */
-  {
-    let surf = 0, protHead = undefined, late = false;
-    for (const e of events) {
-      if (!SURFACE_TYPES.has(e.type)) continue;
-      if (e.type === 'system/message' && surf > 0 && protHead === undefined) { late = true; break; }
-      if (e.surfaceOp === 'append') {
-        if (e.type === 'system/message' && surf === 0) protHead = e.seq;
-        surf += 1;
-      }
-    }
-    if (late) for (const e of events) if (e.type === 'system/message') remove.add(e.seq);
-  }
+     其他表面节点之后才 append、且此前没有受保护头（迟到）→ 宿主抛
+     "requires a protected first surface head" 整会话拒载。典型成因：切除清空系统头后
+     DSH 又在后续轮投递了 system（Chrome 会话实证）。
+     2026-10-11 修正：只拔**真的会迟到**的 append（lateSystemAppends），不再「删光全部 system」——
+     合法的 replacement 载体被牵连拔掉会把它遮蔽的内容整段复活。缺头的收尾由
+     head-guard.js 补一条占位受保护头（否则会话仍是「能读但下次提示词一变就炸」的哑弹）。 */
+  for (const seq of lateSystemAppends(events)) remove.add(seq);
   return { remove: [...remove].sort((a, b) => a - b), turns: [...turnSet].sort((a, b) => a - b), skipped };
 }
 

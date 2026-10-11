@@ -435,6 +435,38 @@ function turnTable(events) {
 }
 
 /**
+ * 找出「会迟到」的 system/message append —— 表层已非空、却还没有受保护头时追加的那些。
+ *
+ * 宿主 dsh-session-format-v3-to-v4 的 foldSurface 只在这里硬拒：
+ *   system/message requires a protected first surface head
+ * 拔掉这些（且只有这些）日志才读得回来。两条重要边界：
+ *   1. 只认 append：system/message 的**替换**（surfaceOp replace）不受此约束，
+ *      被牵连拔掉会把它遮蔽的内容整段"复活"——旧版"删光全部 system"就是这么伤的；
+ *   2. 受保护头本身（表层 0 号节点的 system/message）永远是合法的，绝不能当成迟到拔掉。
+ *
+ * @param {object[]} events
+ * @returns {number[]} 迟到 system/message 的 seq
+ */
+export function lateSystemAppends(events) {
+  const out = [];
+  let nodes = 0;
+  let protectedHead;
+  for (const e of events) {
+    if (!e || !SURFACE_TYPES.has(e.type)) continue;
+    const op = e.surfaceOp;
+    if (op === undefined || op === "append") {
+      if (e.type === "system/message" && nodes > 0 && protectedHead === undefined) { out.push(e.seq); continue; }
+      if (e.type === "system/message" && nodes === 0) protectedHead = e.seq;
+      nodes += 1;
+      continue;
+    }
+    /* 替换：表层节点数不变（区间被一个新节点顶掉） */
+    if (nodes === 0) nodes = 1;
+  }
+  return out;
+}
+
+/**
  * 物理切除事件。
  *
  * @param {object} header 会话头（不会被改）
@@ -448,16 +480,24 @@ function turnTable(events) {
 export function excise(header, events, removeSeqs, options = {}) {
   const headerOut = clone(header) ?? header;
   const src = clone(events) ?? [];
-  /* 系统头级联（2026-10-10 宿主源码解码 dsh-session-format-v3-to-v4:599）：
-     宿主只罚「system/message 迟到」（首个 append 表层必须是它），不罚「完全没有」。
-     若切除波及任一 system/message，留下的后置 system 会变成迟到 → 宿主 foldSurface
-     抛 "requires a protected first surface head" 整会话打不开。故整族移除（无头合法）。
-     这些头带 turn/step 字段，单独保留会引用已删除轮号 → 必须同进同退。 */
+  /* 系统头级联（2026-10-10 宿主源码解码 dsh-session-format-v3-to-v4:599；2026-10-11 修正）：
+     宿主只罚「system/message 迟到」（表层已非空、却还没有受保护头时的 append），
+     不罚「完全没有」。切除把受保护头拔掉后，**原本合法的**后置 system append 才会变成迟到，
+     于是必须有选择地拔：只拔「切除后真的会迟到」的那些，逐轮收敛到不动点。
+     旧版是「只要碰到任一 system 就删光全部 system」——那会连带拔掉合法的 replacement 载体，
+     把它遮蔽的内容整段复活，也把「无头但还能读」的哑弹留在盘上（下一次提示词变化就炸）。
+     无头的收尾交给 head-guard.js（补受保护头），不在这里删。 */
   if (Array.isArray(removeSeqs) && removeSeqs.length > 0) {
     const hitSeqs = new Set(removeSeqs);
     const hasSystemHit = src.some((e) => e.type === "system/message" && hitSeqs.has(e.seq));
     if (hasSystemHit) {
-      for (const e of src) if (e.type === "system/message" && !hitSeqs.has(e.seq)) removeSeqs = [...removeSeqs, e.seq];
+      for (let pass = 0; pass < 8; pass += 1) {
+        const hit = new Set(removeSeqs);
+        const survivors = src.filter((e) => !hit.has(e.seq));
+        const late = lateSystemAppends(survivors).filter((seq) => !hit.has(seq));
+        if (late.length === 0) break;
+        removeSeqs = [...removeSeqs, ...late];
+      }
     }
   }
   const report = {

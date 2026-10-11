@@ -46,6 +46,39 @@ this.adapters.get(...)?.adapter.imageRequestPricing is not a function
 
 生效条件：插件代码在 composition 构建时读取一次，**改动后需重启 DSH**。
 
+## 第七层：受保护系统头守卫（9999.9.13）
+
+宿主 `dsh-session-format-v3-to-v4` 的表层状态机只认一种合法头：**首个 append 到空表层的
+`system/message`**（表层节点 0，受保护）。缺了它，日志**当下还能读**（宿主的规则只在
+"表层非空 + 还没有受保护头时又 append 一条 system" 才拒绝），但这是一颗哑弹：
+下一轮系统提示词一变（换模型、工具集变化、新请求系列），宿主的 `SystemPromptProjection`
+就会 append 一条新的 `system/message` → 落盘即永久损坏：
+
+```
+stored session "session-xxx" is corrupt:
+  system/message requires a protected first surface head
+```
+
+老版 `excise`/`planPurge` 的"头序自愈"正是这种情况下的最坏选择：**删光全部 system/message**，
+理由写的是"宿主不罚缺失，无头=合法"——合法是对的，脆弱也是真的，会话就埋在那儿等下一次引爆。
+
+本层做两件事：
+
+1. **补头**：`head-guard.js` 在首个表面节点前插一条**空** `system/message` 占位头，
+   其后所有 `seq` 与 `seq` 引用（`surfaceOp.*`、`sourceEventSeqs`、`shadowedRange/Seqs`、
+   `headerSeq`、`messageSeq(s)`、`throughSeq`、`sourceEventSeq`）整体 +1，保持 seq 密集。
+   空内容不是"没提示词"：宿主 `project()` 把它当占位头，下一轮会用渲染好的提示词替换它。
+   预筛只读文件前缀（`probeProtectedHead`），只有确实缺头才整读整写。
+2. **收敛级联**：`excise`/`planPurge` 不再"删光全部 system"，只拔**真的会迟到**的
+   append（`lateSystemAppends`，逐轮算到不动点）。合法的 replacement 载体被牵连拔掉，
+   会把它遮蔽的内容整段"复活"——那同样是在毁历史。
+
+触发时机：开机 4s/25s 各全扫一次（先预筛再动手）+ 会话目录变化后 + 真删除写盘后定向补扫。
+**live 会话绝不碰**（内存事件数组必须与文件对齐）；写盘前 `verify`（宿主规则移植版）不许过
+就分毫不动，写盘后回读复核，坏文件先备份到 `$DSH_HOME/backup-head-guard/`。
+
+恢复官方行为：`cordis.patch.yml` 本插件行 `config: { headGuard: false }` + 重启。
+
 ## 安装
 
 电脑（profile 目录 = 你的 DSH profile，如 `~/.dsh/profiles/web`）：
@@ -64,11 +97,13 @@ pnpm install
 ## 验证
 
 ```bash
-node --test test/compat.test.js test/gate.test.js
+node --test test/compat.test.js test/gate.test.js test/guard.test.js test/inbox-rewrite.test.js test/pressure.test.js test/slim.test.js test/head-guard.test.js test/title-warm.test.js test/true-delete.test.js
 ```
 
 - 回填层：装完后开个新会话敲 `/compact`，回 `Compacted N history items (~X tokens)` 即修好；还报 `imageRequestPricing is not a function` → 本插件没被加载，检查 bundles 列表。
 - 硬闸层：重启后 DSH 日志应出现 `[adapter-compat] auto-compaction gate armed`；此后无论怎么聊，**不应再出现任何非手动触发的 `compaction/start` 事件**（`command/run compact` 手动触发的除外）。
+- 头守卫层：日志（`$DSH_HOME/dsh-adapter-compat.log`）出现 `head-guard[...] written=N ...` 就是补过头；
+  之后再也看不到 `requires a protected first surface head`。
 
 ## 仓库
 
