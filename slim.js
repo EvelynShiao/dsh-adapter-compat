@@ -19,6 +19,10 @@ import { emptyTextBlocks } from './purge.js'
 /** 文本类字段名（擦正文用；不碰 id/role/kind/callId 等结构字符串）。 */
 const TEXT_KEYS = new Set(['text', 'texts', 'delta', 'deltas', 'reasoning', 'reasoning_content', 'reasoningContent', 'thinking'])
 
+/** 擦空后的占位符：正文确实没了（真删除语义不变），但 tool_result 不能是空数组，
+ *  否则 Anthropic 风格 provider 把它当成「没有结果」直接拒收整轮。用 [NaN] 短且好认。 */
+export const SLIM_PLACEHOLDER = '[NaN]'
+
 /** 按 key 名递归擦文本：只把字符串置空，键/数组长度/dt/chunk 结构不动（宿主仍能解析）。 */
 export function scrubTexts(node, depth = 0) {
   if (depth > 14 || node === null || typeof node !== 'object') return node
@@ -69,7 +73,17 @@ export function slimEvent(event) {
     if (d.stream !== undefined) { try { scrubTexts({ stream: d.stream }) } catch { /* 保结构优先 */ } }
   } else if (e.type === 'tool/result') {
     // 工具输出：content 块 + result/output 全清
-    if (Array.isArray(d.message?.content)) d.message.content = emptyTextBlocks(d.message.content)
+    if (Array.isArray(d.message?.content)) {
+      const emptied = emptyTextBlocks(d.message.content)
+      /* 出口修（2026-10-11，与 purge.js 同款）：擦完不能留「正文全空的 tool 结果」——
+         provider（Anthropic 风格，deepseek-official 走的就是 Messages API）把空
+         tool_result 当成**没有结果**，直接拒收整轮：
+           messages.N.M: `tool_use` ids were found without `tool_result` blocks immediately after
+         实证 session-3a8e374a / 4ce9464e / 34da7d62 三个会话共 60 条就是这样被擦空后卡死的。
+         留占位符：正文确实没了（清空语义不变），但结构合法。 */
+      const hasText = emptied.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.length > 0)
+      d.message.content = hasText ? emptied : [{ type: 'text', text: SLIM_PLACEHOLDER }]
+    }
     if (typeof d.result === 'string') d.result = ''
     if (typeof d.output === 'string') d.output = ''
     if (d.output && typeof d.output === 'object') d.output = {}
