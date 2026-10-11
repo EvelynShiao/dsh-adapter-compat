@@ -398,8 +398,21 @@ export function purgeSessionFile(file, sid, options = {}) {
       if (typeof id === 'string' && id.length > 0) sharedWithShadowed.add(id);
     }
     const blamed = [...inboxRewrite.deletedIds].filter((id) => !sharedWithShadowed.has(id));
-    const blob = JSON.stringify(result.events);
-    const residue = blamed.filter((id) => blob.includes(id));
+    /* 只认**结构化引用**，不拿整个 JSON 做 includes。
+       2026-10-11 第三例假阳性：模型当时把会话事件 dump 打进了工具输出，正文里就带着 message id，
+       旧检查 grep 整份日志 → 判"残留" → 整次清理 refused（session-11afd797 实测）。
+       正文里的 id 是文本，不是引用。 */
+    const structuralIds = new Set();
+    const collect = (m) => { if (m && typeof m === 'object' && typeof m.id === 'string' && m.id.length > 0) structuralIds.add(m.id); };
+    for (const e of result.events) {
+      const d = e?.data;
+      if (d === null || typeof d !== 'object') continue;
+      collect(d);                                                              // user/message：id 在 data 上
+      collect(d.message);                                                      // system/assistant/tool：id 在 data.message 上
+      if (Array.isArray(d.inserted)) for (const m of d.inserted) collect(m);     // agent/inbox/spliced
+      if (Array.isArray(d.messages)) for (const m of d.messages) collect(m);     // session/title-llm-request
+    }
+    const residue = blamed.filter((id) => structuralIds.has(id));
     if (residue.length > 0) {
       out.status = 'skipped';
       out.notes.push('refused: 被删消息 id 仍有 ' + residue.length + ' 个残留在结果里 ' + JSON.stringify(residue.slice(0, 5)));
