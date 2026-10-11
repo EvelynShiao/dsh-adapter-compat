@@ -375,14 +375,36 @@ export function purgeSessionFile(file, sid, options = {}) {
     return out;
   }
   /* 后置条件二：被删消息 id 不得在任何存活事件里残留（否则界面上会以
-     「排队消息」/标题引用等形态复现）。命中即拒绝，绝不产出半干净的文件。 */
+     「排队消息」/标题引用等形态复现）。命中即拒绝，绝不产出半干净的文件。
+     2026-10-11 修正「tool/result 替换对必然共享 message.id」的假阳性：
+     宿主 assertToolResultRewrite 规定 tool/result 的**替换体**除 message.content 外
+     必须与被遮蔽原事件逐字节一致 —— 其中就包括 message.id。于是删掉替换体（它落在被删
+     轮次里）时，被它遮蔽的**原件仍在盘上**、带着同一个 id → 旧检查判为残留并拒绝整次清理。
+     实测 session-3a8e374a：计划删 199 条、切除后 verify 全绿，却因这 7 个 id 被误杀
+     → 相关轮次**永远清不掉** → Timeline 永久残留。
+     判据：凡「被删事件是 tool/result 替换体」者，其 message.id 允许在存活事件里出现。 */
   if (inboxRewrite.deletedIds.size > 0) {
+    const removedSet = new Set(plan.remove);
+    const sharedWithShadowed = new Set();
+    for (const e of inputEvents) {
+      if (!removedSet.has(e.seq)) continue;
+      if (e?.type !== 'tool/result') continue;
+      const op = e.surfaceOp;
+      if (op === undefined || op === 'append') continue;
+      const id = e.data?.message?.id;
+      if (typeof id === 'string' && id.length > 0) sharedWithShadowed.add(id);
+    }
+    const blamed = [...inboxRewrite.deletedIds].filter((id) => !sharedWithShadowed.has(id));
     const blob = JSON.stringify(result.events);
-    const residue = [...inboxRewrite.deletedIds].filter((id) => blob.includes(id));
+    const residue = blamed.filter((id) => blob.includes(id));
     if (residue.length > 0) {
       out.status = 'skipped';
       out.notes.push('refused: 被删消息 id 仍有 ' + residue.length + ' 个残留在结果里 ' + JSON.stringify(residue.slice(0, 5)));
       return out;
+    }
+    const forgiven = inboxRewrite.deletedIds.size - blamed.length;
+    if (forgiven > 0) {
+      out.notes.push('ok: ' + forgiven + ' 个被删 id 属「tool/result 剪枝替换体 ↔ 被遮蔽原件」共享（宿主强制同 id），不算残留：' + JSON.stringify([...sharedWithShadowed].slice(0, 3)));
     }
   }
   if (inboxRewrite.stats.rewritten > 0) {

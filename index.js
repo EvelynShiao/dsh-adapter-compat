@@ -1051,6 +1051,20 @@ export function installTrueDelete(ctx, config = {}) {
     } catch { /* ignore */ }
   }, 60000)
   if (typeof retryTimer.unref === 'function') retryTimer.unref()
+  /* 会话被释放（关掉对话 / agent 结束）的那一刻定向补扫一次：
+     这是**唯一**能安全做整轮物理切除的窗口——内存事件数组已经不在，文件改写不会错位。
+     此前只有「开机 5s/30s + 60s 重试」，而重启后会话往往先被客户端自动恢复成 live，
+     黄金窗被错过 → 老墓碑只能一直等。现在关掉对话即触发（1.5s 后，留给释放收尾）。 */
+  try {
+    ctx.effect(function* () {
+      yield ctx.on('agent/disposed', (payload) => {
+        const sid = String(payload?.agent?.session?.id ?? payload?.agent?.id ?? payload?.sessionId ?? '')
+        if (!sid) return
+        const t = setTimeout(() => run('disposed', { sinceMs: 0, only: sid }), 1500)
+        if (typeof t.unref === 'function') t.unref()
+      })
+    }, `${PLUGIN_NAME}: true-delete on dispose`)
+  } catch { /* 挂不上钩子不影响其它触发路径 */ }
   return { run, timers, retryTimer }
 }
 
