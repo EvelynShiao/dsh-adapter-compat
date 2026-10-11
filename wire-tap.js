@@ -97,17 +97,30 @@ function appendBounded(line, home) {
 export function repairWireRequest(options) {
   const messages = options?.messages
   if (!Array.isArray(messages)) return 0
+  const isBlank = (m) => {
+    if (!m || typeof m !== 'object' || m.role !== 'tool') return false
+    const content = Array.isArray(m.content) ? m.content : []
+    return !content.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.length > 0)
+  }
+  const fixed = (m) => ({ ...m, content: [{ type: 'text', text: '[内容已清除]' }] })
   let repaired = 0
-  for (const message of messages) {
-    if (message === null || typeof message !== 'object') continue
-    if (message.role !== 'tool') continue
-    const content = Array.isArray(message.content) ? message.content : []
-    const hasText = content.some((block) => block && block.type === 'text' && typeof block.text === 'string' && block.text.length > 0)
-    if (hasText) continue
-    /* 保留结构（id/source/toolCallId/isError 等），只把正文补成占位：
-       远端要的是「这条结果存在且有内容」；占位符满足它，也不谎报成功/失败。 */
-    message.content = [{ type: 'text', text: '[内容已清除]' }]
-    repaired += 1
+  for (let i = 0; i < messages.length; i += 1) {
+    if (!isBlank(messages[i])) continue
+    /* 关键：宿主的消息对象是**深度冻结**的（dsh-session deriveMessages 文档明说 Message 对象
+       SHARED and deep-frozen），直接 `message.content = [...]` 在严格模式下抛错 / 静默失败
+       —— 第一版就是这样被自己的 try/catch 吞掉、连一行日志都没留下的。
+       改法：**换掉数组元素**（新对象、未冻结），而不是改旧对象。 */
+    try {
+      messages[i] = fixed(messages[i])
+      repaired += 1
+    } catch {
+      /* 连数组都冻结：退化成重建整个数组挂回 options */
+      try {
+        options.messages = messages.map((m) => (isBlank(m) ? fixed(m) : m))
+        repaired += messages.filter(isBlank).length
+        break
+      } catch { /* 彻底改不动就放弃，别弄挂请求 */ }
+    }
   }
   return repaired
 }

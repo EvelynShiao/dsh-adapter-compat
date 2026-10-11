@@ -1028,9 +1028,12 @@ export function installTrueDelete(ctx, config = {}) {
       .catch((e) => appendCompatLog('true-delete[' + tag + '] FAILED: ' + String(e?.message ?? e).slice(0, 160), home))
       .finally(() => { inflight = false })
   }
-  // 开机补清：越早越好——那时会话还没被激活（未 live），文件可安全重写
+  /* 开机黄金窗：越早越好。客户端一连上就会把上次的会话恢复成 live，而 live 会话不能
+     整轮物理切除（内存/文件错位）→ 墓碑只能干等下次开机。2026-10-11 用户实证：
+     原来只有 5s/30s，已经晚于客户端恢复，于是「重启也清不掉残留」。
+     加两轮更早的（1.2s / 2.5s），赶在会话被激活之前把能清的清掉。 */
   const timers = []
-  for (const ms of [5000, 30000]) {
+  for (const ms of [1200, 2500, 5000, 30000]) {
     const t = setTimeout(() => run('boot+' + (ms / 1000) + 's', { sinceMs: 0 }), ms)
     if (typeof t.unref === 'function') t.unref()
     timers.push(t)
