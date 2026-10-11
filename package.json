@@ -17,7 +17,8 @@
     "LICENSE",
     "test",
     "true-delete.js",
-    "purge.js"
+    "purge.js",
+    "slim.js"
   ],
   "keywords": [
     "deepseek-harness",
