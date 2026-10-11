@@ -1314,7 +1314,12 @@ export function planMoveSession(options) {
  */
 export async function moveSessionToWorkspace(ctx, options = {}) {
   const home = options.home ?? dshHomeDir()
-  const { sessionId, targetTitle } = options
+  const { sessionId } = options || {}
+  /* 字段名兼容：三个客户端发送点（session-kit 批量面板 / 会话菜单、本插件搬家面板）
+     发的都是 `target`，而这里一直只解构 `targetTitle` → undefined →
+     planMoveSession 抛 "target workspace not found: undefined"，界面显示「工作区未定义」。
+     2026-10-11：两个名字都收，值都是工作区**标题**（客户端取自 workspace.title）。 */
+  const targetTitle = options?.targetTitle ?? options?.target
   const wsPath = `${home}/storages/workspace.json`
   if (!existsSync(wsPath)) throw new Error('workspace.json not found')
   // 活体守卫：live 会话挪家会让内存 cwd/文件路径错位
