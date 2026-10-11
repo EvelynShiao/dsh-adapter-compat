@@ -77,6 +77,15 @@ stored session "session-xxx" is corrupt:
    （两份逐字节相同）→ seq 回跳 → 宿主报 `released v2 row N has seq gap`。
    `guardSessionFile` 在 `verify` 不过时先试去重（丢掉重复的那一份、seq 重新密集），
    治好再验。**这两类病之外**的坏文件一个字节都不动，只报 `problems`。
+4. **对齐 tool/result 替换**（9999.9.14）：宿主规定 `tool/result` 的**替换体**除
+   `message.content` 外必须与被遮蔽原事件逐字节一致（`assertToolResultRewrite`），
+   否则整份日志以 `invalid seed event at index N: tool/result surface replacement may
+   change only content` 拒载。2026-10-11 实锤自伤两处，都已从源头修掉：
+   - `redactEventPayload` 的 `scrubDeep(data)` 会一路清掉 `meta.lines[].text`，替换体随即与原事件不一致；
+     现在**先深拷贝入参、再擦、最后原样还原 `meta`**——顺带修掉「原地改坏调用方事件」（浅拷贝 + 深擦会让
+     内存与磁盘分叉）；`verify` 也补上了这条规则，任何写入器再犯都会被自己的写盘门拦下。
+   - 历史遗留的这类错位由守卫自动对齐：把原事件的 `data` 整份搬过来、只保留替换体自己的 `content`
+     —— 占位正文照留，省上下文的收益不变。
 
 触发时机：开机 4s/25s 各全扫一次（只读前缀预筛，缺头才动手）+ **开机 45s 补一次深扫**
 （整读 + verify，连不在前缀里的重复块/断口一起治）+ 会话目录变化后（预筛）+ 真删除写盘后

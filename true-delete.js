@@ -1162,6 +1162,25 @@ export function verify(header, events, opts = {}) {
             else protectedHead = event.seq;
           }
           surface.splice(first, removed.length, event.seq);
+          /* 宿主的 assertToolResultRewrite（dsh-session planSurfaceEvent 调）：
+             tool/result 的**替换**除 message.content 外必须与被遮蔽的原事件逐字节一致。
+             漏了这条，任何「就地擦文本」的写入器都会产出「重开即拒载」的文件：
+               invalid seed event at index N: tool/result surface replacement may change only content
+             2026-10-11 实证：redactEventPayload 的 scrubDeep 把替换体的 meta.lines[].text 清空。 */
+          if (event.type === "tool/result" && removed.length >= 1) {
+            for (const originalSeq of removed) {
+              const original = events[originalSeq]; // seq 已强制 dense，seq 即下标
+              if (!isObj(original) || original.type !== "tool/result" || !isObj(original.data) || !isObj(event.data)) continue;
+              const strip = (data) => {
+                const copy = structuredClone(data);
+                if (isObj(copy.message)) copy.message.content = null;
+                return JSON.stringify(copy);
+              };
+              if (strip(original.data) !== strip(event.data)) {
+                P(`tool/result 替换@${event.seq} 改到了 content 之外的字段（被遮蔽 #${originalSeq}）——宿主会以 "surface replacement may change only content" 拒载`);
+              }
+            }
+          }
         }
         stats.replaces += 1;
       }

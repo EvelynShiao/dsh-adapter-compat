@@ -545,7 +545,7 @@ export function redactEventPayload(event) {
     /* 只删「文本载体」字段，其余（turn/step/retryId/attemptId/reason 以及任何
        序号/计数标量）全部保留。用白名单会丢掉 llm/retry 的**策略重试序号**，
        校验器随即报「跳过了策略重试序号」。 */
-    const d = { ...event.data }
+    const d = structuredClone(event.data)
     for (const k of ['content', 'text', 'messages', 'prompt', 'reasoning', 'reasoning_content', 'thinking']) {
       if (d[k] !== undefined) delete d[k]
     }
@@ -558,7 +558,15 @@ export function redactEventPayload(event) {
     }
     return { ...event, data: d }
   }
-  const data = { ...event.data }
+  /* 两件事一起做，顺序不能反（2026-10-11 实锤两个都是 bug）：
+     ① 深拷贝：scrubDeep 是**原地**深擦，浅拷贝会让入参 event 的嵌套对象（meta.lines[].text、
+        stream chunk 文本）被一起改坏——调用方拿的是同一批对象时，内存与磁盘就此分叉；
+     ② meta 留档并还原：宿主 assertToolResultRewrite 规定 tool/result 替换体除
+        message.content 外必须与被遮蔽原事件逐字节一致；scrubDeep 会一路清掉
+        meta.lines[].text，于是重开整个会话被拒载：
+          invalid seed event at index N: tool/result surface replacement may change only content */
+  const metaSnapshot = event.data.meta === undefined ? undefined : structuredClone(event.data.meta)
+  const data = structuredClone(event.data)
   if (Array.isArray(data.content)) data.content = emptyTextBlocks(data.content)
   if (data.message && typeof data.message === 'object') {
     const msg = { ...data.message }
@@ -574,6 +582,7 @@ export function redactEventPayload(event) {
   if (typeof data.output === 'string') data.output = ''
   /* 关键补充：按 key 名深度擦（内嵌提供方流 data.stream.*.texts 就在里面） */
   scrubDeep(data)
+  if (metaSnapshot !== undefined) data.meta = metaSnapshot
   if (typeof data.reasoning === 'string') data.reasoning = ''
   if (typeof data.reasoningContent === 'string') data.reasoningContent = ''
   if (typeof data.thinking === 'string') data.thinking = ''

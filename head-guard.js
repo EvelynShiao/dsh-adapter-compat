@@ -285,11 +285,42 @@ function writeSessionSafe(file, header, events) {
 }
 
 /**
- * 处理一个会话文件：读 → 诊断 → （按需）去重复块 / 插受保护头 → verify → 备份 + 安全写盘 + 读回复核。
+ * tool/result 的**替换**只允许改 `message.content`（宿主 Session 构造期
+ * assertToolResultRewrite）。任何非 content 字段与被遮蔽原事件不一致——典型是
+ * 「就地擦文本」的写入器把 `data.meta.lines[].text` 一并清空——整份日志就会以
+ *   invalid seed event at index N: tool/result surface replacement may change only content
+ * 拒载。修法：把原事件的 data 整份搬过来，只保留替换体自己的 content
+ * （占位正文照留 = 省上下文的收益不变，只把结构元数据对齐）。
+ * @returns {{events:object[], repaired:number}}
+ */
+export function repairToolResultRewrites(events) {
+  let repaired = 0
+  const out = events.map((e) => {
+    if (e?.type !== 'tool/result') return e
+    const op = e.surfaceOp
+    if (op === undefined || op === 'append') return e
+    const source = events[op?.startSeq]
+    if (source?.type !== 'tool/result' || typeof source.data !== 'object' || source.data === null || typeof e.data !== 'object' || e.data === null) return e
+    const message = {
+      ...source.data.message,
+      content: e.data.message?.content ?? source.data.message?.content,
+    }
+    const data = { ...source.data, message }
+    if (JSON.stringify(data) === JSON.stringify(e.data)) return e
+    repaired += 1
+    return { ...e, data }
+  })
+  return { events: out, repaired }
+}
+
+/**
+ * 处理一个会话文件：读 → 诊断 → （按需）去重复块 / 对齐 tool-result 替换 / 插受保护头
+ *                    → verify → 备份 + 安全写盘 + 读回复核。
  *
- * 两类病都治：
+ * 三类病都治：
  *   1. 受保护头缺失（哑弹 / 已拒载）—— 首个表面节点前插空 system/message；
- *   2. 同段写了两遍导致 seq 断口（下载/合并/写盘重试的痕迹）—— 去掉重复的那一份。
+ *   2. 同段写了两遍导致 seq 断口（下载/合并/写盘重试的痕迹）—— 去掉重复的那一份；
+ *   3. tool/result 替换改到了 content 之外的字段 —— 用被遮蔽原事件对齐（2026-10-11 新增）。
  * 都没病就一个字节都不动；`deep` 为 false 且没缺头时直接返回（调用方的便宜预筛路径）。
  *
  * @param {string} file - session.v4.jsonl.zstd 绝对路径
@@ -310,7 +341,7 @@ export function guardSessionFile(file, options = {}) {
   let events = doc.events
   let changed = false
 
-  /* 1) verify 不过先试「去重复块」：这是 sync 下载/写盘重试留下的唯一一种「结构还能救」的伤。 */
+  /* 1) verify 不过先试两组「结构还能救」的招：去重复块 → 对齐 tool-result 替换。 */
   if (!verify(header, events).ok) {
     const dup = findDuplicateBlock(events)
     if (dup !== undefined) {
@@ -323,6 +354,15 @@ export function guardSessionFile(file, options = {}) {
           out.notes.push(`去重复块：seq ${dup.secondStart} 起 ${dup.length} 条此前被写了两遍（两份逐字节相同）`)
         }
       } catch { /* 交给下面报 problems */ }
+    }
+    if (!verify(header, events).ok) {
+      const rewrites = repairToolResultRewrites(events)
+      if (rewrites.repaired > 0 && verify(header, rewrites.events).ok) {
+        events = rewrites.events
+        changed = true
+        out.rewritesAligned = rewrites.repaired
+        out.notes.push(`对齐 tool/result 替换 ${rewrites.repaired} 处：非 content 字段（如 meta.lines[].text）曾与被遮蔽原事件不一致 → 宿主会以 "surface replacement may change only content" 拒载`)
+      }
     }
   }
 

@@ -12,7 +12,8 @@ import { mkdtempSync, existsSync, mkdirSync, readFileSync, copyFileSync } from '
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { readSession, writeSession, verify, lateSystemAppends, excise } from '../true-delete.js'
-import { diagnoseProtectedHead, insertProtectedHead, guardSessionFile, probeProtectedHead } from '../head-guard.js'
+import { diagnoseProtectedHead, insertProtectedHead, guardSessionFile, probeProtectedHead, repairToolResultRewrites } from '../head-guard.js'
+import { redactEventPayload } from '../purge.js'
 import { guardProtectedHeads, installHeadGuard } from '../index.js'
 
 const header = () => ({
@@ -182,6 +183,87 @@ test('excise 的系统头级联不再「删光全部 system」：受保护头与
   const v = verify(result.header, result.events)
   assert.equal(v.ok, true, v.problems?.join('; '))
   assert.equal(v.stats.systemHead, 2)
+})
+
+/** 造一份含「tool/result 替换」的会话：原事件带 meta.lines，替换体只该改 content。 */
+function rewriteFixture({ scrubReplacementMeta = false } = {}) {
+  const events = [
+    { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
+    { type: 'step/start', seq: 1, time: 2, data: { turn: 1, step: 1 } },
+    { type: 'assistant/message', seq: 2, time: 3, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'tool-call', id: 'call_1', name: 'read', arguments: '{}' }], source: { kind: 'model' }, id: 'asst-1' } }, surfaceOp: 'append' },
+    { type: 'tool/call', seq: 3, time: 4, data: { turn: 1, step: 1, callId: 'call_1', name: 'read', arguments: '{}' } },
+    {
+      type: 'tool/result',
+      seq: 4,
+      time: 5,
+      data: {
+        turn: 1,
+        step: 1,
+        message: { role: 'tool', source: { kind: 'tool', callId: 'call_1' }, toolCallId: 'call_1', content: [{ type: 'text', text: '原始 40 行文件内容' }], isError: false, id: 'res-1' },
+        meta: { path: 'C:/x/y.jsonl', offset: 1, lines: [{ number: 1, text: '{"type":"session"}' }, { number: 2, text: '{"type":"turn/start"}' }] },
+      },
+      surfaceOp: 'append',
+    },
+    { type: 'step/end', seq: 5, time: 6, data: { turn: 1, step: 1 } },
+  ]
+  // 剪枝替换体：只改 content（合法）
+  const replacement = {
+    type: 'tool/result',
+    seq: 6,
+    time: 7,
+    data: {
+      ...events[4].data,
+      message: { ...events[4].data.message, content: [{ type: 'text', text: '[已剪枝]' }] },
+    },
+    surfaceOp: { op: 'replace', startSeq: 4, endSeq: 4 },
+    sourceEventSeqs: [4],
+  }
+  // 复现「历史遗留伤」：替换体的 meta 被旧版深度擦文本器清空（与 prevention 测试分开写，
+  // 免得哪天 redact 修好了这条用例就失去意义）
+  if (scrubReplacementMeta) {
+    replacement.data = {
+      ...replacement.data,
+      meta: { ...replacement.data.meta, lines: replacement.data.meta.lines.map((l) => ({ ...l, text: '' })) },
+    }
+  }
+  events.push(replacement)
+  events.push({ type: 'turn/end', seq: 7, time: 8, data: { turn: 1, reason: { kind: 'completed' } } })
+  return events
+}
+
+test('根因回归：redactEventPayload 不许碰 meta（它只该擦正文）', () => {
+  const events = rewriteFixture()
+  const before = structuredClone(events[6])
+  const after = redactEventPayload(before)
+  assert.deepEqual(after.data.meta, events[6].data.meta, 'meta 必须原样保留（宿主拿它比对替换体）')
+  assert.notDeepEqual(after.data.message.content, events[6].data.message.content, '正文该擦还是要擦')
+  assert.ok(before.data.meta.lines[0].text.length > 0, '擦除不得原地改坏入参的 meta')
+})
+
+test('tool/result 替换改到 content 之外的字段：verify 必须拒收，guard 必须能修', () => {
+  const broken = rewriteFixture({ scrubReplacementMeta: true })
+  const v = verify(header(), broken)
+  assert.equal(v.ok, false, '宿主规则移植版必须拒收（这正是重开时那句 invalid seed event）')
+  assert.ok(v.problems.some((p) => p.includes('surface replacement may change only content')), v.problems.join('; '))
+
+  const { events: fixed, repaired } = repairToolResultRewrites(broken)
+  assert.equal(repaired, 1)
+  const v2 = verify(header(), fixed)
+  assert.equal(v2.ok, true, v2.problems?.join('; '))
+  assert.deepEqual(fixed[6].data.meta, broken[4].data.meta, '替换体 meta 对齐到被遮蔽原事件')
+  assert.deepEqual(fixed[6].data.message.content, broken[6].data.message.content, '替换体的剪枝正文保留（省上下文收益不变）')
+})
+
+test('guardSessionFile：这一整类伤能自动治好并写盘', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'headguard-rewrite-'))
+  const file = join(dir, 'session.v4.jsonl.zstd')
+  writeSession(file, header(), rewriteFixture({ scrubReplacementMeta: true }))
+  const r = guardSessionFile(file, { write: true, backupDir: join(dir, 'backup'), deep: true })
+  assert.equal(r.status, 'written', JSON.stringify(r))
+  assert.equal(r.rewritesAligned, 1)
+  const back = readSession(file)
+  assert.equal(verify(back.header, back.events).ok, true)
+  assert.deepEqual(back.events[6].data.meta, back.events[4].data.meta)
 })
 
 test('guardSessionFile：同段写了两遍（seq 断口）也能自动去重修好', () => {
