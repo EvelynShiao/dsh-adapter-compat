@@ -86,6 +86,10 @@ import { readSession, writeSession, verify as verifySessionEvents } from './true
 import { guardSessionFile, probeProtectedHead } from './head-guard.js'
 import { installWireTap } from './wire-tap.js'
 import { slimSession } from './slim.js'
+import { installOrderRoute } from './order.js'
+
+/* 与其他层一致地再导出（单测/排查直接 import 用）。 */
+export { installOrderRoute }
 
 export const inject = ['llm', 'webServer']
 
@@ -394,6 +398,22 @@ export function guardSettingsSchema(ctx) {
 export const PRESSURE_CALIBRATED = Symbol.for('dsh-adapter-compat.pressure-calibration')
 
 /** 可信倍率的下限样本量与上限，越界一律退回官方原值。 */
+/**
+ * 输出预留（token）：提供方判据是 `messages + max_tokens ≤ contextWindow`，
+ * 官方的占用显示只比 messages/window，于是 256k 的输出预留从来没被算进去
+ * —— 2026-10-11 实测：仪表盘 95%（949,320/1,000,000），实际请求却是
+ * 1,209,316（953,316 messages + 256,000 completion）> 1,048,576 被拒。
+ * 把预留并进 projectedTokens，百分比才等于「这次发出去会不会被拒」。
+ * 想关掉：插件 config 里 contextReserveTokens: 0。
+ */
+export const pressureReserve = { tokens: 256000 }
+
+/** 设置输出预留（apply 时按插件 config 注入）。 */
+export function setPressureReserveTokens(value) {
+  const n = Number(value)
+  if (Number.isFinite(n) && n >= 0) pressureReserve.tokens = Math.round(n)
+}
+
 export const PRESSURE_MIN_SAMPLE = 2000
 export const PRESSURE_MAX_RATIO = 8
 
@@ -406,14 +426,19 @@ export const PRESSURE_MAX_RATIO = 8
 export function calibratePressureView(state, out) {
   try {
     if (!out || typeof out !== 'object') return out
+    /* 预留一律并入：无论倍率校准走哪条分支，出口值都要是「本次请求的真实规模」。 */
+    const withReserve = (value) => (Number.isFinite(value) ? value + pressureReserve.tokens : value)
+    const fallback = Number.isFinite(out.projectedTokens)
+      ? { ...out, projectedTokens: withReserve(out.projectedTokens) }
+      : out
     const pressure = state?.pressureTokens
     const total = state?.surfaceTokens
     const sampled = state?.sampledSurfaceTokens
-    if (!Number.isFinite(pressure) || !Number.isFinite(total) || !Number.isFinite(sampled)) return out
-    if (pressure <= 0 || sampled < PRESSURE_MIN_SAMPLE) return out
+    if (!Number.isFinite(pressure) || !Number.isFinite(total) || !Number.isFinite(sampled)) return fallback
+    if (pressure <= 0 || sampled < PRESSURE_MIN_SAMPLE) return fallback
     const ratio = pressure / sampled
-    if (!Number.isFinite(ratio) || ratio <= 0 || ratio > PRESSURE_MAX_RATIO) return out
-    const projected = Math.max(0, Math.round(pressure + (total - sampled) * ratio))
+    if (!Number.isFinite(ratio) || ratio <= 0 || ratio > PRESSURE_MAX_RATIO) return fallback
+    const projected = withReserve(Math.max(0, Math.round(pressure + (total - sampled) * ratio)))
     if (projected === out.projectedTokens) return out
     return { ...out, projectedTokens: projected }
   } catch {
@@ -1586,6 +1611,13 @@ export function apply(ctx, config = {}) {
     /* 路由注册失败绝不拖垮 apply */
   }
 
+  // -3.6) 侧栏排序：路由（工作区/会话顺序，只读写宿主 registry，不碰 workspace.json）
+  try {
+    installOrderRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
   // -1) 会话盘监视 + 标题投影预热（不依赖 llm，必须排在 llm 早退之前）
   try {
     installTitleWarm(ctx, config)
@@ -1619,7 +1651,8 @@ export function apply(ctx, config = {}) {
   const installPressureCalibration = (final = false) => {
     try {
       const projections = serviceOf(ctx, 'sessionProjections')
-      const patchedNow = calibrateContextPressure(projections)
+      setPressureReserveTokens(config?.contextReserveTokens ?? pressureReserve.tokens)
+  const patchedNow = calibrateContextPressure(projections)
       /* 落盘铁证：既报走了哪条挂接路径，也报一次算术自证。
          合成状态 pressure=200000 / surface=150000 / sampled=100000（倍率 2）：
          官方公式给 200000+50000=250000，校准后必须是 300000。 */
