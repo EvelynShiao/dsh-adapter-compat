@@ -80,18 +80,59 @@ function appendBounded(line, home) {
 }
 
 /**
- * 挂上探针。挂在 `llm/stream` 瀑布上——那是 provider 收到 options 的**唯一入口**，
- * 也是所有路由（含第三方 adapter）都必经的一层。
+ * 出口修：把「正文全空的 tool 结果」补一个占位文本。
+ *
+ * 为什么必须修在出口、而不是只修日志：provider（Anthropic 风格）把
+ * `tool_result.content = []` 视为**没有结果**，于是报
+ *   messages.N.M: `tool_use` ids were found without `tool_result` blocks immediately after
+ * 宿主侧一切合法（assistant 宣告了 tool_use、下一条就是对应 tool 结果），但空内容远端不认。
+ * 实证 2026-10-11：session-3a8e374a 有 7 条全空 tool/result（#941/#946/#951/#956/#958/#963/#971，
+ * 正文被历史上的清空操作擦空），导致该会话每次请求都被 deepseek 拒收、连续三轮同一错误。
+ *
+ * cordis 的 waterfall 语义（cordis/lib/index.js:317）：`next()` 复用同一个 args 数组，
+ * 所以在这里**直接改 options.messages** 就改到了真正发出去的请求——无需重建 options。
+ *
+ * @returns {number} 实际修补的消息条数（0 = 无需修补）
+ */
+export function repairWireRequest(options) {
+  const messages = options?.messages
+  if (!Array.isArray(messages)) return 0
+  let repaired = 0
+  for (const message of messages) {
+    if (message === null || typeof message !== 'object') continue
+    if (message.role !== 'tool') continue
+    const content = Array.isArray(message.content) ? message.content : []
+    const hasText = content.some((block) => block && block.type === 'text' && typeof block.text === 'string' && block.text.length > 0)
+    if (hasText) continue
+    /* 保留结构（id/source/toolCallId/isError 等），只把正文补成占位：
+       远端要的是「这条结果存在且有内容」；占位符满足它，也不谎报成功/失败。 */
+    message.content = [{ type: 'text', text: '[内容已清除]' }]
+    repaired += 1
+  }
+  return repaired
+}
+
+/**
+ * 挂上探针（顺带出口修）。挂在 `llm/stream` 瀑布上——那是 provider 收到 options 的
+ * **唯一入口**，也是所有路由（含第三方 adapter）都必经的一层。
  * @returns {boolean} 是否装上
  */
 export function installWireTap(ctx, config = {}, deps = {}) {
-  if (config?.wireTap === false) return false
+  if (config?.wireTap === false && config?.wireGuard === false) return false
   const home = deps.home ?? homeDir()
+  const tap = config?.wireTap !== false
+  const guard = config?.wireGuard !== false
   try {
     ctx.effect(function* () {
       yield ctx.on('llm/stream', (options, next) => {
         try {
-          appendBounded(JSON.stringify(digestRequest(options)), home)
+          if (guard) {
+            const n = repairWireRequest(options)
+            if (n > 0) appendBounded(JSON.stringify({ t: new Date().toISOString(), event: 'wire-guard', repaired: n, provider: options?.provider, model: options?.model }), home)
+          }
+        } catch { /* 修补失败不阻断请求 */ }
+        try {
+          if (tap) appendBounded(JSON.stringify(digestRequest(options)), home)
         } catch { /* 摘要失败不阻断请求 */ }
         return next()
       })

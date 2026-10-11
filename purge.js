@@ -618,6 +618,16 @@ export function redactEventPayload(event) {
   if (typeof data.result === 'string') data.result = ''
   if (data.output && typeof data.output === 'object') data.output = {}
   if (typeof data.output === 'string') data.output = ''
+  /* 出口修同伴（2026-10-11）：擦完不能留下「正文全空的 tool 结果」——
+     provider（Anthropic 风格）把 tool_result.content=[] 当成没有结果，直接拒收整轮：
+       messages.N.M: tool_use ids were found without tool_result blocks immediately after
+     实证 session-3a8e374a 的 #941/#946/#951/#956/#958/#963/#971 七条就是这样被擦空的。
+     留占位符：清空语义不变（正文确实没了），但结构合法。 */
+  if (event.type === 'tool/result' && data.message && typeof data.message === 'object') {
+    const blocks = Array.isArray(data.message.content) ? data.message.content : []
+    const hasText = blocks.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.length > 0)
+    if (!hasText) data.message = { ...data.message, content: [{ type: 'text', text: '[内容已清除]' }] }
+  }
   /* 关键补充：按 key 名深度擦（内嵌提供方流 data.stream.*.texts 就在里面） */
   scrubDeep(data)
   if (metaSnapshot !== undefined) data.meta = metaSnapshot
