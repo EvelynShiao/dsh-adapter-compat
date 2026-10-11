@@ -145,9 +145,16 @@ export function planPurge(events, options = {}) {
           if (node && Number.isSafeInteger(node.data?.turn)) { turnSet.add(node.data.turn); got = true; }
         }
         if (!got) {
-          const starts = events.filter((x) => x.type === 'turn/start' && x.seq < op.startSeq && Number.isSafeInteger(x.data?.turn));
-          const last = starts[starts.length - 1];
-          if (last) turnSet.add(last.data.turn);
+          /* 轮外墓碑：被遮行不在任何轮窗口内（2026-10-11 实测 11afd797 seq844 位于
+             轮16 结束**之后**，user/message 本身没有 data.turn）。
+             旧 fallback 把它归属到「前一个 turn/start 的轮」，两个后果都错：
+               ① 真正的目标行 seq844 永远进不了 remove → 墓碑永远清不掉（卡在最后1个）
+               ② 把无关的整轮拖进 remove → 过度删除（实测连带切掉 turn16 的 33 行）
+             这类被遮行不归属任何轮、范围内也没有任何带 turn 的节点 → 不存在 step 归属，
+             直接外科摘除「载体 + 被遮行」不会留下 step/start-end 算术残骸。
+             （got=true 时仍按轮摘，理由同上方注释：轮内整摘才不会留悬空 step。） */
+          for (let s = op.startSeq; s <= op.endSeq; s += 1) surgical.add(s);
+          surgical.add(e.seq);
         }
       }
       continue;
