@@ -20,7 +20,8 @@
     "purge.js",
     "slim.js",
     "head-guard.js",
-    "wire-tap.js"
+    "wire-tap.js",
+    "order.js"
   ],
   "keywords": [
     "deepseek-harness",
