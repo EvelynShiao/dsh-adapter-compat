@@ -62,7 +62,7 @@ stored session "session-xxx" is corrupt:
 老版 `excise`/`planPurge` 的"头序自愈"正是这种情况下的最坏选择：**删光全部 system/message**，
 理由写的是"宿主不罚缺失，无头=合法"——合法是对的，脆弱也是真的，会话就埋在那儿等下一次引爆。
 
-本层做两件事：
+本层做三件事：
 
 1. **补头**：`head-guard.js` 在首个表面节点前插一条**空** `system/message` 占位头，
    其后所有 `seq` 与 `seq` 引用（`surfaceOp.*`、`sourceEventSeqs`、`shadowedRange/Seqs`、
@@ -73,7 +73,15 @@ stored session "session-xxx" is corrupt:
    append（`lateSystemAppends`，逐轮算到不动点）。合法的 replacement 载体被牵连拔掉，
    会把它遮蔽的内容整段"复活"——那同样是在毁历史。
 
-触发时机：开机 4s/25s 各全扫一次（先预筛再动手）+ 会话目录变化后 + 真删除写盘后定向补扫。
+3. **去重复块**（与补头同一条流水线）：同步下载/写盘重试会把同一段事件原地写两遍
+   （两份逐字节相同）→ seq 回跳 → 宿主报 `released v2 row N has seq gap`。
+   `guardSessionFile` 在 `verify` 不过时先试去重（丢掉重复的那一份、seq 重新密集），
+   治好再验。**这两类病之外**的坏文件一个字节都不动，只报 `problems`。
+
+触发时机：开机 4s/25s 各全扫一次（只读前缀预筛，缺头才动手）+ **开机 45s 补一次深扫**
+（整读 + verify，连不在前缀里的重复块/断口一起治）+ 会话目录变化后（预筛）+ 真删除写盘后
+定向深扫。没伤病时开机那次也只留一行摘要（`head-guard[boot-deep+45s] scanned=… written=0`），
+免得"守卫到底在不在跑"只能靠猜。
 **live 会话绝不碰**（内存事件数组必须与文件对齐）；写盘前 `verify`（宿主规则移植版）不许过
 就分毫不动，写盘后回读复核，坏文件先备份到 `$DSH_HOME/backup-head-guard/`。
 
