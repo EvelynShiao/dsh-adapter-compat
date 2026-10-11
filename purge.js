@@ -70,8 +70,10 @@ export function classifyTombstoneCarrier(event, options = {}) {
   if (!op || typeof op !== 'object' || op.op !== 'replace') return undefined;
   let summary = null;
   try { summary = JSON.parse(src.summary ?? 'null') } catch { summary = null }
-  /* 「删除并重新生成」留下的旧版本：默认按设计保留（能再生成/对比）。
-     purgeRegenerate:true 时当普通删除处理——用户明确要"删了就物理没了"（2026-10-11）。 */
+  /* 「删除并重新生成」留下的旧版本：2026-10-11 起默认一并物理清除（用户要求
+     「全部真删除、不准留墓碑」）。原设计是保留以便对比，但那会让墓碑永久留在文件里。
+     安全前提：轮次推导已改用 surfaceOp 反推（planPurge 的 turnOfSeq），不会因为
+     summary.turn 漂移而切到用户还活着的轮次。options.purgeRegenerate===false 可关回。 */
   if (summary && summary.regeneration !== undefined && options.purgeRegenerate !== true) return { skip: true, why: 'regenerate' };
   const turns = new Set();
   if (summary && Number.isSafeInteger(summary.turn)) {
@@ -100,6 +102,25 @@ export function planPurge(events, options = {}) {
   const sinceMs = Number.isFinite(options.sinceMs) ? options.sinceMs : undefined;
   const purgeRegenerate = options.purgeRegenerate === true;
   const byseq = new Map(events.map((e) => [e.seq, e]));
+  /* seq → 轮号索引。墓碑的 summary.turn 会被**历史重编号**漂移（2026-10-11 实测 3a8e374a：
+     声称 turn 19/28，而 surfaceOp 实际遮蔽的是 turn 17/26，差 2）。直接采信 summary 会
+     整轮切到**用户还活着的轮次**上——该删的留下、不该删的没了。
+     故凡能用 surfaceOp 遮蔽区间反推出真实轮次，一律以真实轮为准，summary 只作兜底。 */
+  const turnOfSeq = new Map();
+  {
+    let cur = null;
+    for (const e of events) {
+      if (e.type === 'turn/start') cur = e.data?.turn;
+      if (cur !== null && Number.isSafeInteger(cur)) turnOfSeq.set(e.seq, cur);
+      if (e.type === 'turn/end') { if (cur !== null && Number.isSafeInteger(cur)) turnOfSeq.set(e.seq, cur); cur = null; }
+    }
+  }
+  const realTurnsOf = (op) => {
+    if (!op || typeof op !== 'object' || !Number.isFinite(op.startSeq) || !Number.isFinite(op.endSeq)) return null;
+    const out = new Set();
+    for (let s = op.startSeq; s <= op.endSeq; s += 1) { const t = turnOfSeq.get(s); if (t !== undefined) out.add(t); }
+    return out.size > 0 ? out : null;
+  };
   const turnSet = new Set();
   const surgical = new Set();
   const skipped = [];
@@ -177,6 +198,9 @@ export function planPurge(events, options = {}) {
       }
       continue;
     }
+    /* 轮次取值：surfaceOp 反推优先（见上方 turnOfSeq 注释），summary 兜底。 */
+    const real = realTurnsOf(e.surfaceOp);
+    if (real !== null) { for (const turn of real) turnSet.add(turn); continue; }
     for (const turn of c.turns) turnSet.add(turn);
   }
   const remove = new Set();

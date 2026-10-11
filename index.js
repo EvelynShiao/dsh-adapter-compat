@@ -1023,6 +1023,10 @@ export function installTrueDelete(ctx, config = {}) {
     if (inflight) return   // 防重入：目录钩子/定时器/开机可能交叠，绝不并发写盘
     inflight = true
     Promise.resolve()
+      /* purgeRegenerate 默认**开**（2026-10-11 用户要求「全部真删除、不准留墓碑」）：
+         带 regeneration 的墓碑（删除并重新生成）此前默认跳过 → 墓碑永远留在文件里。
+         轮次推导已改用 surfaceOp 反推（见 purge.js turnOfSeq），不再采信会漂移的
+         summary.turn，因此整轮切不会误伤用户还活着的轮次。显式 config.purgeRegenerate=false 可关回。 */
       .then(() => purgeTombstones(ctx, { home, write: true, purgeRegenerate: config?.purgeRegenerate !== false, ...options }))
       .then((r) => summarise(tag, r))
       .catch((e) => appendCompatLog('true-delete[' + tag + '] FAILED: ' + String(e?.message ?? e).slice(0, 160), home))
