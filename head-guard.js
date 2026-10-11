@@ -236,7 +236,37 @@ export function probeProtectedHead(file, options = {}) {
   return undefined
 }
 
-/** 临时文件 → 读回复核 → 原子替换；任何一步不过，原文件分毫不动。 */function writeSessionSafe(file, header, events) {
+/**
+ * 找「同段写了两遍」：连续 seq 原地重复一次（同步/写盘重试留下的痕迹）。
+ * @returns {{firstStart:number, secondStart:number, length:number}|undefined} 下标区间
+ */
+export function findDuplicateBlock(events) {
+  for (let i = 1; i < events.length; i += 1) {
+    if (!(events[i].seq < events[i - 1].seq)) continue
+    const back = events[i - 1].seq - events[i].seq + 1
+    if (i - back < 0 || i + back > events.length) continue
+    let same = true
+    for (let k = 0; k < back; k += 1) {
+      if (JSON.stringify(events[i - back + k]) !== JSON.stringify(events[i + k])) { same = false; break }
+    }
+    if (same) return { firstStart: i - back, secondStart: i, length: back }
+  }
+  return undefined
+}
+
+/** 去掉重复块里的一份（keepSecond=true 丢第一份），seq 随之重新变密集。 */
+export function repairDuplicateBlock(events, options = {}) {
+  const keepSecond = options.keepSecond !== false
+  const dup = findDuplicateBlock(events)
+  if (dup === undefined) throw new Error('没有发现重复块')
+  const dropFrom = keepSecond ? dup.firstStart : dup.secondStart
+  const dropped = events.filter((_, i) => i >= dropFrom && i < dropFrom + dup.length)
+  const kept = events.filter((_, i) => i < dropFrom || i >= dropFrom + dup.length)
+  return { events: kept.map((e, i) => ({ ...e, seq: i })), dup, dropped: dropped.length }
+}
+
+/** 临时文件 → 读回复核 → 原子替换；任何一步不过，原文件分毫不动。 */
+function writeSessionSafe(file, header, events) {
   const tmp = `${file}.headguard.tmp`
   try {
     writeSession(tmp, header, events)
@@ -255,10 +285,16 @@ export function probeProtectedHead(file, options = {}) {
 }
 
 /**
- * 处理一个会话文件：读 → 诊断 → 插头 → verify → （可选）备份 + 安全写盘 + 读回复核。
+ * 处理一个会话文件：读 → 诊断 → （按需）去重复块 / 插受保护头 → verify → 备份 + 安全写盘 + 读回复核。
+ *
+ * 两类病都治：
+ *   1. 受保护头缺失（哑弹 / 已拒载）—— 首个表面节点前插空 system/message；
+ *   2. 同段写了两遍导致 seq 断口（下载/合并/写盘重试的痕迹）—— 去掉重复的那一份。
+ * 都没病就一个字节都不动；`deep` 为 false 且没缺头时直接返回（调用方的便宜预筛路径）。
+ *
  * @param {string} file - session.v4.jsonl.zstd 绝对路径
- * @param {object} [options] - { write, backupDir }
- * @returns {{file:string, status:string, notes:string[], problems:string[], diagnosis?:object, removed?:number}}
+ * @param {object} [options] - { write, backupDir, deep }
+ * @returns {{file:string, status:string, notes:string[], problems:string[], diagnosis?:object}}
  */
 export function guardSessionFile(file, options = {}) {
   const out = { file, status: 'clean', notes: [], problems: [] }
@@ -270,43 +306,68 @@ export function guardSessionFile(file, options = {}) {
     out.notes.push(`readSession: ${String(error?.message ?? error).slice(0, 200)}`)
     return out
   }
-  const { header, events } = doc
+  const { header } = doc
+  let events = doc.events
+  let changed = false
+
+  /* 1) verify 不过先试「去重复块」：这是 sync 下载/写盘重试留下的唯一一种「结构还能救」的伤。 */
+  if (!verify(header, events).ok) {
+    const dup = findDuplicateBlock(events)
+    if (dup !== undefined) {
+      try {
+        const repaired = repairDuplicateBlock(events, { keepSecond: true })
+        if (verify(header, repaired.events).ok) {
+          events = repaired.events
+          changed = true
+          out.deduped = { at: dup.secondStart, length: dup.length }
+          out.notes.push(`去重复块：seq ${dup.secondStart} 起 ${dup.length} 条此前被写了两遍（两份逐字节相同）`)
+        }
+      } catch { /* 交给下面报 problems */ }
+    }
+  }
+
+  /* 2) 受保护头。 */
   const diag = diagnoseProtectedHead(events)
-  if (diag.ok) return out
-  out.diagnosis = diag
-  let fixed
-  try {
-    fixed = insertProtectedHead(events, diag)
-  } catch (error) {
-    out.status = 'failed'
-    out.notes.push(`insert: ${String(error?.message ?? error).slice(0, 200)}`)
-    return out
+  if (!diag.ok) {
+    out.diagnosis = diag
+    try {
+      const fixed = insertProtectedHead(events, diag)
+      const v = verify(header, fixed)
+      if (!v.ok) {
+        out.status = 'skipped'
+        out.problems = (v.problems ?? []).slice(0, 6).map(String)
+        return out
+      }
+      events = fixed
+      changed = true
+      out.insertedAt = diag.insertAt
+      out.notes.push(`补受保护头 @seq ${diag.insertAt}（原状：${diag.reason}${diag.illegalSeq === undefined ? '' : `，宿主的拒绝点在 seq ${diag.illegalSeq}`}）`)
+    } catch (error) {
+      out.status = 'failed'
+      out.notes.push(`insert: ${String(error?.message ?? error).slice(0, 200)}`)
+      return out
+    }
+  } else if (!changed && options.deep !== true) {
+    return out // 便宜预筛路径：没缺头就不是这一层的事
   }
-  const v = verify(header, fixed)
-  if (!v.ok) {
-    out.status = 'skipped'
-    out.problems = (v.problems ?? []).slice(0, 6).map(String)
-    return out
-  }
+
+  if (!changed) return out
   out.status = 'planned'
   if (options.write !== true) return out
   try {
     if (options.backupDir) {
       mkdirSync(options.backupDir, { recursive: true })
-      const backup = join(options.backupDir, `${String(header?.id ?? 'session')}.headless.zstd`)
+      const backup = join(options.backupDir, `${String(header?.id ?? 'session')}.before-headguard.zstd`)
       if (!existsSync(dirname(backup))) mkdirSync(dirname(backup), { recursive: true })
       copyFileSync(file, backup)
     }
-    const w = writeSessionSafe(file, header, fixed)
+    const w = writeSessionSafe(file, header, events)
     if (!w.ok) {
       out.status = 'write-refused'
       out.problems = w.problems
       return out
     }
-    if (options.backupDir === undefined) { /* 无备份目录时也要保证有退路：调用方负责 */ }
     out.status = 'written'
-    out.insertedAt = diag.insertAt
-    out.notes.push(`补受保护头 @seq ${diag.insertAt}（原状：${diag.reason}${diag.illegalSeq === undefined ? '' : `，宿主的拒绝点在 seq ${diag.illegalSeq}`}）`)
   } catch (error) {
     out.status = 'failed'
     out.notes.push(`write: ${String(error?.message ?? error).slice(0, 200)}`)

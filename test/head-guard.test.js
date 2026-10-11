@@ -184,6 +184,36 @@ test('excise 的系统头级联不再「删光全部 system」：受保护头与
   assert.equal(v.stats.systemHead, 2)
 })
 
+test('guardSessionFile：同段写了两遍（seq 断口）也能自动去重修好', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'headguard-dup-'))
+  const file = join(dir, 'session.v4.jsonl.zstd')
+  const base = headedEvents()
+  // 把 [4,5] 两行原地重复一遍（下载/写盘重试的痕迹）：seq 回跳 → 宿主判 seq gap
+  const dup = [...base.slice(0, 6), ...base.slice(4, 6), ...base.slice(6)]
+  writeSession(file, header(), dup)
+  assert.equal(verify(header(), dup).ok, false, '重复块必须让宿主校验失败（seq 断口）')
+  const r = guardSessionFile(file, { write: true, backupDir: join(dir, 'backup'), deep: true })
+  assert.equal(r.status, 'written', JSON.stringify(r))
+  assert.ok(r.deduped, '应报告去过重复块')
+  const back = readSession(file)
+  assert.ok(back.events.every((e, i) => e.seq === i), 'seq 必须重新密集')
+  assert.equal(back.events.length, base.length, '只应丢掉重复的那一份')
+  const v = verify(back.header, back.events)
+  assert.equal(v.ok, true, v.problems?.join('; '))
+})
+
+test('guardSessionFile：不是「重复块 / 缺头」的坏文件一律不动', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'headguard-other-'))
+  const file = join(dir, 'session.v4.jsonl.zstd')
+  const events = headedEvents()
+  events[4].data.message.content = 'not-an-array' // 结构坏，但不是本层能治的病
+  writeSession(file, header(), events)
+  const before = readFileSync(file)
+  const r = guardSessionFile(file, { write: true, backupDir: join(dir, 'backup'), deep: true })
+  assert.notEqual(r.status, 'written')
+  assert.deepEqual(readFileSync(file), before, '不认识的病必须一个字节都不动')
+})
+
 test('guardProtectedHeads：缺头的补上、live 的分毫不动', async () => {
   const home = mkdtempSync(join(tmpdir(), 'headguard-home-'))
   const mk = (sid, events) => {
@@ -200,10 +230,11 @@ test('guardProtectedHeads：缺头的补上、live 的分毫不动', async () =>
     get: (n) => (n === 'sessions' ? { get: (id) => (id === 'session-headed' ? { id } : undefined) } : undefined),
     logger: {},
   }
-  const r = await guardProtectedHeads(ctx, { home, write: true })
+  const r = await guardProtectedHeads(ctx, { home, write: true, deep: true })
   assert.equal(r.scanned, 2)
   assert.equal(r.liveSkipped, 1)
   assert.equal(r.written, 1)
+  assert.equal(r.deep, true)
   const back = readSession(headlessFile)
   assert.equal(verify(back.header, back.events).stats.systemHead, 4)
   assert.deepEqual(readFileSync(headedFile), headedBefore, 'live 会话必须分毫不动')
@@ -228,7 +259,7 @@ test('guardSessionFile：写盘前复核，写盘后回读，二次运行是 cle
 
   const done = guardSessionFile(file, { write: true, backupDir })
   assert.equal(done.status, 'written', JSON.stringify(done))
-  assert.ok(existsSync(join(backupDir, 'session-headguard-test.headless.zstd')), '必须先留备份')
+  assert.ok(existsSync(join(backupDir, 'session-headguard-test.before-headguard.zstd')), '必须先留备份')
 
   const back = readSession(file)
   const v = verify(back.header, back.events)

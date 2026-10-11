@@ -1040,7 +1040,7 @@ export function installTrueDelete(ctx, config = {}) {
   /* 真删除写过的会话，立刻补一次头：切除最容易把 system 头拔掉（旧版会顺手删光全部
      system/message，见 true-delete.js 的系统头级联）。定向补扫，不做全盘读。 */
   compatHooks.afterPurge = (ids) => {
-    try { if (typeof compatHooks.headGuard === 'function' && ids !== undefined && ids.length > 0) compatHooks.headGuard(ids) } catch { /* ignore */ }
+    try { if (typeof compatHooks.headGuard === 'function' && ids !== undefined && ids.length > 0) compatHooks.headGuard(ids, true) } catch { /* ignore */ }
   }
   /* 台账非空 → 60s 定点重试：清完即停，只在有待清项时存在（非常驻轮询）。
      解决「开机时活体、窗口又错过 → 老墓碑永远等下次开机」的死角。 */
@@ -1067,31 +1067,39 @@ export const HEAD_GUARD_BACKUP_DIR = 'backup-head-guard'
  * 缺头状态本身还能读（这是 excise 旧"头序自愈"删光 system 的依据），但它是个哑弹——
  * 下一次提示词变化（换模型/工具集/新会话系列）就炸。所以这里主动补头。
  *
- * 成本：先用 probeProtectedHead 只解前几帧预筛（首个表面节点永远在最前面几帧里），
- * 只有确实缺头才整读整写。
+ * 成本：默认先 probeProtectedHead 只解前几帧预筛（首个表面节点永远在最前面几帧里），
+ * 只有确实缺头才整读整写；deep:true 时逐个整读 + verify，连「同段写了两遍导致 seq 断口」
+ * 的下载/写盘事故也一并治（代价是整库读一遍，只在开机那一次做）。
  * live 会话绝不碰（内存事件数组与文件必须对齐）。
  * @param {object} ctx - cordis 上下文（只用于 live 判定）
- * @param {object} [options] - { home, write, only, backupDir }
+ * @param {object} [options] - { home, write, only, backupDir, deep }
  */
 export async function guardProtectedHeads(ctx, options = {}) {
   const home = options.home ?? dshHomeDir()
   const write = options.write === true
+  const deep = options.deep === true
   const backupDir = options.backupDir ?? `${home}/${HEAD_GUARD_BACKUP_DIR}`
   const only = options.only instanceof Set ? options.only : undefined
-  const out = { write, scanned: 0, headless: 0, written: 0, liveSkipped: 0, failed: 0, results: [] }
+  const out = { write, deep, scanned: 0, headless: 0, written: 0, liveSkipped: 0, failed: 0, deduped: 0, results: [] }
   for (const entry of listSessionFiles(home)) {
     if (only !== undefined && !only.has(entry.id)) continue
     out.scanned += 1
     if (isSessionLive(ctx, entry.id)) { out.liveSkipped += 1; continue }
-    let probe
-    try {
-      probe = probeProtectedHead(entry.file)
-    } catch {
-      probe = undefined
+    if (!deep) {
+      let probe
+      try {
+        probe = probeProtectedHead(entry.file)
+      } catch {
+        probe = undefined
+      }
+      if (probe === undefined || probe.ok) continue
+      out.headless += 1
     }
-    if (probe === undefined || probe.ok) continue
-    out.headless += 1
-    const result = guardSessionFile(entry.file, { write, backupDir })
+    const result = guardSessionFile(entry.file, { write, backupDir, deep })
+    if (result.status === 'clean') continue
+    if (result.status === 'unreadable') { out.failed += 1; out.results.push({ id: entry.id, ...result }); continue }
+    if (result.diagnosis !== undefined) out.headless += 1
+    if (result.deduped !== undefined) out.deduped += 1
     out.results.push({ id: entry.id, ...result })
     if (result.status === 'written') out.written += 1
     else if (result.status !== 'planned') out.failed += 1
@@ -1110,11 +1118,12 @@ export function installHeadGuard(ctx, config = {}) {
     Promise.resolve()
       .then(() => guardProtectedHeads(ctx, { home, write: true, ...options }))
       .then((r) => {
-        if (r.written === 0 && r.failed === 0) return
+        /* 开机那次一定留一行：否则「守卫在不在跑」只能靠猜（没伤病就一个字不打）。 */
+        if (r.written === 0 && r.failed === 0 && options.deep !== true) return
         appendCompatLog(
-          'head-guard[' + tag + '] written=' + r.written + ' headless=' + r.headless
-            + ' liveSkipped=' + r.liveSkipped + ' failed=' + r.failed
-            + (r.written > 0 ? ' ids=' + r.results.filter((x) => x.status === 'written').map((x) => String(x.id).slice(0, 16) + '@' + x.insertedAt).join(' ') : ''),
+          'head-guard[' + tag + '] scanned=' + r.scanned + ' written=' + r.written + ' headless=' + r.headless
+            + ' deduped=' + r.deduped + ' liveSkipped=' + r.liveSkipped + ' failed=' + r.failed
+            + (r.written > 0 ? ' ids=' + r.results.filter((x) => x.status === 'written').map((x) => String(x.id).slice(0, 16)).join(' ') : ''),
           home,
         )
         if (r.written > 0) ctx.logger?.info?.(`[adapter-compat] protected system head restored on ${r.written} session(s)`)
@@ -1123,16 +1132,24 @@ export function installHeadGuard(ctx, config = {}) {
       .finally(() => { inflight = false })
   }
   const timers = []
+  /* 4s：便宜的缺头预筛全扫。45s：深扫一遍（整读 + verify），连下载/写盘留下的
+     「同段两遍 → seq 断口」也治掉——这类伤不在前缀里，预筛看不见。 */
   for (const ms of [4000, 25000]) {
     const t = setTimeout(() => run('boot+' + (ms / 1000) + 's'), ms)
     if (typeof t.unref === 'function') t.unref()
     timers.push(t)
   }
-  compatHooks.headGuard = (ids) => run('hook', ids === undefined ? {} : { only: ids instanceof Set ? ids : new Set(ids) })
+  {
+    const t = setTimeout(() => run('boot-deep+45s', { deep: true }), 45000)
+    if (typeof t.unref === 'function') t.unref()
+    timers.push(t)
+  }
+  compatHooks.headGuard = (ids, deep) => run('hook', { ...(ids === undefined ? {} : { only: ids instanceof Set ? ids : new Set(ids) }), ...(deep === true ? { deep: true } : {}) })
   return { run, timers }
 }
 
-/* Timeline 块索引孤儿清理（三插件零墓碑的第三条腿）：   session-kit/easyrewrite 删掉整个会话后 session-blocks.db 里该会话的块还留着
+/* Timeline 块索引孤儿清理（三插件零墓碑的第三条腿）：
+   session-kit/easyrewrite 删掉整个会话后 session-blocks.db 里该会话的块还留着
    → 右栏永远显示墓碑。文件消失即索引孤儿——每次真删除扫描顺手清（幂等）。
    实证：手机端曾积 37 个孤儿（2026-10-09 手动清过），此前插件层无人清。 */
 export function pruneBlockOrphans(home) {
