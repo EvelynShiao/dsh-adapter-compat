@@ -33,7 +33,7 @@ test('slimEvent: assistant/message 清 reasoning 块、保留 text 回复与 too
 test('slimEvent: tool/result 清空 content/result/output', () => {
   const ev = { seq: 20, type: 'tool/result', data: { turn: 1, step: 1, message: { role: 'tool', content: [{ type: 'text', text: 'y'.repeat(900) }] }, result: 'zzz', output: 'ooo' } }
   const out = slimEvent(ev)
-  assert.equal(out.data.message.content[0].text, '', 'tool 输出应清空')
+  assert.equal(out.data.message.content[0].text, '[NaN]', 'tool 输出应清空，但要留 [NaN] 占位（空 content 会被 provider 当成「没有结果」拒收整轮）')
   assert.equal(out.data.result, '')
   assert.equal(out.data.output, '')
 })

@@ -86,6 +86,10 @@ import { readSession, writeSession, verify as verifySessionEvents } from './true
 import { guardSessionFile, probeProtectedHead } from './head-guard.js'
 import { installWireTap } from './wire-tap.js'
 import { slimSession } from './slim.js'
+import { installOrderRoute } from './order.js'
+
+/* 与其他层一致地再导出（单测/排查直接 import 用）。 */
+export { installOrderRoute }
 
 export const inject = ['llm', 'webServer']
 
@@ -1603,6 +1607,13 @@ export function apply(ctx, config = {}) {
   // -3.5) 会话瘦身：路由（不依赖 llm，排在早退之前）
   try {
     installSlimRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.6) 侧栏排序：路由（工作区/会话顺序，只读写宿主 registry，不碰 workspace.json）
+  try {
+    installOrderRoute(ctx, config)
   } catch {
     /* 路由注册失败绝不拖垮 apply */
   }
