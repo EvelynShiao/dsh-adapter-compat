@@ -86,6 +86,7 @@ import { readSession, writeSession, verify as verifySessionEvents } from './true
 import { guardSessionFile, probeProtectedHead } from './head-guard.js'
 import { installWireTap } from './wire-tap.js'
 import { slimSession } from './slim.js'
+import { repairEvents, scanFile, describeGap } from './repair.js'
 import { installOrderRoute } from './order.js'
 
 /* 与其他层一致地再导出（单测/排查直接 import 用）。 */
@@ -397,18 +398,31 @@ export function guardSettingsSchema(ctx) {
 /** 占用校准标记：防止热重载后二次包装。 */
 export const PRESSURE_CALIBRATED = Symbol.for('dsh-adapter-compat.pressure-calibration')
 
-/** 可信倍率的下限样本量与上限，越界一律退回官方原值。 */
-/**
- * 输出预留（token）：提供方判据是 `messages + max_tokens ≤ contextWindow`，
- * 官方的占用显示只比 messages/window，于是 256k 的输出预留从来没被算进去
- * —— 2026-10-11 实测：仪表盘 95%（949,320/1,000,000），实际请求却是
- * 1,209,316（953,316 messages + 256,000 completion）> 1,048,576 被拒。
- * 把预留并进 projectedTokens，百分比才等于「这次发出去会不会被拒」。
- * 想关掉：插件 config 里 contextReserveTokens: 0。
+/** 输出预留（token，固定值）：默认 0。设为非 0 会把该 token 数直接加到显示占用上。
+ *  ⚠️ 2026-10-12 实测教训：这里原本写死 256000（当时为了预演「messages + max_tokens
+ *  ≤ contextWindow」会不会被提供方拒），结果它是个**绝对值**，在小会话上把占用抬成
+ *  实际的 4~6 倍——真实提示词 52,088，仪表盘显示 308,088（30%）；提示词涨到 79,465
+ *  时显示 335,465（32%）。倍数还不固定，无法据此判断真实用量。
+ *  现改为下方的**相对余量**（PRESSURE_MARGIN_RATIO，默认 5%），保证显示值略大于
+ *  实际值。想恢复旧的「预留预演」行为：插件 config 里 contextReserveTokens。
  */
-export const pressureReserve = { tokens: 256000 }
+export const pressureReserve = { tokens: 0 }
 
-/** 设置输出预留（apply 时按插件 config 注入）。 */
+/** 相对余量：显示值 = 校准值 × (1 + 该比例)。用户要求「留 5% 余量」。 */
+export const PRESSURE_MARGIN_RATIO = 0.05
+
+/** fallback 增量的保守修正系数（仅作用于「无实测倍率」时的 surface 增量）。
+ *  宿主 dsh-token-meter 的 CHARS_PER_TOKEN = 4（≈0.25 token/字符，英文口径）；
+ *  DeepSeek 官方换算（api-docs.deepseek.com/zh-cn/quick_start/token_usage）：
+ *  1 英文字符 ≈ 0.3 token、**1 中文字符 ≈ 0.6 token** —— 官方中文口径 1.67 字符/token，
+ *  宿主口径对中文会话低估 4 × 0.6 = 2.4 倍。实测倍率分支靠真实 usage 自然修正，
+ *  但 fallback（样本不足/倍率异常）没有实测兜底，直接用官方 4 字符/token 的增量
+ *  在中文会话里会低估到爆窗。按官方中文口径回算取 2.4：英文会话 fallback 略虚高，
+ *  属短暂冷启动态——用户要求「常数保守、宁高勿爆」。
+ */
+export const PRESSURE_FALLBACK_FACTOR = 2.4
+
+/** 设置固定预留（apply 时按插件 config 注入；不设则保持 0）。 */
 export function setPressureReserveTokens(value) {
   const n = Number(value)
   if (Number.isFinite(n) && n >= 0) pressureReserve.tokens = Math.round(n)
@@ -426,20 +440,29 @@ export const PRESSURE_MAX_RATIO = 8
 export function calibratePressureView(state, out) {
   try {
     if (!out || typeof out !== 'object') return out
-    /* 预留一律并入：无论倍率校准走哪条分支，出口值都要是「本次请求的真实规模」。 */
-    const withReserve = (value) => (Number.isFinite(value) ? value + pressureReserve.tokens : value)
-    const fallback = Number.isFinite(out.projectedTokens)
-      ? { ...out, projectedTokens: withReserve(out.projectedTokens) }
-      : out
+    /* 余量一律并入：无论倍率校准走哪条分支，出口值都要略大于本次请求的真实规模。 */
+    const withReserve = (value) =>
+      Number.isFinite(value) ? Math.round(value * (1 + PRESSURE_MARGIN_RATIO)) + pressureReserve.tokens : value
     const pressure = state?.pressureTokens
     const total = state?.surfaceTokens
     const sampled = state?.sampledSurfaceTokens
+    /* fallback：官方 projected = pressure + (surface - sampled)，增量按 4 字符/token（英文口径）估。
+     * pressure 是提供方真数不动；只把**正的** surface 增量按官方中文口径 ×PRESSURE_FALLBACK_FACTOR
+     * 回算（负增量不放大，防绝对值放大反成低估）。state 缺字段时保持官方值。 */
+    const official = out.projectedTokens
+    let fallbackValue = official
+    if (Number.isFinite(official) && Number.isFinite(pressure) && Number.isFinite(total) && Number.isFinite(sampled)) {
+      const delta = total - sampled
+      if (delta > 0) fallbackValue = Math.max(0, Math.round(pressure + delta * PRESSURE_FALLBACK_FACTOR))
+    }
+    const fallback = Number.isFinite(fallbackValue)
+      ? { ...out, projectedTokens: withReserve(fallbackValue) }
+      : out
     if (!Number.isFinite(pressure) || !Number.isFinite(total) || !Number.isFinite(sampled)) return fallback
     if (pressure <= 0 || sampled < PRESSURE_MIN_SAMPLE) return fallback
     const ratio = pressure / sampled
     if (!Number.isFinite(ratio) || ratio <= 0 || ratio > PRESSURE_MAX_RATIO) return fallback
     const projected = withReserve(Math.max(0, Math.round(pressure + (total - sampled) * ratio)))
-    if (projected === out.projectedTokens) return out
     return { ...out, projectedTokens: projected }
   } catch {
     // 校准失败必须退回官方值，垫片绝不能反过来弄坏占用显示
@@ -1596,6 +1619,171 @@ export function installSlimRoute(ctx, config = {}) {
   }
 }
 
+/* ============ 第八层：断号修复（seq-gap repair） ===========
+ *
+ * 症状（2026-10-12 session-790e9a59 实证）：强退丢掉一次未落盘的追加批次，
+ * 重启后宿主按内存续写 → 文件中间 seq 断号，历史加载报
+ * "complete frame contains a torn JSONL record"（误导文案，实际不是 zstd 撕裂）。
+ * 宿主自愈只覆盖尾部撕裂，中间断号只能靠本层补行。
+ *
+ * 流程照 slimSessionFile 的权威范式：定位 → live 拒写(409) → 读 → 按上下文补行
+ * （repair.js，只认 tool/call 后缺 result/step-end 两种可确定推断的形态）→ verify
+ * 全绿 → 备份 → 写 → 读回复核（不过回滚）→ 清 projcache → 刷新列表。
+ * 干跑（write:false）只报告不落盘；无法识别的断号形态一律报告不动手。
+ *
+ * 关掉：cordis.patch.yml 本插件行 config.repairSession: false。
+ */
+
+/**
+ * 检查/修复一个会话的 seq 断号。
+ * @param {object} ctx - cordis 上下文（live 判定 + 修复后刷新列表）。
+ * @param {string} sessionId - 目标会话 id。
+ * @param {{write?:boolean, home?:string}} options - write:true 才落盘（默认干跑）。
+ */
+export async function repairSessionFile(ctx, sessionId, options = {}) {
+  const home = options.home ?? dshHomeDir()
+  const write = options.write === true
+  const located = listSessionFiles(home).find((x) => x.id === sessionId)
+  if (!located) throw Object.assign(new Error('session file not found'), { code: 'NOT_FOUND' })
+  if (isSessionLive(ctx, sessionId)) {
+    throw Object.assign(new Error('session is open in the host; switch to another conversation first'), { code: 'SESSION_LIVE' })
+  }
+  const scan = scanFile(located.file)
+  if (scan.error) throw Object.assign(new Error('session unreadable: ' + scan.error), { code: 'READ_FAILED' })
+  const plan = repairEvents(scan.header, scan.events)
+  const base = {
+    ok: plan.ok,
+    write,
+    id: sessionId,
+    gaps: plan.gaps.map(describeGap),
+    gapDetails: plan.gaps,
+    warnings: scan.warnings,
+    unsupported: plan.unsupported,
+    wouldInsert: plan.inserted.length,
+    verifyProblems: plan.problems,
+  }
+  if (plan.alreadyHealthy) return { ...base, ok: true, alreadyHealthy: true, wouldInsert: 0 }
+  if (!plan.ok) {
+    throw Object.assign(new Error('repair plan rejected: ' + (plan.problems[0] ?? 'unsupported gap shape')), { code: 'PLAN_REJECTED', plan: base })
+  }
+  if (!write) return base
+
+  // 备份失败就拒写：修复是可选项，不值得冒没备份的险
+  const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR + '-repair'
+  let backupPath = null
+  try {
+    mkdirSync(backupDir, { recursive: true })
+    backupPath = backupDir + '/' + sessionId + '.jsonl.zstd'
+    copyFileSync(located.file, backupPath)
+  } catch { backupPath = null }
+  if (!backupPath) throw Object.assign(new Error('backup failed; refusing to write'), { code: 'BACKUP_FAILED' })
+
+  writeSession(located.file, scan.header, plan.fixed)
+  const back = readSession(located.file)
+  const v2 = verifySessionEvents(back.header, back.events)
+  if (!v2.ok) {
+    try { copyFileSync(backupPath, located.file) } catch { /* 尽力回滚 */ }
+    throw Object.assign(new Error('post-write verify failed; rolled back'), { code: 'VERIFY_FAILED', problems: v2.problems })
+  }
+  const result = { ...base, ok: true, inserted: plan.inserted.length, backup: true }
+  // 内容变了 → 投影要冷重建
+  try { rmSync(home + '/storages/session_projcache/sessions/' + sessionId + '.json', { force: true }) } catch { /* ignore */ }
+  try { const sessions = serviceOf(ctx, 'sessions'); if (typeof sessions?.refresh === 'function') await sessions.refresh() } catch { /* ignore */ }
+  try { result.bytes = statSync(located.file).size } catch { /* ignore */ }
+  appendCompatLog(`repair ${sessionId.slice(0, 18)}: gaps=${plan.gaps.length} inserted=${plan.inserted.length}`)
+  return result
+}
+
+/**
+ * 全盘扫描（只读巡检）：列出所有断号会话与不可读会话。
+ * @param {string} [home]
+ * @returns {{ok:boolean, scanned:number, healthy:number, bad:object[], warned:object[], unreadable:object[]}}
+ */
+export function repairScanAll(home = dshHomeDir()) {
+  const out = { ok: true, scanned: 0, healthy: 0, bad: [], warned: [], unreadable: [] }
+  for (const entry of listSessionFiles(home)) {
+    out.scanned += 1
+    try {
+      const scan = scanFile(entry.file)
+      if (scan.error) { out.unreadable.push({ id: entry.id, error: scan.error }); out.ok = false; continue }
+      if (scan.gaps.length > 0) {
+        const plan = repairEvents(scan.header, scan.events)
+        out.bad.push({
+          id: entry.id,
+          gaps: scan.gaps.map(describeGap),
+          gapDetails: scan.gaps,
+          warnings: scan.warnings,
+          repairable: plan.ok,
+          unsupported: plan.unsupported,
+        })
+        out.ok = false
+      } else {
+        out.healthy += 1
+        if (scan.warnings.length > 0) out.warned.push({ id: entry.id, warnings: scan.warnings })
+      }
+    } catch (error) {
+      out.unreadable.push({ id: entry.id, error: String(error?.message ?? error) })
+      out.ok = false
+    }
+  }
+  return out
+}
+
+/** 注册断号修复路由（POST repair-session {sessionId, write} + GET repair-scan）。 */
+export function installRepairRoute(ctx, config = {}) {
+  if (config?.repairSession === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') return false
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/repair-session',
+      handler: async (req, res) => {
+        const reply = (status, obj) => {
+          try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+        }
+        if (req.method !== 'POST') return reply(405, { ok: false, error: 'method-not-allowed' })
+        let body = ''
+        try {
+          for await (const chunk of req) { body += chunk; if (body.length > 65536) throw new Error('body too large') }
+          const parsed = JSON.parse(body || '{}')
+          if (typeof parsed?.sessionId !== 'string' || !parsed.sessionId) return reply(400, { ok: false, error: 'sessionId required' })
+          const result = await repairSessionFile(ctx, parsed.sessionId, { write: parsed.write === true })
+          appendCompatLog(`repair-session route ok: ${JSON.stringify(result).slice(0, 200)}`)
+          return reply(200, result)
+        } catch (error) {
+          const msg = String(error?.message ?? error)
+          const code = error?.code === 'SESSION_LIVE' ? 409 : error?.code === 'NOT_FOUND' ? 404 : 400
+          appendCompatLog(`repair-session route FAILED(${code}): ${msg.slice(0, 200)}`)
+          return reply(code, { ok: false, error: msg, plan: error?.plan, problems: error?.problems })
+        }
+      },
+    })
+    try {
+      web.register({
+        kind: 'exact',
+        path: '/dsh-adapter-compat/repair-scan',
+        handler: async (req, res) => {
+          const reply = (status, obj) => {
+            try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+          }
+          if (req.method !== 'GET') return reply(405, { ok: false, error: 'method-not-allowed' })
+          try {
+            const report = repairScanAll()
+            appendCompatLog(`repair-scan: scanned=${report.scanned} bad=${report.bad.length} unreadable=${report.unreadable.length}`)
+            return reply(200, { ok: true, report })
+          } catch (e) { return reply(500, { ok: false, error: String(e?.message ?? e) }) }
+        },
+      })
+    } catch { /* 扫描路由失败不影响修复路由 */ }
+    appendCompatLog('repair routes registered')
+    return true
+  } catch (e) {
+    appendCompatLog('repair route FAILED: ' + String(e?.message ?? e).slice(0, 200))
+    return false
+  }
+}
+
 export function apply(ctx, config = {}) {
   // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
   try {
@@ -1607,6 +1795,13 @@ export function apply(ctx, config = {}) {
   // -3.5) 会话瘦身：路由（不依赖 llm，排在早退之前）
   try {
     installSlimRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.55) 断号修复：路由（强退丢批兜底，不依赖 llm，排在早退之前）
+  try {
+    installRepairRoute(ctx, config)
   } catch {
     /* 路由注册失败绝不拖垮 apply */
   }

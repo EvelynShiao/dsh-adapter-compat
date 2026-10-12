@@ -578,12 +578,21 @@ export function excise(header, events, removeSeqs, options = {}) {
     report.removed.byType[t] = (report.removed.byType[t] ?? 0) + 1;
   }
 
-  // ── 5. 载体候选（replace / compaction）──
+  // ── 5. 载体候选（replace / compaction/prune）──
+  /* 2026-10-12：**不再把 compaction/summary 当载体候选**。
+     它带 shadowedSeqs，遮蔽范围一旦部分被物理删除就会被判 carrier-narrowed → 整条剔除，
+     而它是压缩三件套（start/summary/end）的中间件 —— 剔除后 compaction/end 就变成
+     "成功结束但缺少 summary"，verify 拒写、整个清理被卡死（实测 session-3a8e374a：
+     seq1868 遮蔽 648 节点、与本次 remove 交集为 0 仍被判 narrowed，因为它引用的
+     49..1859 区间里有被删轮）。
+     另外 command/done.sourceEventSeq 指向该 summary，载体一剔除就成了 dangling 引用。
+     摘要本身是要保留的正文（它总结的内容被删，不等于摘要该消失）。
+     compaction/prune 仍是候选：那是真·物理剪枝，剪掉的内容被删时撤销它才是对的。 */
   const candidates = [];
   for (const e of src) {
     if (remove.has(e.seq)) continue;
     const isReplace = e.surfaceOp !== undefined && e.surfaceOp !== "append";
-    const isCompact = e.type === "compaction/prune" || e.type === "compaction/summary";
+    const isCompact = e.type === "compaction/prune";
     if (!isReplace && !isCompact) continue;
     const shadowed = isReplace
       ? (oldFold.replaceShadows.get(e.seq) ?? [])
