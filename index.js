@@ -398,18 +398,31 @@ export function guardSettingsSchema(ctx) {
 /** 占用校准标记：防止热重载后二次包装。 */
 export const PRESSURE_CALIBRATED = Symbol.for('dsh-adapter-compat.pressure-calibration')
 
-/** 可信倍率的下限样本量与上限，越界一律退回官方原值。 */
-/**
- * 输出预留（token）：提供方判据是 `messages + max_tokens ≤ contextWindow`，
- * 官方的占用显示只比 messages/window，于是 256k 的输出预留从来没被算进去
- * —— 2026-10-11 实测：仪表盘 95%（949,320/1,000,000），实际请求却是
- * 1,209,316（953,316 messages + 256,000 completion）> 1,048,576 被拒。
- * 把预留并进 projectedTokens，百分比才等于「这次发出去会不会被拒」。
- * 想关掉：插件 config 里 contextReserveTokens: 0。
+/** 输出预留（token，固定值）：默认 0。设为非 0 会把该 token 数直接加到显示占用上。
+ *  ⚠️ 2026-10-12 实测教训：这里原本写死 256000（当时为了预演「messages + max_tokens
+ *  ≤ contextWindow」会不会被提供方拒），结果它是个**绝对值**，在小会话上把占用抬成
+ *  实际的 4~6 倍——真实提示词 52,088，仪表盘显示 308,088（30%）；提示词涨到 79,465
+ *  时显示 335,465（32%）。倍数还不固定，无法据此判断真实用量。
+ *  现改为下方的**相对余量**（PRESSURE_MARGIN_RATIO，默认 5%），保证显示值略大于
+ *  实际值。想恢复旧的「预留预演」行为：插件 config 里 contextReserveTokens。
  */
-export const pressureReserve = { tokens: 256000 }
+export const pressureReserve = { tokens: 0 }
 
-/** 设置输出预留（apply 时按插件 config 注入）。 */
+/** 相对余量：显示值 = 校准值 × (1 + 该比例)。用户要求「留 5% 余量」。 */
+export const PRESSURE_MARGIN_RATIO = 0.05
+
+/** fallback 增量的保守修正系数（仅作用于「无实测倍率」时的 surface 增量）。
+ *  宿主 dsh-token-meter 的 CHARS_PER_TOKEN = 4（≈0.25 token/字符，英文口径）；
+ *  DeepSeek 官方换算（api-docs.deepseek.com/zh-cn/quick_start/token_usage）：
+ *  1 英文字符 ≈ 0.3 token、**1 中文字符 ≈ 0.6 token** —— 官方中文口径 1.67 字符/token，
+ *  宿主口径对中文会话低估 4 × 0.6 = 2.4 倍。实测倍率分支靠真实 usage 自然修正，
+ *  但 fallback（样本不足/倍率异常）没有实测兜底，直接用官方 4 字符/token 的增量
+ *  在中文会话里会低估到爆窗。按官方中文口径回算取 2.4：英文会话 fallback 略虚高，
+ *  属短暂冷启动态——用户要求「常数保守、宁高勿爆」。
+ */
+export const PRESSURE_FALLBACK_FACTOR = 2.4
+
+/** 设置固定预留（apply 时按插件 config 注入；不设则保持 0）。 */
 export function setPressureReserveTokens(value) {
   const n = Number(value)
   if (Number.isFinite(n) && n >= 0) pressureReserve.tokens = Math.round(n)
@@ -427,20 +440,29 @@ export const PRESSURE_MAX_RATIO = 8
 export function calibratePressureView(state, out) {
   try {
     if (!out || typeof out !== 'object') return out
-    /* 预留一律并入：无论倍率校准走哪条分支，出口值都要是「本次请求的真实规模」。 */
-    const withReserve = (value) => (Number.isFinite(value) ? value + pressureReserve.tokens : value)
-    const fallback = Number.isFinite(out.projectedTokens)
-      ? { ...out, projectedTokens: withReserve(out.projectedTokens) }
-      : out
+    /* 余量一律并入：无论倍率校准走哪条分支，出口值都要略大于本次请求的真实规模。 */
+    const withReserve = (value) =>
+      Number.isFinite(value) ? Math.round(value * (1 + PRESSURE_MARGIN_RATIO)) + pressureReserve.tokens : value
     const pressure = state?.pressureTokens
     const total = state?.surfaceTokens
     const sampled = state?.sampledSurfaceTokens
+    /* fallback：官方 projected = pressure + (surface - sampled)，增量按 4 字符/token（英文口径）估。
+     * pressure 是提供方真数不动；只把**正的** surface 增量按官方中文口径 ×PRESSURE_FALLBACK_FACTOR
+     * 回算（负增量不放大，防绝对值放大反成低估）。state 缺字段时保持官方值。 */
+    const official = out.projectedTokens
+    let fallbackValue = official
+    if (Number.isFinite(official) && Number.isFinite(pressure) && Number.isFinite(total) && Number.isFinite(sampled)) {
+      const delta = total - sampled
+      if (delta > 0) fallbackValue = Math.max(0, Math.round(pressure + delta * PRESSURE_FALLBACK_FACTOR))
+    }
+    const fallback = Number.isFinite(fallbackValue)
+      ? { ...out, projectedTokens: withReserve(fallbackValue) }
+      : out
     if (!Number.isFinite(pressure) || !Number.isFinite(total) || !Number.isFinite(sampled)) return fallback
     if (pressure <= 0 || sampled < PRESSURE_MIN_SAMPLE) return fallback
     const ratio = pressure / sampled
     if (!Number.isFinite(ratio) || ratio <= 0 || ratio > PRESSURE_MAX_RATIO) return fallback
     const projected = withReserve(Math.max(0, Math.round(pressure + (total - sampled) * ratio)))
-    if (projected === out.projectedTokens) return out
     return { ...out, projectedTokens: projected }
   } catch {
     // 校准失败必须退回官方值，垫片绝不能反过来弄坏占用显示
