@@ -96,6 +96,40 @@ stored session "session-xxx" is corrupt:
 
 恢复官方行为：`cordis.patch.yml` 本插件行 `config: { headGuard: false }` + 重启。
 
+## 第八层：断号修复（9999.9.20）
+
+症状（2026-10-12 实证，session-790e9a59）：**强退 DSH 会丢掉一次未落盘的追加批次**，
+重启后宿主按内存续写，会话文件中间出现 seq 断号——zstd 帧结构完整、checksum 都对，
+历史加载却报 `corrupt Zstandard session log: complete frame contains a torn JSONL record`
+（误导文案：不是 zstd 撕裂，是断号让 committedBytes 停滞）。宿主自带的自愈只覆盖**尾部
+撕裂**（截断丢弃），中间断号覆盖不到 → 历史打不开。典型断点：`tool/call` 之后缺
+`tool/result` + `step/end`（工具执行中强退）。
+
+修法 = 按上下文补行，不重编号、不动任何既有行：
+
+- 只认从工具协议可**确定性推断**的形态：`tool/call` 后缺 1 行 → 补 `tool/result`；
+  缺 2 行且下一跳是 `step/start` → 补 `[tool/result, step/end]`。其余形态一律只报告
+  不动手（`unsupported`），绝不猜；
+- 合成行占位正文 `[NaN]`（与 slim 同一惯例）；`sourceEventSeqs`/`surfaceOp` 放顶层信封；
+- `verify`（宿主规则移植版）全绿才落盘：先备份到 `$DSH_HOME/backup-true-delete-repair/`，
+  写完读回复核，不过就回滚；live 会话 409 拒写；
+- 干跑默认，`write: true` 才改文件。
+
+路由（重启 DSH 后生效）：
+
+```bash
+# 巡检全部会话（只读）：列出断号/不可读会话
+curl http://127.0.0.1:<port>/dsh-adapter-compat/repair-scan
+# 干跑诊断单个会话
+curl -X POST http://127.0.0.1:<port>/dsh-adapter-compat/repair-session \
+  -d '{"sessionId":"session-xxxx"}'
+# 确认无误后落盘修复
+curl -X POST http://127.0.0.1:<port>/dsh-adapter-compat/repair-session \
+  -d '{"sessionId":"session-xxxx","write":true}'
+```
+
+关掉：`cordis.patch.yml` 本插件行 `config: { repairSession: false }` + 重启。
+
 ## 安装
 
 电脑（profile 目录 = 你的 DSH profile，如 `~/.dsh/profiles/web`）：

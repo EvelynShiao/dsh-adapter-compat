@@ -86,6 +86,7 @@ import { readSession, writeSession, verify as verifySessionEvents } from './true
 import { guardSessionFile, probeProtectedHead } from './head-guard.js'
 import { installWireTap } from './wire-tap.js'
 import { slimSession } from './slim.js'
+import { repairEvents, scanFile, describeGap } from './repair.js'
 import { installOrderRoute } from './order.js'
 
 /* 与其他层一致地再导出（单测/排查直接 import 用）。 */
@@ -1596,6 +1597,171 @@ export function installSlimRoute(ctx, config = {}) {
   }
 }
 
+/* ============ 第八层：断号修复（seq-gap repair） ===========
+ *
+ * 症状（2026-10-12 session-790e9a59 实证）：强退丢掉一次未落盘的追加批次，
+ * 重启后宿主按内存续写 → 文件中间 seq 断号，历史加载报
+ * "complete frame contains a torn JSONL record"（误导文案，实际不是 zstd 撕裂）。
+ * 宿主自愈只覆盖尾部撕裂，中间断号只能靠本层补行。
+ *
+ * 流程照 slimSessionFile 的权威范式：定位 → live 拒写(409) → 读 → 按上下文补行
+ * （repair.js，只认 tool/call 后缺 result/step-end 两种可确定推断的形态）→ verify
+ * 全绿 → 备份 → 写 → 读回复核（不过回滚）→ 清 projcache → 刷新列表。
+ * 干跑（write:false）只报告不落盘；无法识别的断号形态一律报告不动手。
+ *
+ * 关掉：cordis.patch.yml 本插件行 config.repairSession: false。
+ */
+
+/**
+ * 检查/修复一个会话的 seq 断号。
+ * @param {object} ctx - cordis 上下文（live 判定 + 修复后刷新列表）。
+ * @param {string} sessionId - 目标会话 id。
+ * @param {{write?:boolean, home?:string}} options - write:true 才落盘（默认干跑）。
+ */
+export async function repairSessionFile(ctx, sessionId, options = {}) {
+  const home = options.home ?? dshHomeDir()
+  const write = options.write === true
+  const located = listSessionFiles(home).find((x) => x.id === sessionId)
+  if (!located) throw Object.assign(new Error('session file not found'), { code: 'NOT_FOUND' })
+  if (isSessionLive(ctx, sessionId)) {
+    throw Object.assign(new Error('session is open in the host; switch to another conversation first'), { code: 'SESSION_LIVE' })
+  }
+  const scan = scanFile(located.file)
+  if (scan.error) throw Object.assign(new Error('session unreadable: ' + scan.error), { code: 'READ_FAILED' })
+  const plan = repairEvents(scan.header, scan.events)
+  const base = {
+    ok: plan.ok,
+    write,
+    id: sessionId,
+    gaps: plan.gaps.map(describeGap),
+    gapDetails: plan.gaps,
+    warnings: scan.warnings,
+    unsupported: plan.unsupported,
+    wouldInsert: plan.inserted.length,
+    verifyProblems: plan.problems,
+  }
+  if (plan.alreadyHealthy) return { ...base, ok: true, alreadyHealthy: true, wouldInsert: 0 }
+  if (!plan.ok) {
+    throw Object.assign(new Error('repair plan rejected: ' + (plan.problems[0] ?? 'unsupported gap shape')), { code: 'PLAN_REJECTED', plan: base })
+  }
+  if (!write) return base
+
+  // 备份失败就拒写：修复是可选项，不值得冒没备份的险
+  const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR + '-repair'
+  let backupPath = null
+  try {
+    mkdirSync(backupDir, { recursive: true })
+    backupPath = backupDir + '/' + sessionId + '.jsonl.zstd'
+    copyFileSync(located.file, backupPath)
+  } catch { backupPath = null }
+  if (!backupPath) throw Object.assign(new Error('backup failed; refusing to write'), { code: 'BACKUP_FAILED' })
+
+  writeSession(located.file, scan.header, plan.fixed)
+  const back = readSession(located.file)
+  const v2 = verifySessionEvents(back.header, back.events)
+  if (!v2.ok) {
+    try { copyFileSync(backupPath, located.file) } catch { /* 尽力回滚 */ }
+    throw Object.assign(new Error('post-write verify failed; rolled back'), { code: 'VERIFY_FAILED', problems: v2.problems })
+  }
+  const result = { ...base, ok: true, inserted: plan.inserted.length, backup: true }
+  // 内容变了 → 投影要冷重建
+  try { rmSync(home + '/storages/session_projcache/sessions/' + sessionId + '.json', { force: true }) } catch { /* ignore */ }
+  try { const sessions = serviceOf(ctx, 'sessions'); if (typeof sessions?.refresh === 'function') await sessions.refresh() } catch { /* ignore */ }
+  try { result.bytes = statSync(located.file).size } catch { /* ignore */ }
+  appendCompatLog(`repair ${sessionId.slice(0, 18)}: gaps=${plan.gaps.length} inserted=${plan.inserted.length}`)
+  return result
+}
+
+/**
+ * 全盘扫描（只读巡检）：列出所有断号会话与不可读会话。
+ * @param {string} [home]
+ * @returns {{ok:boolean, scanned:number, healthy:number, bad:object[], warned:object[], unreadable:object[]}}
+ */
+export function repairScanAll(home = dshHomeDir()) {
+  const out = { ok: true, scanned: 0, healthy: 0, bad: [], warned: [], unreadable: [] }
+  for (const entry of listSessionFiles(home)) {
+    out.scanned += 1
+    try {
+      const scan = scanFile(entry.file)
+      if (scan.error) { out.unreadable.push({ id: entry.id, error: scan.error }); out.ok = false; continue }
+      if (scan.gaps.length > 0) {
+        const plan = repairEvents(scan.header, scan.events)
+        out.bad.push({
+          id: entry.id,
+          gaps: scan.gaps.map(describeGap),
+          gapDetails: scan.gaps,
+          warnings: scan.warnings,
+          repairable: plan.ok,
+          unsupported: plan.unsupported,
+        })
+        out.ok = false
+      } else {
+        out.healthy += 1
+        if (scan.warnings.length > 0) out.warned.push({ id: entry.id, warnings: scan.warnings })
+      }
+    } catch (error) {
+      out.unreadable.push({ id: entry.id, error: String(error?.message ?? error) })
+      out.ok = false
+    }
+  }
+  return out
+}
+
+/** 注册断号修复路由（POST repair-session {sessionId, write} + GET repair-scan）。 */
+export function installRepairRoute(ctx, config = {}) {
+  if (config?.repairSession === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') return false
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/repair-session',
+      handler: async (req, res) => {
+        const reply = (status, obj) => {
+          try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+        }
+        if (req.method !== 'POST') return reply(405, { ok: false, error: 'method-not-allowed' })
+        let body = ''
+        try {
+          for await (const chunk of req) { body += chunk; if (body.length > 65536) throw new Error('body too large') }
+          const parsed = JSON.parse(body || '{}')
+          if (typeof parsed?.sessionId !== 'string' || !parsed.sessionId) return reply(400, { ok: false, error: 'sessionId required' })
+          const result = await repairSessionFile(ctx, parsed.sessionId, { write: parsed.write === true })
+          appendCompatLog(`repair-session route ok: ${JSON.stringify(result).slice(0, 200)}`)
+          return reply(200, result)
+        } catch (error) {
+          const msg = String(error?.message ?? error)
+          const code = error?.code === 'SESSION_LIVE' ? 409 : error?.code === 'NOT_FOUND' ? 404 : 400
+          appendCompatLog(`repair-session route FAILED(${code}): ${msg.slice(0, 200)}`)
+          return reply(code, { ok: false, error: msg, plan: error?.plan, problems: error?.problems })
+        }
+      },
+    })
+    try {
+      web.register({
+        kind: 'exact',
+        path: '/dsh-adapter-compat/repair-scan',
+        handler: async (req, res) => {
+          const reply = (status, obj) => {
+            try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+          }
+          if (req.method !== 'GET') return reply(405, { ok: false, error: 'method-not-allowed' })
+          try {
+            const report = repairScanAll()
+            appendCompatLog(`repair-scan: scanned=${report.scanned} bad=${report.bad.length} unreadable=${report.unreadable.length}`)
+            return reply(200, { ok: true, report })
+          } catch (e) { return reply(500, { ok: false, error: String(e?.message ?? e) }) }
+        },
+      })
+    } catch { /* 扫描路由失败不影响修复路由 */ }
+    appendCompatLog('repair routes registered')
+    return true
+  } catch (e) {
+    appendCompatLog('repair route FAILED: ' + String(e?.message ?? e).slice(0, 200))
+    return false
+  }
+}
+
 export function apply(ctx, config = {}) {
   // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
   try {
@@ -1607,6 +1773,13 @@ export function apply(ctx, config = {}) {
   // -3.5) 会话瘦身：路由（不依赖 llm，排在早退之前）
   try {
     installSlimRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.55) 断号修复：路由（强退丢批兜底，不依赖 llm，排在早退之前）
+  try {
+    installRepairRoute(ctx, config)
   } catch {
     /* 路由注册失败绝不拖垮 apply */
   }
