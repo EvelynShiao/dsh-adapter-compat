@@ -80,7 +80,7 @@ export const name = 'adapter-compat'
 
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs'
 import { zstdCompressSync, constants as zstdConstants, zstdDecompressSync } from 'node:zlib'
-import { purgeSessionFile, readPendingLedger, writePendingLedger } from './purge.js'
+import { purgeSessionFile, readPendingLedger, writePendingLedger, assertRowsDense } from './purge.js'
 import { redactEventPayload, redactSessionFile } from './purge.js'
 import { readSession, writeSession, verify as verifySessionEvents } from './true-delete.js'
 import { guardSessionFile, probeProtectedHead } from './head-guard.js'
@@ -1752,6 +1752,23 @@ export async function healSessionFile(ctx, sessionId, options = {}) {
   }
   const scan = scanFile(located.file)
   if (scan.error) throw Object.assign(new Error('session unreadable: ' + scan.error), { code: 'READ_FAILED' })
+  /* 门禁（2026-10-14 用户实证）：readSession 会**静默跳行/跳帧**——
+     帧解压失败丢整帧（true-delete.js L261 `catch{warnings.push(...); continue}`）、
+     单行 JSON 坏丢该行（L293-295）。heal 是「读进来→写回去」，被跳的行写不回去，
+     缺行就此固化（实测：同一会话两次 heal 后缺行位置不同：00:11 缺 2314-2328、
+     02:14 缺 2509-2518）；而 true-delete 的 verify 没有 seq 连续性检查，写回照过。
+     修法与 purgeSessionFile 同款：有跳行警告直接拒写，seq 断口/settlement 也不放行。 */
+  if (Array.isArray(scan.warnings) && scan.warnings.length > 0) {
+    throw Object.assign(
+      new Error('文件有无法解析的帧/行（readSession 会跳过它们，写回会造成缺行），拒绝修复：' + scan.warnings[0]),
+      { code: 'READ_WARNINGS', warnings: scan.warnings })
+  }
+  const dense = assertRowsDense(scan.events)
+  if (!dense.ok) {
+    throw Object.assign(
+      new Error('输入文件 seq 断口或 settlement 不全，拒绝动它（防扩散）：' + dense.problems[0]),
+      { code: 'INPUT_DENSE_FAILED', problems: dense.problems })
+  }
   const plan = healBlankToolResults(scan.events)
   const base = {
     ok: true, write, id: sessionId,
@@ -1774,10 +1791,12 @@ export async function healSessionFile(ctx, sessionId, options = {}) {
 
   writeSession(located.file, scan.header, plan.events)
   const back = readSession(located.file)
+  const dense2 = assertRowsDense(back.events)
   const v2 = verifySessionEvents(back.header, back.events)
-  if (!v2.ok) {
+  if (!v2.ok || !dense2.ok) {
     try { copyFileSync(backupPath, located.file) } catch { /* 尽力回滚 */ }
-    throw Object.assign(new Error('post-write verify failed; rolled back'), { code: 'VERIFY_FAILED', problems: v2.problems })
+    throw Object.assign(new Error('post-write verify failed; rolled back'),
+      { code: 'VERIFY_FAILED', problems: [...(v2.problems ?? []), ...(dense2.ok ? [] : dense2.problems)] })
   }
   try { rmSync(home + '/storages/session_projcache/sessions/' + sessionId + '.json', { force: true }) } catch { /* ignore */ }
   try { const sessions = serviceOf(ctx, 'sessions'); if (typeof sessions?.refresh === 'function') await sessions.refresh() } catch { /* ignore */ }
