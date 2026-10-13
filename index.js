@@ -84,7 +84,7 @@ import { purgeSessionFile, readPendingLedger, writePendingLedger } from './purge
 import { redactEventPayload, redactSessionFile } from './purge.js'
 import { readSession, writeSession, verify as verifySessionEvents } from './true-delete.js'
 import { guardSessionFile, probeProtectedHead } from './head-guard.js'
-import { installWireTap } from './wire-tap.js'
+import { installWireTap, healBlankToolResults } from './wire-tap.js'
 import { slimSession } from './slim.js'
 import { repairEvents, scanFile, describeGap } from './repair.js'
 import { installOrderRoute } from './order.js'
@@ -1729,6 +1729,145 @@ export function repairScanAll(home = dshHomeDir()) {
   return out
 }
 
+/**
+ * 文本层根治（2026-10-13）：把某会话盘上「正文全空的 tool 结果」修成 [NaN]。
+ *
+ * 设计取舍（用户明确要求「不要频繁扫盘吃内存」）：
+ *   - **不做定时器、不做启动全盘扫** —— 出口守卫（wire-guard v3）在发送前逐请求兜底，
+ *     纯内存零磁盘 IO，实时流量已安全；
+ *   - 本函数只在**手动路由**（POST heal-tools）触发时跑一次，修完即止；
+ *     历史残缺是有限的（首次修复后新增极少），一次性清理足够。
+ *   - 只改 message.content，meta 留档/isError/id/source 原样保留。
+ *
+ * 门禁与 repairSessionFile 同规格：live 拒动 → 备份失败拒写 → verify 全绿才落盘
+ * → 回读复核不过回滚 → 清 projcache + refresh。
+ */
+export async function healSessionFile(ctx, sessionId, options = {}) {
+  const home = options.home ?? dshHomeDir()
+  const write = options.write === true
+  const located = listSessionFiles(home).find((x) => x.id === sessionId)
+  if (!located) throw Object.assign(new Error('session file not found'), { code: 'NOT_FOUND' })
+  if (isSessionLive(ctx, sessionId)) {
+    throw Object.assign(new Error('session is open in the host; switch to another conversation first'), { code: 'SESSION_LIVE' })
+  }
+  const scan = scanFile(located.file)
+  if (scan.error) throw Object.assign(new Error('session unreadable: ' + scan.error), { code: 'READ_FAILED' })
+  const plan = healBlankToolResults(scan.events)
+  const base = {
+    ok: true, write, id: sessionId,
+    alreadyHealthy: plan.alreadyHealthy,
+    wouldHeal: plan.healed.length,
+    healed: plan.healed.slice(0, 20),
+    warnings: scan.warnings,
+  }
+  if (plan.alreadyHealthy) return { ...base }
+  if (!write) return base
+
+  const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR + '-heal'
+  let backupPath = null
+  try {
+    mkdirSync(backupDir, { recursive: true })
+    backupPath = backupDir + '/' + sessionId + '.jsonl.zstd'
+    copyFileSync(located.file, backupPath)
+  } catch { backupPath = null }
+  if (!backupPath) throw Object.assign(new Error('backup failed; refusing to write'), { code: 'BACKUP_FAILED' })
+
+  writeSession(located.file, scan.header, plan.events)
+  const back = readSession(located.file)
+  const v2 = verifySessionEvents(back.header, back.events)
+  if (!v2.ok) {
+    try { copyFileSync(backupPath, located.file) } catch { /* 尽力回滚 */ }
+    throw Object.assign(new Error('post-write verify failed; rolled back'), { code: 'VERIFY_FAILED', problems: v2.problems })
+  }
+  try { rmSync(home + '/storages/session_projcache/sessions/' + sessionId + '.json', { force: true }) } catch { /* ignore */ }
+  try { const sessions = serviceOf(ctx, 'sessions'); if (typeof sessions?.refresh === 'function') await sessions.refresh() } catch { /* ignore */ }
+  /* 记指纹：skipUnchanged 开着时，下次直接 stat 跳过（heal 后文件 mtime 已变，指纹=新值） */
+  try {
+    const fp = fileFingerprint(located.file)
+    if (fp) { const st = readHealState(home); st[sessionId] = fp; writeHealState(st, home) }
+  } catch { /* ignore */ }
+  appendCompatLog(`heal ${sessionId.slice(0, 18)}: blank tool results=${plan.healed.length}`)
+  return { ...base, healedCount: plan.healed.length, backup: true }
+}
+
+/* ── 会话日志修复：用户选项与指纹（2026-10-13 用户定案）──────────────────
+   三个开关存 .dsh/adapter-compat-heal.json（默认全关，设置页可勾选保存）：
+     bootScan     开机自动扫（一次性；不加定时器 —— 用户明确不要频繁扫盘吃内存）
+     sendScan     发送前扫（出口守卫的结构修；关掉 = 内存零成本兜底也省，
+                  代价是 DeepSeek 可能重新拒收残缺载荷，UI 上有提示）
+     skipUnchanged 无变化对话不扫（按 文件大小+mtime 指纹跳过，只 stat 不读盘）
+   指纹存同目录 .heal-state.json，heal 后记录 → 下次直接跳过。
+   读缓存 2s：sendScan 每次发消息都会读，不能每次 IO。 */
+const HEAL_OPTIONS_FILE = 'adapter-compat-heal.json'
+const HEAL_STATE_FILE = 'adapter-compat-heal-state.json'
+const HEAL_DEFAULTS = { bootScan: false, sendScan: false, skipUnchanged: false }
+let healOptionsCache = { at: 0, value: null }
+
+export function readHealOptions(home = dshHomeDir()) {
+  const now = Date.now()
+  if (healOptionsCache.value && now - healOptionsCache.at < 2000) return healOptionsCache.value
+  let value = { ...HEAL_DEFAULTS }
+  try {
+    const raw = JSON.parse(readFileSync(home + '/' + HEAL_OPTIONS_FILE, 'utf8'))
+    if (raw && typeof raw === 'object') for (const k of Object.keys(HEAL_DEFAULTS)) if (typeof raw[k] === 'boolean') value[k] = raw[k]
+  } catch { /* 无文件 = 默认全关 */ }
+  healOptionsCache = { at: now, value }
+  return value
+}
+
+export function writeHealOptions(next, home = dshHomeDir()) {
+  const value = { ...HEAL_DEFAULTS }
+  if (next && typeof next === 'object') for (const k of Object.keys(HEAL_DEFAULTS)) if (typeof next[k] === 'boolean') value[k] = next[k]
+  writeFileSync(home + '/' + HEAL_OPTIONS_FILE, JSON.stringify(value, null, 1), 'utf8')
+  healOptionsCache = { at: Date.now(), value }
+  return value
+}
+
+/** 读指纹表（sessionId -> {size, mtimeMs}）。文件损坏/不存在都当空表。 */
+function readHealState(home) {
+  try {
+    const raw = JSON.parse(readFileSync(home + '/' + HEAL_STATE_FILE, 'utf8'))
+    return raw && typeof raw === 'object' ? raw : {}
+  } catch { return {} }
+}
+
+function writeHealState(state, home) {
+  try { writeFileSync(home + '/' + HEAL_STATE_FILE, JSON.stringify(state), 'utf8') } catch { /* 指纹写失败不影响修复 */ }
+}
+
+/** 文件指纹（只 stat，零读盘）：skipUnchanged 的判据。 */
+function fileFingerprint(file) {
+  try { const st = statSync(file); return { size: st.size, mtimeMs: Math.floor(st.mtimeMs) } } catch { return null }
+}
+
+/** 只读巡检：统计每个会话的空 tool 结果数（不修）。供 heal-scan 面板显示。 */
+export function healScanAll(home = dshHomeDir(), options = {}) {
+  const skipUnchanged = options.skipUnchanged === true
+  const state = skipUnchanged ? readHealState(home) : {}
+  const out = { ok: true, scanned: 0, withBlanks: 0, totalBlanks: 0, skippedUnchanged: 0, sessions: [], unreadable: [] }
+  for (const entry of listSessionFiles(home)) {
+    out.scanned += 1
+    try {
+      if (skipUnchanged) {
+        const fp = fileFingerprint(entry.file)
+        const prev = state[entry.id]
+        if (fp && prev && prev.size === fp.size && prev.mtimeMs === fp.mtimeMs) { out.skippedUnchanged += 1; continue }
+      }
+      const scan = scanFile(entry.file)
+      if (scan.error) { out.unreadable.push({ id: entry.id, error: scan.error }); continue }
+      const plan = healBlankToolResults(scan.events)
+      if (plan.healed.length > 0) {
+        out.withBlanks += 1
+        out.totalBlanks += plan.healed.length
+        out.sessions.push({ id: entry.id, blanks: plan.healed.length, sample: plan.healed.slice(0, 3) })
+      }
+    } catch (error) {
+      out.unreadable.push({ id: entry.id, error: String(error?.message ?? error) })
+    }
+  }
+  return out
+}
+
 /** 注册断号修复路由（POST repair-session {sessionId, write} + GET repair-scan）。 */
 export function installRepairRoute(ctx, config = {}) {
   if (config?.repairSession === false) return false
@@ -1776,6 +1915,101 @@ export function installRepairRoute(ctx, config = {}) {
         },
       })
     } catch { /* 扫描路由失败不影响修复路由 */ }
+    /* 文本层根治路由（2026-10-13，手动触发，无定时器/无启动扫盘 —— 出口守卫已兜实时流量）：
+       POST heal-tools {sessionId, write}  修某会话的空 tool 结果 → [NaN]
+       POST heal-tools {write:true}        修全部（逐个过 live/备份/verify 门禁）
+       GET  heal-scan                      只读统计，不写 */
+    try {
+      web.register({
+        kind: 'exact',
+        path: '/dsh-adapter-compat/heal-tools',
+        handler: async (req, res) => {
+          const reply = (status, obj) => {
+            try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+          }
+          if (req.method !== 'POST') return reply(405, { ok: false, error: 'method-not-allowed' })
+          let raw = ''
+          try {
+            for await (const chunk of req) { raw += chunk; if (raw.length > 65536) throw new Error('body too large') }
+            const parsed = JSON.parse(raw || '{}')
+            const write = parsed.write === true
+            if (parsed.sessionId) {
+              const result = await healSessionFile(ctx, String(parsed.sessionId), { write, home: parsed.home })
+              appendCompatLog(`heal-tools(${String(parsed.sessionId).slice(0, 18)}): healed=${result.healedCount ?? result.wouldHeal} write=${write}`)
+              return reply(200, { ok: true, result })
+            }
+            const all = listSessionFiles(parsed.home ?? dshHomeDir())
+            const done = [], skipped = [], failed = []
+            const skipUnchanged = parsed.skipUnchanged === true || readHealOptions(parsed.home).skipUnchanged === true
+            const state = skipUnchanged ? readHealState(parsed.home ?? dshHomeDir()) : {}
+            let unchanged = 0
+            for (const entry of all) {
+              try {
+                /* skipUnchanged：只 stat 比对指纹，未变化的连文件都不读 */
+                if (skipUnchanged) {
+                  const fp = fileFingerprint(entry.file)
+                  const prev = state[entry.id]
+                  if (fp && prev && prev.size === fp.size && prev.mtimeMs === fp.mtimeMs) { unchanged += 1; continue }
+                }
+                const r = await healSessionFile(ctx, entry.id, { write, home: parsed.home })
+                if (r.alreadyHealthy) continue
+                done.push({ id: entry.id, healed: r.healedCount ?? r.wouldHeal })
+              } catch (e) {
+                const code = e?.code
+                if (code === 'SESSION_LIVE') skipped.push({ id: entry.id, why: 'live' })
+                else if (code === 'NOT_FOUND') { /* ignore */ }
+                else failed.push({ id: entry.id, error: String(e?.message ?? e).slice(0, 120) })
+              }
+            }
+            appendCompatLog(`heal-tools(all): healed=${done.length} live-skipped=${skipped.length} unchanged=${unchanged} failed=${failed.length} write=${write}`)
+            return reply(200, { ok: true, result: { done, skipped, failed, unchanged } })
+          } catch (e) {
+            const msg = String(e?.message ?? e)
+            const code = e?.code === 'SESSION_LIVE' ? 409 : e?.code === 'NOT_FOUND' ? 404 : 400
+            return reply(code, { ok: false, error: msg })
+          }
+        },
+      })
+      web.register({
+        kind: 'exact',
+        path: '/dsh-adapter-compat/heal-scan',
+        handler: async (req, res) => {
+          const reply = (status, obj) => {
+            try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+          }
+          if (req.method !== 'GET') return reply(405, { ok: false, error: 'method-not-allowed' })
+          try {
+            const url = new URL(req.url, 'http://127.0.0.1')
+            const skipUnchanged = url.searchParams.get('skipUnchanged') === '1' || readHealOptions().skipUnchanged === true
+            const report = healScanAll(undefined, { skipUnchanged })
+            appendCompatLog(`heal-scan: scanned=${report.scanned} withBlanks=${report.withBlanks} totalBlanks=${report.totalBlanks} unchanged=${report.skippedUnchanged}`)
+            return reply(200, { ok: true, report })
+          } catch (e) { return reply(500, { ok: false, error: String(e?.message ?? e) }) }
+        },
+      })
+      /* 选项读写（GET 读当前三个开关；POST 存，供设置页勾选保存）。 */
+      try {
+        web.register({
+          kind: 'exact',
+          path: '/dsh-adapter-compat/heal-options',
+          handler: async (req, res) => {
+            const reply = (status, obj) => {
+              try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+            }
+            if (req.method === 'GET') return reply(200, { ok: true, options: readHealOptions() })
+            if (req.method !== 'POST') return reply(405, { ok: false, error: 'method-not-allowed' })
+            let raw = ''
+            try {
+              for await (const chunk of req) { raw += chunk; if (raw.length > 8192) throw new Error('body too large') }
+              const parsed = JSON.parse(raw || '{}')
+              const saved = writeHealOptions(parsed)
+              appendCompatLog(`heal-options saved: ${JSON.stringify(saved)}`)
+              return reply(200, { ok: true, options: saved })
+            } catch (e) { return reply(400, { ok: false, error: String(e?.message ?? e) }) }
+          },
+        })
+      } catch { /* ignore */ }
+    } catch { /* heal 路由失败不影响修复路由 */ }
     appendCompatLog('repair routes registered')
     return true
   } catch (e) {
@@ -1806,6 +2040,41 @@ export function apply(ctx, config = {}) {
     /* 路由注册失败绝不拖垮 apply */
   }
 
+  /* -3.56) 开机一次性扫（2026-10-13 用户定案）：
+     只有 bootScan 开着才跑；**一次性，不加定时器**（用户明确不要频繁扫盘吃内存）。
+     延时 15s 启动（等宿主把会话/注册表就绪，避免和启动潮抢 IO），
+     遵守 skipUnchanged（只 stat 跳过未变的），live 会话自动跳过。 */
+  try {
+    const boot = readHealOptions()
+    if (boot.bootScan) {
+      const t = setTimeout(async () => {
+        try {
+          appendCompatLog('boot-heal: start（一次性）')
+          const state = boot.skipUnchanged ? readHealState(dshHomeDir()) : {}
+          let healed = 0, unchanged = 0, live = 0, failed = 0
+          for (const entry of listSessionFiles(dshHomeDir())) {
+            try {
+              if (boot.skipUnchanged) {
+                const fp = fileFingerprint(entry.file)
+                const prev = state[entry.id]
+                if (fp && prev && prev.size === fp.size && prev.mtimeMs === fp.mtimeMs) { unchanged += 1; continue }
+              }
+              const r = await healSessionFile(ctx, entry.id, { write: true })
+              if (!r.alreadyHealthy) healed += 1
+            } catch (e) {
+              if (e?.code === 'SESSION_LIVE') live += 1
+              else failed += 1
+            }
+          }
+          appendCompatLog(`boot-heal: done healed=${healed} unchanged=${unchanged} live=${live} failed=${failed}`)
+        } catch (e) { appendCompatLog('boot-heal failed: ' + String(e?.message ?? e).slice(0, 160)) }
+      }, 15000)
+      if (typeof t.unref === 'function') t.unref()
+    } else {
+      appendCompatLog('boot-heal: 已关闭（设置页可开）')
+    }
+  } catch { /* 开机扫失败绝不影响启动 */ }
+
   // -3.6) 侧栏排序：路由（工作区/会话顺序，只读写宿主 registry，不碰 workspace.json）
   try {
     installOrderRoute(ctx, config)
@@ -1829,7 +2098,7 @@ export function apply(ctx, config = {}) {
 
   // -1.4) 线级取证探针：把 provider 真正收到的 messages 结构落盘（llm-wire.jsonl）
   try {
-    installWireTap(ctx, config)
+    installWireTap(ctx, config, { getOptions: () => readHealOptions() })
   } catch {
     /* 探针失败绝不拖垮 apply */
   }
