@@ -354,8 +354,11 @@ export function installWireGuard(ctx, deps = {}) {
     if (original[WIRE_GUARD_MARK]) continue
     const wrapped = function (options, prepared) {
       let next = options
+      /* 配置字段（provider/model/reasoningEffort/temperature/maxTokens/stop）有没有被我们改过 */
+      let configChanged = false
       try {
-        /* ① 结构修：空 tool 结果补占位符 + tool-call 之后的 text 重排到前面 */
+        /* ① 结构修：空 tool 结果补占位符 + tool-call 之后的 text 重排到前面
+           只动 messages —— callConfigEquals 不比较 messages，所以不需要同步 prepared。 */
         const guarded = guardRequestMessages(next)
         if (guarded) {
           log({ t: new Date().toISOString(), event: 'wire-guard', via: 'streamWithRegistration', repaired: guarded.repaired, reordered: guarded.reordered, provider: next?.provider, model: next?.model })
@@ -373,8 +376,25 @@ export function installWireGuard(ctx, deps = {}) {
             ...budget.dropped === undefined ? {} : { dropped: budget.dropped, estimatedAfter: budget.estimatedAfter },
           })
           next = budget.request
+          if (next?.maxTokens !== options?.maxTokens) configChanged = true
         }
       } catch { /* 预算失败不阻断请求 */ }
+      /* ③ 与宿主新门禁对齐（2026-10-13）
+         新版 dsh-llm 的 `prepareCall` 会冻结一份 config，并在 adapterStream 里做
+         `callConfigEquals(options, prepared.config)`；不等就抛
+         `LlmError("prepared LLM call config changed before adapter dispatch", "INVALID_PREPARED_CALL")`
+         —— 整轮运行以 `finish.kind = "error"` 结束（不是重试，是直接失败）。
+         实数实录：session-7f9c698a「工具引用与最终问题解决」上下文 887631/1048576，
+         预算闸把 maxTokens 256000 压到 139973 → 上一轮起就变成 INVALID_PREPARED_CALL。
+         修法：改了 maxTokens 就把 prepared.config 里那个值一起改成一样的（只重建我们手上
+         这个未冻结的 prepared 信封，不碰宿主的冻结对象）。registration/modelInfo/dispatch
+         原样带着走，adapter 绑定关系不变。 */
+      if (configChanged && prepared !== undefined && prepared !== null) {
+        try {
+          prepared = { ...prepared, config: { ...prepared.config, maxTokens: next.maxTokens } }
+          log({ t: new Date().toISOString(), event: 'wire-config-synced', sessionId: next?.sessionId, provider: next?.provider, model: next?.model, maxTokens: next.maxTokens })
+        } catch { /* 重建失败就别装了：宁可原样交出去，也不要弄坏信封 */ }
+      }
       return original.call(this, next, prepared)
     }
     wrapped[WIRE_GUARD_MARK] = true
