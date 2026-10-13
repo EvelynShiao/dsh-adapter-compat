@@ -102,7 +102,7 @@ export function repairWireRequest(options) {
     const content = Array.isArray(m.content) ? m.content : []
     return !content.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.length > 0)
   }
-  const fixed = (m) => ({ ...m, content: [{ type: 'text', text: '[内容已清除]' }] })
+  const fixed = (m) => ({ ...m, content: [{ type: 'text', text: '[NaN]' }] })
   let repaired = 0
   for (let i = 0; i < messages.length; i += 1) {
     if (!isBlank(messages[i])) continue
@@ -125,8 +125,12 @@ export function repairWireRequest(options) {
   return repaired
 }
 
-/** 空正文占位符（与 purge.js 出口修同款：清空语义不变，但结构合法）。 */
-export const WIRE_PLACEHOLDER = '[内容已清除]'
+/**
+ * 空正文占位符 —— 全局统一为 [NaN]（2026-10-13 用户定案）。
+ * 之前是中文「[内容已清除]」：CJK 计 token 贵，且与 slim.js / repair.js 的 [NaN] 不一致。
+ * 清空语义不变（正文确实没了），结构合法、provider 不拒收。
+ */
+export const WIRE_PLACEHOLDER = '[NaN]'
 
 /** 打标用（instance + prototype 双层，防重复包装）。 */
 const WIRE_GUARD_MARK = Symbol.for('dsh-adapter-compat.wire-guard')
@@ -142,6 +146,69 @@ export function isBlankToolMessage(message) {
 export function countBlankToolMessages(options) {
   const messages = Array.isArray(options?.messages) ? options.messages : []
   return messages.filter(isBlankToolMessage).length
+}
+
+/**
+ * 文本层根治（2026-10-13）：把盘上事件里的「正文全空 tool 结果」直接修成 [NaN]。
+ *
+ * 出口守卫（guardRequestMessages）只拦「发出去的那一份」，盘上历史残缺还在 ——
+ * 实测 session-34da7d62 43 条、session-3a8e374a 7 条空 tool 结果（都是断流/擦除留下的
+ * [{text:""}] 形态）。这里做盘上修复：只改 message.content，其余字段（meta 留档、
+ * isError、id、source）原样保留 —— 与 redactEventPayload 的 tool/result 占位同语义。
+ *
+ * 纯函数，不碰文件；调用方负责备份/校验/原子写。返回被修的事件（结构克隆，不改入参）。
+ *
+ * @param {object[]} events
+ * @returns {{events:object[], healed:object[], alreadyHealthy:boolean}}
+ */
+export function healBlankToolResults(events) {
+  const healed = []
+  if (!Array.isArray(events)) return { events: events ?? [], healed, alreadyHealthy: true }
+  let changed = false
+  const fixed = events.map((event) => {
+    if (event?.type !== 'tool/result') return event
+    const msg = event.data?.message
+    if (!msg || typeof msg !== 'object') return event
+    const content = Array.isArray(msg.content) ? msg.content : []
+    // 只修「有块但全空」与「空数组」两种；正文尚存的一律不动
+    const blank = content.length === 0 || !content.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.length > 0)
+    if (!blank) return event
+    changed = true
+    healed.push({ seq: event.seq, toolCallId: msg.toolCallId, from: content.length === 0 ? '[]' : '[text:""]' })
+    return { ...event, data: { ...event.data, message: { ...msg, content: [{ type: 'text', text: WIRE_PLACEHOLDER }] } } }
+  })
+  return { events: fixed, healed, alreadyHealthy: !changed }
+}
+
+/**
+ * image/file 块是否残缺（DeepSeek 断流、附件加载失败时 attachment 或 attachmentId 缺失）。
+ * 实测正常形态：{type, attachment:{attachmentId:'att-…', bytes, name, …}}。
+ * 残缺块发出去会被适配器解析失败 → 拒收整轮，出口端直接丢块保会话。
+ */
+export function isBrokenAttachmentBlock(block) {
+  if (!block || typeof block !== 'object') return false
+  if (block.type !== 'image' && block.type !== 'file') return false
+  const a = block.attachment
+  if (!a || typeof a !== 'object') return true
+  const id = a.attachmentId
+  return typeof id !== 'string' || id.length === 0
+}
+
+/**
+ * 修一条 assistant 的 tool-call 块（断流会留下缺参/缺名的半截调用）：
+ *   arguments 缺失/空/非法 JSON → '{}'（结构合法；调用本已执行过，参数只是回显）
+ *   name 缺失 → [NaN]（保 id 配对，名字无法凭空造）
+ *   id 缺失 → 返回 null = 无法修复，调用方丢弃该块（无 id 无法与 tool_result 配对）
+ * @returns {object|null} 修复后的新块；null = 建议丢弃
+ */
+export function repairToolCallBlock(block) {
+  if (typeof block.id !== 'string' || block.id.length === 0) return null
+  const nb = { ...block }
+  let changed = false
+  if (typeof nb.arguments !== 'string' || nb.arguments.length === 0) { nb.arguments = '{}'; changed = true }
+  else { try { JSON.parse(nb.arguments) } catch { nb.arguments = '{}'; changed = true } }
+  if (typeof nb.name !== 'string' || nb.name.length === 0) { nb.name = WIRE_PLACEHOLDER; changed = true }
+  return changed ? nb : null
 }
 
 /**
@@ -167,46 +234,98 @@ export function reorderAssistantContent(content) {
 }
 
 /**
- * 出口修 v2 —— 真正生效的那条路。
+ * 出口修 v3（2026-10-13）—— 防御性兜底，保证发给 DeepSeek 的请求不因残缺被拒收。
  *
- * v1（repairWireRequest）挂在 `llm/stream` 上原地改，但宿主在发请求前已经把
- * request / messages 数组 / 每条消息全部冻死（dsh-agent-loop/lib/index.js:1246-1257：
- * `deepFreeze(message)` + `Object.freeze(boundaryMessages)` + `Object.freeze({ ...messages })`），
- * 于是 `messages[i] = …` 与 `options.messages = …` 两条路都抛 TypeError、被 try/catch 吞掉
- * → 2026-10-11 实测：载荷里明明有 7 条空 tool 结果，wire-guard 却一条没修、零日志。
+ * 残缺不是本插件造成的（DeepSeek 断流截断、附件加载失败等），本插件只在出口拦截。
+ * v2 只修两件事；v3 扩到六类（都实证过会被 provider 拒收整轮）：
+ *   ① 空正文 tool 结果       → 补 [NaN]（provider 当成「没有结果」→ 拒收）
+ *   ② assistant tool-call 缺参数/缺名 → arguments='{}'、name=[NaN]
+ *   ③ assistant tool-call 无 id      → 丢块（无 id 无法配对，留着必拒）
+ *   ④ tool 结果找不到对应 tool_use（孤儿）→ 丢条（留着拒整轮，丢只丢一条）
+ *   ⑤ tool_use 没有对应结果（断流断在工具执行中）→ 合成 [NaN] 占位结果
+ *   ⑥ image/file 块 attachment 残缺（加载失败）→ 丢块保会话
+ * 外加重排：assistant 里 tool-call 之后不许再有 text。
  *
- * v2 的做法：**完全不碰原对象**，重建一个未冻结的 request（浅拷贝 + 新 messages 数组），
- * 在 `streamWithRegistration` 这一层换进去。宿主的 adapterStream 对未冻结 options 是友好
- * 处理的（只在 `Object.isFrozen(options)` 时才 deepFreeze 投影），适配器最终序列化的就是我们
- * 这版数组 —— 不写盘、不改历史，纯出口拦截。
+ * 两遍处理：第一遍修 assistant 内容（此时才知道最终哪些 id 被宣告），
+ * 第二遍按修后 id 集合判孤儿/补缺失结果 —— 顺序不能反。
  *
- * 修两件事（都是 provider 拒收整轮的成因）：
- *   ① assistant 里 tool-call 之后还带 text ⇒ 重排成 [reasoning…, text…, tool-call…]
- *   ② 正文全空的 tool 结果 ⇒ 补占位符（否则远端当成「没有结果」）
+ * 全部只改「这一份要发出去的 request」，历史零改动。
  *
- * @returns {{request:object,repaired:number,reordered:number}|null} null = 无需修补
+ * @returns {{request:object,...counters}|null} null = 无需修补
  */
 export function guardRequestMessages(options) {
   const messages = options?.messages
   if (!Array.isArray(messages)) return null
-  let repaired = 0
-  let reordered = 0
-  const next = messages.map((message) => {
-    if (isBlankToolMessage(message)) {
-      repaired += 1
-      return Object.freeze({ ...message, content: Object.freeze([{ type: 'text', text: WIRE_PLACEHOLDER }]) })
-    }
-    if (message?.role === 'assistant') {
-      const fixed = reorderAssistantContent(message.content)
-      if (fixed) {
-        reordered += 1
-        return Object.freeze({ ...message, content: Object.freeze(fixed) })
+  const counters = { repaired: 0, reordered: 0, fixedCalls: 0, droppedCalls: 0, droppedOrphans: 0, droppedBlobs: 0, synthesized: 0 }
+
+  // ── 第一遍：重建 assistant/user 的内容 ──
+  const rebuilt = messages.map((message) => {
+    if (!message || typeof message !== 'object') return message
+    if (message.role === 'assistant' && Array.isArray(message.content)) {
+      const kept = []
+      for (const b of message.content) {
+        if (b?.type === 'tool-call') {
+          const fixed = repairToolCallBlock(b)
+          if (fixed === null) { counters.droppedCalls += 1; continue }
+          if (fixed !== b) counters.fixedCalls += 1
+          kept.push(fixed)
+          continue
+        }
+        if (isBrokenAttachmentBlock(b)) { counters.droppedBlobs += 1; continue }
+        kept.push(b)
       }
+      const reordered = reorderAssistantContent(kept)
+      const finalBlocks = reordered || kept
+      if (finalBlocks !== message.content) {
+        if (reordered) counters.reordered += 1
+        return { ...message, content: finalBlocks }
+      }
+      return message
+    }
+    if (message.role === 'user' && Array.isArray(message.content)) {
+      const kept = message.content.filter((b) => { if (isBrokenAttachmentBlock(b)) { counters.droppedBlobs += 1; return false } return true })
+      if (kept.length !== message.content.length) return { ...message, content: kept }
     }
     return message
   })
-  if (repaired + reordered === 0) return null
-  return { request: { ...options, messages: next }, repaired, reordered }
+
+  // ── 第二遍：tool 结果 + 缺失结果合成 ──
+  const advertised = new Set()
+  for (const m of rebuilt) {
+    if (m?.role !== 'assistant' || !Array.isArray(m.content)) continue
+    for (const b of m.content) if (b?.type === 'tool-call' && typeof b.id === 'string' && b.id) advertised.add(b.id)
+  }
+  const withResult = new Set()
+  for (const m of rebuilt) if (m?.role === 'tool' && typeof m.toolCallId === 'string') withResult.add(m.toolCallId)
+
+  const next = []
+  for (const message of rebuilt) {
+    if (message?.role === 'tool') {
+      if (isBlankToolMessage(message)) {
+        counters.repaired += 1
+        next.push({ ...message, content: [{ type: 'text', text: WIRE_PLACEHOLDER }] })
+        continue
+      }
+      const tid = message.toolCallId
+      if (typeof tid !== 'string' || tid.length === 0 || !advertised.has(tid)) { counters.droppedOrphans += 1; continue }
+      next.push(message)
+      continue
+    }
+    next.push(message)
+    // 断流断在工具执行中：tool_use 有、结果没回来 → 紧跟其后合成占位结果
+    if (message?.role === 'assistant' && Array.isArray(message.content)) {
+      for (const b of message.content) {
+        if (b?.type !== 'tool-call') continue
+        if (withResult.has(b.id)) continue
+        counters.synthesized += 1
+        next.push({ role: 'tool', toolCallId: b.id, content: [{ type: 'text', text: WIRE_PLACEHOLDER }] })
+        withResult.add(b.id)
+      }
+    }
+  }
+
+  if (Object.values(counters).every((n) => n === 0)) return null
+  return { request: { ...options, messages: next }, ...counters }
 }
 
 /**
@@ -345,6 +464,10 @@ export function applyContextBudget(options, prepared, config = {}) {
 export function installWireGuard(ctx, deps = {}) {
   const log = typeof deps?.log === 'function' ? deps.log : () => {}
   const budgetConfig = deps?.config ?? {}
+  /* 发送前扫开关（2026-10-13 用户定案）：设置页「会话日志修复」的 sendScan 复选框。
+     关掉后步骤①的结构修（空 tool 结果占位 / tool-call 重排 / 孤儿丢弃 / 残图丢块）
+     整体跳过 —— 内存零成本的操作也省掉，但 DeepSeek 可能重新拒收残缺载荷。 */
+  const getOptions = typeof deps?.getOptions === 'function' ? deps.getOptions : null
   const llm = ctx?.llm ?? ctx
   if (!llm || typeof llm.streamWithRegistration !== 'function') return 0
   let patched = 0
@@ -358,11 +481,15 @@ export function installWireGuard(ctx, deps = {}) {
       let configChanged = false
       try {
         /* ① 结构修：空 tool 结果补占位符 + tool-call 之后的 text 重排到前面
-           只动 messages —— callConfigEquals 不比较 messages，所以不需要同步 prepared。 */
-        const guarded = guardRequestMessages(next)
-        if (guarded) {
-          log({ t: new Date().toISOString(), event: 'wire-guard', via: 'streamWithRegistration', repaired: guarded.repaired, reordered: guarded.reordered, provider: next?.provider, model: next?.model })
-          next = guarded.request
+           只动 messages —— callConfigEquals 不比较 messages，所以不需要同步 prepared。
+           受「发送前扫」开关控制（默认关；关掉 = 内存零成本的兜底也省，代价是 DeepSeek
+           可能重新拒收残缺载荷）。 */
+        if (getOptions?.()?.sendScan !== false) {
+          const guarded = guardRequestMessages(next)
+          if (guarded) {
+            log({ t: new Date().toISOString(), event: 'wire-guard', via: 'streamWithRegistration', repaired: guarded.repaired, reordered: guarded.reordered, provider: next?.provider, model: next?.model })
+            next = guarded.request
+          }
         }
       } catch { /* 修补失败不阻断请求 */ }
       try {
@@ -417,10 +544,10 @@ export function installWireTap(ctx, config = {}, deps = {}) {
   /* 出口修 v2 先装（真正生效的那条路）。llm 服务此刻可能还没就绪：记一行，再定时重试。 */
   let guardPatched = 0
   if (guard) {
-    try { guardPatched = installWireGuard(ctx, { log: append, config }) } catch { guardPatched = 0 }
+    try { guardPatched = installWireGuard(ctx, { log: append, config, getOptions: deps.getOptions }) } catch { guardPatched = 0 }
     append({ t: new Date().toISOString(), event: 'wire-guard-installed', targets: guardPatched })
     for (const ms of [1000, 3000, 8000]) {
-      const t = setTimeout(() => { try { if (guardPatched === 0) guardPatched = installWireGuard(ctx, { log: append, config }) } catch { /* ignore */ } }, ms)
+      const t = setTimeout(() => { try { if (guardPatched === 0) guardPatched = installWireGuard(ctx, { log: append, config, getOptions: deps.getOptions }) } catch { /* ignore */ } }, ms)
       if (typeof t.unref === 'function') t.unref()
     }
   }
@@ -430,7 +557,7 @@ export function installWireTap(ctx, config = {}, deps = {}) {
         try {
           if (guard) {
             /* 兜底：llm 服务若一直没拿到，用瀑布的 this（LlmRuntime 实例）现场补装一次 */
-            if (guardPatched === 0) { try { guardPatched = installWireGuard(this, { log: append, config }) } catch { /* ignore */ } }
+            if (guardPatched === 0) { try { guardPatched = installWireGuard(this, { log: append, config, getOptions: deps.getOptions }) } catch { /* ignore */ } }
             const n = repairWireRequest(options)
             if (n > 0) append({ t: new Date().toISOString(), event: 'wire-guard', via: 'in-place', repaired: n, provider: options?.provider, model: options?.model })
             const left = countBlankToolMessages(options)

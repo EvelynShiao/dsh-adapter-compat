@@ -56,6 +56,24 @@ window.__ModuleLoader__.load({
       errNotFound: '会话或目标工作区不存在（可能已被删除）',
       errOther: '移动失败',
       orderNav: '侧栏排序',
+      /* 会话日志修复分区文案（2026-10-13） */
+      healNav: '会话日志修复',
+      healDesc: '清理会话日志里的残缺工具结果（断流/加载失败留下），修复前自动备份',
+      healBoot: '开机自动扫',
+      healBootDesc: '启动 15 秒后一次性扫描并修复（不加定时器，不常驻）',
+      healSend: '发送前扫',
+      healSendDesc: '发消息前把载荷里的空工具结果/残缺块兜底修好（纯内存，零磁盘 IO）',
+      healSendWarn: '关闭后 DeepSeek 可能重新拒收残缺载荷',
+      healSkip: '无变化对话不扫',
+      healSkipDesc: '按文件指纹跳过上次检查后没变过的对话（只 stat 不读盘）',
+      healSave: '保存选项',
+      healSaved: '已保存',
+      healSaveFail: '保存失败',
+      healCheck: '全面体检',
+      healChecking: '体检中…',
+      healRepair: '修复发现的问题',
+      healRepairing: '修复中…',
+      healClean: '全部会话日志结构完整，无需修复',
       orderIntro: '拖动 ⠿ 手柄（或长按整行）换位置，↑↓ 是稳的备选。顺序直接写进宿主 workspace.json（工作区 global.workspaceIds / 会话 sessionIds），不是只改页面。正在运行的会话不能重排。',
       orderTabSession: '会话管理',
       orderTabWorkspace: '工作区管理',
@@ -96,6 +114,12 @@ window.__ModuleLoader__.load({
       .ac-session { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-base); }
       .ac-session-name { font-size: 13px; color: var(--dsw-alias-label-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .ac-session-hint { font-size: 11px; color: var(--dsw-alias-label-secondary); margin-top: 2px; }
+      /* 会话日志修复分区（2026-10-13） */
+      .ac-check { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: var(--dsw-alias-label-secondary); }
+      .ac-check input { margin-top: 3px; accent-color: var(--dsw-alias-state-business-primary); }
+      .ac-report { font-size: 12px; line-height: 1.7; color: var(--dsw-alias-label-secondary); border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 8px 10px; }
+      .ac-report b { color: var(--dsw-alias-label-primary); }
+      .ac-hint-warn { font-size: 11px; color: var(--dsw-alias-state-error-primary, #d5303f); margin-top: 2px; }
       .ac-notice { font-size: 12px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-secondary); }
       .ac-notice-ok { border-color: var(--dsw-alias-state-business-primary); color: var(--dsw-alias-state-business-primary); }
       .ac-notice-err { border-color: var(--dsw-alias-state-error-primary, #d5303f); color: var(--dsw-alias-state-error-primary, #d5303f); }
@@ -245,6 +269,143 @@ window.__ModuleLoader__.load({
         }) : null)
     }
 
+    /* ── 会话日志修复分区（2026-10-13）──────────────────────────────
+       三个开关默认全关，手动勾选保存（存 .dsh/adapter-compat-heal.json，服务端读）。
+       开机扫 = 一次性（服务端 15s 延时，不加定时器）；
+       发送前扫 = 出口守卫的结构修（纯内存）；无变化不扫 = 指纹 stat 跳过。
+       全面体检 = GET heal-scan（尊重「无变化不扫」），只读不修；
+       体检发现空工具结果后才出现「修复」按钮 → POST heal-tools {write:true}。
+       写法约定：**每个子块先单独算好再展开**（一层一层摆平）—— 上一版在 return 里
+       塞了三层嵌套 h(，括号数到自己都不信，node --check 卡在最后一行。 */
+    const HEAL_OPTS = '/dsh-adapter-compat/heal-options'
+    const HEAL_SCAN = '/dsh-adapter-compat/heal-scan'
+    const HEAL_FIX = '/dsh-adapter-compat/heal-tools'
+
+    async function fetchJson(url, options) {
+      const res = await fetch(url, options)
+      const data = await res.json().catch(() => ({}))
+      return { ok: res.ok, data }
+    }
+
+    function HealSection() {
+      const [opts, setOpts] = useState({ bootScan: false, sendScan: false, skipUnchanged: false })
+      const [loaded, setLoaded] = useState(false)
+      const [saving, setSaving] = useState(false)
+      const [saved, setSaved] = useState('')
+      const [report, setReport] = useState(null)
+      const [checking, setChecking] = useState(false)
+      const [fixing, setFixing] = useState(false)
+      const [fixResult, setFixResult] = useState(null)
+
+      useEffect(() => {
+        let dead = false
+        fetchJson(HEAL_OPTS).then((r) => {
+          if (dead) return
+          if (r.ok && r.data && r.data.options) setOpts(r.data.options)
+          setLoaded(true)
+        }).catch(() => { if (!dead) setLoaded(true) })
+        return () => { dead = true }
+      }, [])
+
+      const toggle = (key) => setOpts((o) => ({ ...o, [key]: !o[key] }))
+
+      const save = async () => {
+        setSaving(true); setSaved('')
+        try {
+          const r = await fetchJson(HEAL_OPTS, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(opts) })
+          if (r.ok && r.data && r.data.options) { setOpts(r.data.options); setSaved('ok') } else setSaved('fail')
+        } catch (e) { setSaved('fail') }
+        setSaving(false)
+      }
+
+      const check = async () => {
+        setChecking(true); setReport(null); setFixResult(null)
+        try {
+          const url = HEAL_SCAN + (opts.skipUnchanged ? '?skipUnchanged=1' : '')
+          const r = await fetchJson(url)
+          if (r.ok) setReport(r.data.report)
+        } catch (e) { /* 网络失败保持空 */ }
+        setChecking(false)
+      }
+
+      const fix = async () => {
+        setFixing(true); setFixResult(null)
+        try {
+          const r = await fetchJson(HEAL_FIX, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ write: true, skipUnchanged: opts.skipUnchanged }),
+          })
+          if (r.ok) { setFixResult(r.data.result); setReport(null) }
+        } catch (e) { /* 同上 */ }
+        setFixing(false)
+      }
+
+      const checkRow = (key, title, desc, warnText) => {
+        const kids = [
+          h('div', { className: 'ac-row-title', style: { display: 'inline' } }, title),
+          h('div', { className: 'ac-row-desc' }, desc),
+        ]
+        if (warnText) kids.push(h('div', { className: 'ac-hint-warn' }, warnText))
+        return h('label', { className: 'ac-check' },
+          h('input', { type: 'checkbox', checked: opts[key], onChange: () => toggle(key) }),
+          h('span', null, ...kids))
+      }
+
+      const head = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.healNav),
+          h('div', { className: 'ac-row-desc' }, ZH.healDesc)))
+
+      const buttons = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
+        h('button', { className: 'ac-btn ac-btn-primary', disabled: saving, onClick: save },
+          saving ? '保存中…' : (saved === 'ok' ? ZH.healSaved : ZH.healSave)),
+        saved === 'fail' ? h('span', { className: 'ac-hint-warn' }, ZH.healSaveFail) : null,
+        h('button', { className: 'ac-btn', disabled: checking, onClick: check },
+          checking ? ZH.healChecking : ZH.healCheck))
+
+      let reportBlock = null
+      if (report) {
+        const kids = [h('div', null, `扫描 ${report.scanned} 个会话` +
+          (report.skippedUnchanged ? `，按指纹跳过 ${report.skippedUnchanged} 个` : ''))]
+        if (report.unreadable && report.unreadable.length) kids.push(h('div', null, `读取失败 ${report.unreadable.length} 个`))
+        if (report.withBlanks > 0) {
+          kids.push(h('div', null, h('b', null, `${report.withBlanks} 个会话共 ${report.totalBlanks} 条空工具结果`)))
+          kids.push(h('div', null, '（断流/附件加载失败留下的残缺；发送前扫会兜底，也可点下面按钮根治到盘上）'))
+          kids.push(h('div', { style: { marginTop: '6px' } },
+            h('button', { className: 'ac-btn ac-btn-primary', disabled: fixing, onClick: fix },
+              fixing ? ZH.healRepairing : ZH.healRepair)))
+        } else {
+          kids.push(h('div', null, ZH.healClean))
+        }
+        reportBlock = h('div', { className: 'ac-report' }, ...kids)
+      }
+
+      let fixBlock = null
+      if (fixResult) {
+        const done = (fixResult.done || []).length
+        const unchanged = fixResult.unchanged || 0
+        const live = (fixResult.skipped || []).length
+        const failed = (fixResult.failed || []).length
+        let txt = `修复完成：${done} 个会话`
+        if (unchanged) txt += `，${unchanged} 个未变化跳过`
+        if (live) txt += `，${live} 个正在运行跳过`
+        if (failed) txt += `，${failed} 个失败`
+        fixBlock = h('div', { className: 'ac-report' }, h('div', null, txt))
+      }
+
+      const body = loaded
+        ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
+            checkRow('bootScan', ZH.healBoot, ZH.healBootDesc),
+            checkRow('sendScan', ZH.healSend, ZH.healSendDesc, opts.sendScan ? null : ZH.healSendWarn),
+            checkRow('skipUnchanged', ZH.healSkip, ZH.healSkipDesc),
+            buttons,
+            reportBlock,
+            fixBlock)
+        : h('div', { className: 'ac-row-desc' }, '加载选项…')
+
+      return h('div', { className: 'ac-settings' }, head, body)
+    }
+
     function apply(ctx) {
       /* 2026-10-11 夜：本插件的「侧栏排序」设置分区已**退役** ——
          用户定案排序改在 dsh-session-kit 的两个面板里（工作区管理 / 会话搬家（批量））。
@@ -253,6 +414,19 @@ window.__ModuleLoader__.load({
          设置 → 会话与提示词 → 会话搬家（批量）（session-kit 的批量面板）。
          move-session 宿主路由照常服务批量面板。 */
 
+      /* 2026-10-13：设置 → 会话与提示词 下加「会话日志修复」分区。
+         插槽点 settings.section（list slot；registerOptions: id/order/label）。
+         order 37 —— 挨着 session-kit「会话与提示词」（35）与已退役的排序分区（36）。 */
+      try {
+        ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
+          name: 'settings.section',
+          id: `${NS}-heal`,
+          order: 37,
+          label: ZH.healNav,
+        }, HealSection)), `${NS}: heal section`)
+      } catch {
+        /* 注册失败不影响插件其余部分 */
+      }
     }
 
     exports.apply = apply
