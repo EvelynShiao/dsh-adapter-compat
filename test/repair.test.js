@@ -232,3 +232,93 @@ test('repairScanAll：断号会话被列为 bad 且标记 repairable', async () 
   assert.equal(report.bad[0].repairable, true)
   assert.equal(report.bad[0].gaps.length, 1)
 })
+
+/* ═════════ 大缺口（missing ≥ 3）：扩展结构重建 ═════════
+ * 回归钉子：物化函数曾把动作 `turn-start` 写成 `turn/start`，导致**所有跨 turn 的缺口**
+ * 静默失败、看上去像「规划器无解」。下面两条专门跨 turn，写错就红。 */
+
+/** 两轮链（每轮 1 步），用于跨 turn 的大缺口。 */
+function twoTurnChain() {
+  const msg = (seq, turn, step, text) => ({
+    type: 'assistant/message', seq, time: T(seq),
+    data: {
+      turn, step, stream: [],
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text }],
+        source: { kind: 'model', provider: 'our-free-model', model: 'longcat-2.5-preview-free' },
+        id: `msg-${seq}`,
+      },
+    },
+    surfaceOp: 'append',
+  })
+  return [
+    { type: 'turn/start', seq: 0, time: T(0), data: { turn: 1 } },
+    { type: 'step/start', seq: 1, time: T(1), data: { turn: 1, step: 1 } },
+    msg(2, 1, 1, '第一轮开工'),
+    { type: 'step/end', seq: 3, time: T(3), data: { turn: 1, step: 1 } },
+    { type: 'turn/end', seq: 4, time: T(4), data: { turn: 1 } },
+    { type: 'turn/start', seq: 5, time: T(5), data: { turn: 2 } },
+    { type: 'step/start', seq: 6, time: T(6), data: { turn: 2, step: 1 } },
+    msg(7, 2, 1, '第二轮开工'),
+    { type: 'step/end', seq: 8, time: T(8), data: { turn: 2, step: 1 } },
+    { type: 'turn/end', seq: 9, time: T(9), data: { turn: 2 } },
+  ]
+}
+
+test('基线：twoTurnChain 本身过 verify', () => {
+  const v = verify(HEADER, twoTurnChain())
+  assert.deepEqual(v.problems, [])
+})
+
+test('大缺口跨 turn（缺 4 行，结构刚好够）：补 [step/end, turn/end, turn/start, step/start]', () => {
+  const full = twoTurnChain()
+  const broken = full.filter((e) => ![3, 4, 5, 6].includes(e.seq))
+  const gaps = scanGaps(broken)
+  assert.equal(gaps.length, 1)
+  assert.equal(gaps[0].missing, 4)
+  const plan = repairEvents(HEADER, broken)
+  assert.equal(plan.ok, true, plan.problems.join('; '))
+  assert.equal(plan.inserted.map((r) => r.type).join(','), 'step/end,turn/end,turn/start,step/start')
+  plan.fixed.forEach((ev, i) => assert.equal(ev.seq, i, `第 ${i} 行 seq 应为 ${i}`))
+  assert.equal(verify(HEADER, plan.fixed).ok, true)
+  // 既有行必须原样保留（按对象引用比对：确认没被改过）
+  for (const e of full) {
+    if ([3, 4, 5, 6].includes(e.seq)) continue
+    assert.equal(plan.fixed[e.seq], e, `seq ${e.seq} 的原行必须原样保留`)
+  }
+})
+
+test('大缺口跨 turn（缺 8 行，结构不够填）：多出来的用 assistant/attempt 补（非表层）', () => {
+  const broken = twoTurnChain().filter((e) => ![1, 2, 3, 4, 5, 6, 7, 8].includes(e.seq))
+  const gaps = scanGaps(broken)
+  assert.equal(gaps.length, 1)
+  assert.equal(gaps[0].missing, 8)
+  const plan = repairEvents(HEADER, broken)
+  assert.equal(plan.ok, true, plan.problems.join('; '))
+  assert.equal(plan.inserted.length, 8)
+  const pads = plan.inserted.filter((r) => r.type === 'assistant/attempt')
+  assert.ok(pads.length >= 1, '结构行不够填时要用 attempt 补满')
+  for (const p of pads) {
+    assert.equal(p.surfaceOp, undefined, 'attempt 不是表层事件，不能带 surfaceOp')
+    assert.equal(p.sourceEventSeqs, undefined, 'attempt 不能带 sourceEventSeqs')
+    assert.deepEqual(p.data.stream, [], 'attempt 必须带 stream（settlement）')
+  }
+  plan.fixed.forEach((ev, i) => assert.equal(ev.seq, i))
+  assert.equal(verify(HEADER, plan.fixed).ok, true)
+})
+
+test('大缺口但形态不可定（缺 4 行、turn 内无坐标）：仍然只报告不动手', () => {
+  // turn/end 之后直接 step/start(2/1)，结构上只需 1 行 turn/start，却缺 4 行
+  // → 多出来的多半是不挂 turn 的真实内容（user/message、插件事件），不许假造
+  const broken = [
+    { type: 'turn/start', seq: 0, time: T(0), data: { turn: 1 } },
+    { type: 'step/start', seq: 1, time: T(1), data: { turn: 1, step: 1 } },
+    { type: 'turn/end', seq: 2, time: T(2), data: { turn: 1 } },
+    { type: 'step/start', seq: 6, time: T(6), data: { turn: 2, step: 1 } },
+  ]
+  const plan = repairEvents(HEADER, broken)
+  assert.equal(plan.ok, false)
+  assert.equal(plan.unsupported.length, 1)
+  assert.equal(plan.fixed, undefined)
+})
