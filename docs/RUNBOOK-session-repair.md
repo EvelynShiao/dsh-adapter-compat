@@ -98,6 +98,28 @@ console.log(bad.length?bad.join('\n'):'结构完整');
 
 > `arguments` 用 `'{"command":"[NaN]"}'`（合法 JSON）而不是空串——空串会被判非法。
 
+### 1.3 大缺口（missing ≥ 3）：插件自动重建结构
+
+≥3 行的缺口几乎只有一种成因：**整段 zstd 帧丢了**（实测 session-8420e924 缺 10 行 = 2509-2518，正好跨 3 个 step）。帧边界是物理事实，帧里写了什么已经没了 —— 所以只重建**能确定的结构**，正文一律 `[NaN]`：
+
+- **能确定**：turn/step 坐标链。断口处的 open turn/step 与下一跳的 `data.turn/step` 之间坐标只能前进，只能经 `step/end + step/start`、`turn/end + turn/start` 走过去，每一步是确定的行数。下一跳若在等一个 call（`tool/result` 要它 started、`tool/call` 要它 declared 未 started），callId 已知 → 补 `assistant/message`（声明）+ `tool/call`（发起），声明里的工具名抄断口前最近一次真实 `tool/call`。
+- **不能确定**：正文。填充优先 `assistant/attempt`（**非表层事件**，界面上不会多出假消息）；`tool/result` 用 `[NaN]`；未 started 的 call 用宿主自己的 `TOOL_NOT_STARTED` 收尾形态（`dsh-session/lib/index.js openTurnClosers` 原文措辞）。
+
+规划器 `repair.js planGapRows`：0-1 BFS 在「open 状态 × 已用行数」上找**恰好 missing 行**、且落点满足下一跳硬约束的最省结构路径（结构行越少 ⇒ 不可见填充越多）。找不到就报 unsupported，**绝不硬凑**；找到了也要过 `verify` + `assertRowsDense` + 宿主 `Session.fromRestore` 三道门才许落盘。
+
+**明确拒绝的形态**（不是 bug，是不敢猜）：
+
+| 形态 | 为什么拒绝 |
+|---|---|
+| `missing ≤ 2` 且不是「紧邻 tool/call 的 result（± step/end）」 | 形态学上还有别的可能，宁可报告（§1.2 人工判断） |
+| `turn/end → step/start` 这类：结构上只需 1~2 行，但缺的行数更多 | 多出来的多半是**不挂 turn 的真实内容**（user/message、todo/write、插件事件），假造等于伪造用户输入 |
+| 缺口需要补 `assistant/message`（下一跳在等一个未声明的 call），但断口前没有真实 `assistant/message` | 合成消息必须带真实 provider/model，宿主 `assertMessageEventShape` 会拒载（只要不需要合成消息，就没有这个限制） |
+| `missing > 240` | 太大，交人工按 §1.2 构造 |
+
+被拒时 `repairScanAll` / `repairSessionFile` 会带出 `describeGapReport`：seq 区间、前后行坐标、`autoRepairable`、`hints`（拒绝原因），照着人工构造即可。
+
+> 反例教训（2026-10-14）：物化函数里把动作 `turn-start` 写成了 `turn/start`，结果**所有跨 turn 的缺口**都在物化时静默返回 null，看上去像「规划器无解」。给规划器加 `trace` 参数（`planGapRows(gap, events, { trace: [] })`）能直接看到断在哪一步。
+
 ## 2. §2：headerSeq 残留
 
 ```js
