@@ -395,8 +395,31 @@ function materializeGapPlan(path, st0, ctx) {
   return rows
 }
 
+/** 会真正约束 open turn/step 的事件类型（其余如插件事件、user/message 不约束）。 */
+const GAP_ANCHOR_TYPES = new Set([
+  'turn/start', 'turn/end', 'step/start', 'step/end',
+  'assistant/attempt', 'assistant/message', 'system/message', 'developer/message',
+  'tool/call', 'tool/result', 'request/header', 'request/context',
+  'llm/retry', 'compaction/start', 'compaction/summary', 'compaction/end',
+])
+
 /**
- * 大缺口规划：找「恰好 missing 行、落点满足下一跳硬约束」的最省结构路径。
+ * 断口的锚点：**下一跳可能是无坐标的插件事件**（如 `session-log-deepseek/delivery-accepted`），
+ * 它对 open turn/step 没有任何要求；真正决定「缺口收尾状态」的是往后第一条带坐标的事件。
+ * 实测 8420 [1250+12]：下一跳是 delivery-accepted，按它收尾就把 step 停在 6，
+ * 而真实后续 assistant/message 在 step 8 → 整条链错位、verify 拒绝。
+ */
+function gapAnchorIndex(events, from) {
+  const limit = Math.min(events.length, from + 64)
+  for (let i = from; i < limit; i += 1) {
+    const t = events[i]?.type
+    if (typeof t === 'string' && GAP_ANCHOR_TYPES.has(t)) return i
+  }
+  return from
+}
+
+/**
+ * 大缺口规划：找「恰好 missing 行、落点满足锚点事件硬约束」的最省结构路径。
  * @returns {object[]|null} 合成行；无解返回 null（调用方按 unsupported 报告）。
  */
 function planGapRows(gap, events, { forceSettle = false, trace = null } = {}) {
@@ -404,19 +427,21 @@ function planGapRows(gap, events, { forceSettle = false, trace = null } = {}) {
   const M = gap.missing
   const next = events[gap.index]
   if (!next || typeof next.type !== 'string') { T('早退：没有下一跳'); return null }
+  const anchorIdx = gapAnchorIndex(events, gap.index)
+  const anchor = events[anchorIdx] ?? next
   const source = modelSourceBefore(events, gap.index)   // 惰性：只有真要合成 assistant/message 时才是硬要求
   const base = replayGapState(events, gap.index)
   if (!base) { T('早退：断口前状态机回放失败'); return null }
 
-  // 下一跳是不是在等一个 call（result 等它 started，tool/call 等它 declared 未 started）
-  const nd = base && next.data && typeof next.data === 'object' ? next.data : {}
+  // 锚点是不是在等一个 call（result 等它 started，tool/call 等它 declared 未 started）
+  const nd = anchor.data && typeof anchor.data === 'object' ? anchor.data : {}
   let need = null
   let declSpec = null
-  if (next.type === 'tool/result' && next.surfaceOp === 'append') {
+  if (anchor.type === 'tool/result' && anchor.surfaceOp === 'append') {
     const id = nd?.message?.toolCallId ?? nd?.message?.source?.callId
     if (typeof id !== 'string' || !id) return null
     need = { id, kind: 'result' }
-  } else if (next.type === 'tool/call') {
+  } else if (anchor.type === 'tool/call') {
     if (typeof nd?.callId !== 'string' || !nd.callId) return null
     need = { id: nd.callId, kind: 'call' }
   }
@@ -465,7 +490,7 @@ function planGapRows(gap, events, { forceSettle = false, trace = null } = {}) {
   }
 
   // 0-1 BFS：cost 0 = attempt 填充，cost 1 = 结构行。队列按 cost 单调，首个命中目标即最省。
-  T(`M=${M} forceSettle=${forceSettle} prefix=${prefix.length} state0=${JSON.stringify({ turn: base.turn, step: base.step, nextTurn: base.nextTurn, nextStep: base.nextStep, pending: base.pending.map((p) => p.id.slice(0, 8) + (p.started ? '+' : '-')) })} need=${need ? need.kind + ':' + String(need.id).slice(0, 10) : 'null'} bounds=turn≤${maxTurn},step≤${maxStep} next=${next.type}(${nd?.turn}/${nd?.step})`)
+  T(`M=${M} forceSettle=${forceSettle} prefix=${prefix.length} state0=${JSON.stringify({ turn: base.turn, step: base.step, nextTurn: base.nextTurn, nextStep: base.nextStep, pending: base.pending.map((p) => p.id.slice(0, 8) + (p.started ? '+' : '-')) })} need=${need ? need.kind + ':' + String(need.id).slice(0, 10) : 'null'} bounds=turn≤${maxTurn},step≤${maxStep} anchor=${anchor.type}@${anchorIdx}(${nd?.turn}/${nd?.step})${anchorIdx > gap.index ? ` [下一跳 ${next.type} 无坐标，跳过]` : ''}`)
   const key = (s, k) => `${s.turn}|${s.step}|${s.nextTurn}|${s.nextStep}|${[...s.pending].map((p) => p.id + (p.started ? '+' : '-')).sort().join(',')}|${k}`
   const start = { st, k: prefix.length, path: prefix, cost: 0 }
   const best = new Map([[key(st, prefix.length), 0]])
@@ -476,7 +501,7 @@ function planGapRows(gap, events, { forceSettle = false, trace = null } = {}) {
     const node = queue[head]
     head += 1
     if (node.k === M) {
-      const ok = gapTargetOk(node.st, next, need)
+      const ok = gapTargetOk(node.st, anchor, need)
       T(`pop k=M cost=${node.cost} target=${ok} st=${JSON.stringify({ turn: node.st.turn, step: node.st.step, nextTurn: node.st.nextTurn, nextStep: node.st.nextStep })}`)
       if (ok) {
         const rows = materializeGapPlan(node.path, base, ctx)
@@ -640,17 +665,19 @@ export function describeGapReport(gap, events) {
   } else {
     if (gap.missing < MIN_EXTENDED_GAP) hints.push('缺口只有 1~2 行，必须是紧邻 tool/call 的 tool/result（± step/end）才补；本例不满足，只能人工看上下文')
     if (gap.missing > MAX_FABRICATE) hints.push(`缺口 ${gap.missing} 行超过自动重建上限 ${MAX_FABRICATE}，要按 RUNBOOK §1 人工构造`)
-    const nd = next?.data
-    const waitId = next?.type === 'tool/call' ? nd?.callId
-      : (next?.type === 'tool/result' && next.surfaceOp === 'append' ? (nd?.message?.toolCallId ?? nd?.message?.source?.callId) : null)
+    const anchor = events[gapAnchorIndex(events, gap.index)] ?? next
+    const nd = anchor?.data
+    const waitId = anchor?.type === 'tool/call' ? nd?.callId
+      : (anchor?.type === 'tool/result' && anchor.surfaceOp === 'append' ? (nd?.message?.toolCallId ?? nd?.message?.source?.callId) : null)
     if (typeof waitId === 'string' && waitId) {
       const st0 = replayGapState(events, gap.index)
       const declared = Boolean(st0 && st0.pending.some((p) => p.id === waitId))
       if (!declared && !modelSourceBefore(events, gap.index)) {
-        hints.push('下一跳在等一个未声明的 call，需要补 assistant/message，但断口前没有真实 assistant/message（缺 provider/model），宿主会拒载 → 人工补')
+        hints.push('锚点事件在等一个未声明的 call，需要补 assistant/message，但断口前没有真实 assistant/message（缺 provider/model），宿主会拒载 → 人工补')
       }
     }
   }
+  const anchorIdx = gapAnchorIndex(events, gap.index)
   return {
     describe: describeGap(gap),
     missing: gap.missing,
@@ -658,6 +685,7 @@ export function describeGapReport(gap, events) {
     seqTo: gap.expected + gap.missing - 1,
     prev: strip(prev),
     next: strip(next),
+    anchor: anchorIdx > gap.index ? { ...strip(events[anchorIdx]), note: '下一跳无坐标，锚点后移' } : undefined,
     autoRepairable: buildExtendedCandidates(gap, events).length > 0,
     hints,
   }
