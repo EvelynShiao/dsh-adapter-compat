@@ -322,3 +322,51 @@ test('大缺口但形态不可定（缺 4 行、turn 内无坐标）：仍然只
   assert.equal(plan.unsupported.length, 1)
   assert.equal(plan.fixed, undefined)
 })
+
+test('大缺口且下一跳是无坐标插件事件：锚点后移到第一条带坐标的事件', () => {
+  // 实测 8420 [1250+12]：缺口下一跳是 session-log-deepseek/delivery-accepted（无 turn/step），
+  // 若拿它当收尾目标，step 会停在旧值，而真实后续 assistant/message 已经在下一个 step → 整条链错位。
+  const pluginEvent = (seq) => ({
+    type: 'session-log-deepseek/delivery-accepted', seq, time: T(seq),
+    data: { delivery: { kind: 'accepted' } }, ignorable: true,
+  })
+  const msg = (seq, turn, step, text) => ({
+    type: 'assistant/message', seq, time: T(seq),
+    data: {
+      turn, step, stream: [],
+      message: {
+        role: 'assistant', content: [{ type: 'text', text }],
+        source: { kind: 'model', provider: 'our-free-model', model: 'longcat-2.5-preview-free' },
+        id: `msg-${seq}`,
+      },
+    },
+    surfaceOp: 'append',
+  })
+  const full = [
+    { type: 'turn/start', seq: 0, time: T(0), data: { turn: 1 } },
+    { type: 'step/start', seq: 1, time: T(1), data: { turn: 1, step: 1 } },
+    msg(2, 1, 1, '第一轮开工'),
+    { type: 'step/end', seq: 3, time: T(3), data: { turn: 1, step: 1 } },
+    { type: 'turn/end', seq: 4, time: T(4), data: { turn: 1 } },
+    { type: 'turn/start', seq: 5, time: T(5), data: { turn: 2 } },
+    { type: 'step/start', seq: 6, time: T(6), data: { turn: 2, step: 1 } },
+    pluginEvent(7),
+    msg(8, 2, 1, '第二轮开工'),
+    { type: 'step/end', seq: 9, time: T(9), data: { turn: 2, step: 1 } },
+    { type: 'turn/end', seq: 10, time: T(10), data: { turn: 2 } },
+  ]
+  const broken = full.filter((e) => ![1, 2, 3, 4, 5, 6].includes(e.seq))
+  const gaps = scanGaps(broken)
+  assert.equal(gaps.length, 1)
+  assert.equal(gaps[0].missing, 6)
+  assert.equal(broken[gaps[0].index].type, 'session-log-deepseek/delivery-accepted', '下一跳确实是无坐标插件事件')
+  const plan = repairEvents(HEADER, broken)
+  assert.equal(plan.ok, true, plan.problems.join('; '))
+  // 收尾必须落在 (turn2, step1)，否则后面的 assistant/message 会错位
+  const types = plan.inserted.map((r) => r.type)
+  assert.ok(types.includes('turn/start'), '要跨到第二轮：' + types.join(','))
+  assert.equal(plan.inserted.at(-1).data.turn, 2, '最后一行要在 turn 2')
+  assert.equal(plan.inserted.at(-1).data.step, 1, '最后一行要在 step 1')
+  plan.fixed.forEach((ev, i) => assert.equal(ev.seq, i))
+  assert.equal(verify(HEADER, plan.fixed).ok, true)
+})
