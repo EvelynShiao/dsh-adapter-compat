@@ -130,6 +130,45 @@ curl -X POST http://127.0.0.1:<port>/dsh-adapter-compat/repair-session \
 
 关掉：`cordis.patch.yml` 本插件行 `config: { repairSession: false }` + 重启。
 
+## 第九层：压缩摘要跟随「当前选中模型」（9999.9.22）
+
+症状（2026-10-14 16:36 实证，session-fd76557f）：在 UI 里把模型切成一个能用的，
+再点 `/compact`，报的还是旧模型的错——
+
+```
+16:16:52  request/header    deepseek-official/deepseek-flash   ← 最后一次真正派发过的请求
+16:35:25  model/selection   dsh/deepseek-v4.1-flash            ← 用户切换的模型
+16:36:57  compaction/end    ERROR: Insufficient Balance
+```
+
+根因：摘要那一次请求的模型解析链是 `configured ?? latest ?? agentTarget`，其中
+`latest = agent.session.requestHeader()?.config`，而 `request/header` 事件只在请求
+**真正被派发**时写入（`dsh-agent-loop`；且 header 与上次相同时不写事件）。
+所以「在 UI 里切了模型、但还没有一条消息真正路由出去」时，`latest` 仍是旧模型——
+切模型等于没切。另外界面上那句
+`Compaction could not produce a useful summary.` 只是错误码 `summary` 的固定文案，
+是「摘要那一步失败」的统称，**不代表摘要质量差**；402 余额不足、网络 transport 失败
+全都落到这一句上，排查时别被它带偏。
+
+修法：包装 `BasicCompactionEngine.summarize()`，调用期间把 `this.config` 的摘要目标
+临时钉到宿主 `modelSelection` 投影的 `pending ?? lastUsed`：
+
+- `pending` = 在 UI 里选了、还没有任何已派发请求消费掉的选择；
+- `lastUsed` = 上一次真正派发过的请求用的路由；
+- 取 `pending ?? lastUsed`，与 UI 上「下一个请求会用谁」语义完全一致。
+
+要点：
+
+- 不碰任何核心文件，不改 `cordis.patch.yml`，DSH 升级后依然生效；
+- 与 `autoGate` 解耦：关掉自动压缩硬闸时，手动 `/compact` 照样跟随当前选中模型；
+- `config` 是 `deepFreeze` 过的对象，所以换的是实例上的引用，不是改对象本身；
+- `finally` 无条件还原，异常 / 取消 / 超时路径都覆盖；
+- 任何一步拿不到投影就静默回退到宿主原逻辑，垫片绝不反过来弄挂宿主。
+
+注意：本层只解决「压缩用哪个模型」，不解决「那个模型本身能不能用」。当前选中的模型
+若余额不足或网络不通，压缩仍会失败——区别是它现在会老实按你选的那个打，而且切完模型
+立刻生效，不需要先成功发一条消息。
+
 ## 安装
 
 电脑（profile 目录 = 你的 DSH profile，如 `~/.dsh/profiles/web`）：

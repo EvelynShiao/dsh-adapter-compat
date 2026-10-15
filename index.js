@@ -74,6 +74,19 @@
  *   修法：轮询 sessions 目录指纹，外部落盘稳定后 → sessions.refresh() 重扫 +
  *   按**磁盘扫描**（不只信注册表）全盘补齐 projcache。详见下方
  *   warmProjectionTitles / installSessionWatch 的说明。
+ *
+ * ============ 第六层：压缩摘要跟随「当前选中模型」（9999.9.22） ===========
+ *   症状：在 UI 里把模型切成一个能用的，再点 /compact，报的还是旧模型的错
+ *   （实测 2026-10-14 16:36：切成 dsh/deepseek-v4.1-flash 之后压缩仍打
+ *   deepseek-official，拿到 Insufficient Balance 402）。
+ *   根因：摘要请求的模型解析链是 `configured ?? latest ?? agentTarget`，其中
+ *   latest = session.requestHeader()?.config，而 request/header 事件只在请求
+ *   真正被派发时写入 → 「切了模型但没发消息」时 latest 仍是旧模型。
+ *   修法：包装 BasicCompactionEngine.summarize()，调用期间把 this.config 的摘要
+ *   目标钉到 modelSelection 投影的 pending ?? lastUsed（与 UI 上「下一个请求会用
+ *   谁」一致）。不碰核心文件、不改 cordis.patch.yml，DSH 升级后依然生效；
+ *   与 autoGate 解耦；finally 无条件还原；拿不到投影就静默回退。
+ *   详见下方 selectedRoute / wrapSummarize / armSummarizerSelection 的说明。
  */
 
 export const name = 'adapter-compat'
@@ -273,6 +286,187 @@ export function armGate(ctx) {
     /* 内核无该事件面：根引擎闸已足够覆盖单一引擎拓扑 */
   }
 }
+
+/* ============ 第六层：压缩摘要跟随「当前选中模型」（9999.9.22） ===========
+ *   症状：在 UI 里把模型切成一个能用的，再点 /compact，报的还是旧模型的错
+ *   （实测 2026-10-14 16:36：切成 dsh/deepseek-v4.1-flash 之后压缩仍打
+ *   deepseek-official，拿到 Insufficient Balance 402）。
+ *
+ *   根因：压缩摘要那一次请求的模型解析链是
+ *     const target = configured ?? latest ?? agentTarget
+ *   其中
+ *     latest = agent.session.requestHeader()?.config
+ *   而 requestHeader() 只 fold request/header 事件，该事件仅在请求被「准备」
+ *   （真正派发）时写入（dsh-agent-loop）。所以「在 UI 里切了模型、但还没有
+ *   一条消息真正路由出去」时，latest 仍是旧模型 —— 切模型等于没切。
+ *
+ *   修法：包装 BasicCompactionEngine.summarize()，在调用期间把 this.config 的
+ *   摘要目标临时钉到「当前选中模型」，让 configured 分支赢。选择意图取自宿主
+ *   的 modelSelection 投影：
+ *     pending  = UI 里选了、还没有任何已派发请求消费掉的选择
+ *     lastUsed = 上一次真正派发过的请求用的路由
+ *   取 pending ?? lastUsed，与 UI 上「下一个请求会用谁」语义完全一致。
+ *
+ *   要点：
+ *   - 不碰任何核心文件，不改 cordis.patch.yml，DSH 升级后依然生效；
+ *   - 与 autoGate 解耦：关掉自动压缩硬闸时手动 /compact 照样跟随当前选中模型；
+ *   - config 是 deepFreeze 过的对象，所以换的是实例上的引用，不是改对象本身；
+ *   - finally 无条件还原，异常/取消/超时路径都覆盖；
+ *   - 任何一步拿不到投影就静默回退到宿主原逻辑，垫片绝不反过来弄挂宿主。
+ */
+
+/** 摘要包装标记：防止热重载后二次包装。 */
+export const SUMMARIZER_ARMED = Symbol.for('dsh-adapter-compat.summarizer-selected-model')
+
+/**
+ * 读会话「当前选中模型」。
+ * @returns {{provider: string, model: string} | undefined} 拿不到就返回 undefined。
+ */
+export function selectedRoute(ctx, agent) {
+  let projections
+  try {
+    projections = ctx?.get?.('sessionProjections')
+  } catch {
+    return undefined
+  }
+  if (!projections || typeof projections.stateOf !== 'function') return undefined
+  let state
+  try {
+    state = projections.stateOf(agent?.session, 'modelSelection')
+  } catch {
+    return undefined
+  }
+  const pick = state?.pending ?? state?.lastUsed
+  if (!pick) return undefined
+  if (typeof pick.provider !== 'string' || pick.provider.length === 0) return undefined
+  if (typeof pick.model !== 'string' || pick.model.length === 0) return undefined
+  return { provider: pick.provider, model: pick.model }
+}
+
+/**
+ * 包装一个对象的 summarize()：调用期间把 this.config 的摘要目标钉到当前选中模型。
+ * 幂等（SUMMARIZER_ARMED 标记）；任何异常静默返回 false。
+ * @returns {boolean} 本次是否实际包装。
+ */
+export function wrapSummarize(ctx, obj) {
+  if (!obj || typeof obj.summarize !== 'function') return false
+  if (obj.summarize[SUMMARIZER_ARMED]) return false
+  const original = obj.summarize
+  const wrapped = async function (...args) {
+    const agent = args[1]
+    let picked
+    try {
+      picked = selectedRoute(ctx, agent)
+    } catch {
+      picked = undefined
+    }
+    const previous = this?.config
+    let swapped = false
+    if (picked && previous && typeof previous === 'object') {
+      try {
+        // config 已 deepFreeze，换引用而不是改对象
+        this.config = Object.freeze({
+          ...previous,
+          summarizationProvider: picked.provider,
+          summarizationModel: picked.model,
+        })
+        swapped = true
+      } catch {
+        swapped = false
+      }
+    }
+    try {
+      return await original.apply(this, args)
+    } finally {
+      if (swapped) {
+        try {
+          this.config = previous
+        } catch {
+          /* 只读实例：保持原样，绝不弄挂宿主 */
+        }
+      }
+    }
+  }
+  wrapped[SUMMARIZER_ARMED] = true
+  wrapped.original = original
+  try {
+    Object.defineProperty(obj, 'summarize', {
+      value: wrapped, configurable: true, writable: true, enumerable: false,
+    })
+    return true
+  } catch {
+    try {
+      obj.summarize = wrapped
+      return true
+    } catch {
+      return false
+    }
+  }
+}
+
+/**
+ * 给引擎装摘要包装：prototype 优先（一次覆盖同类全部实例，含已存在的），
+ * 实例自身持有 summarize 时再补一次。幂等；异常静默。
+ * @returns {boolean} 是否有实际动作。
+ */
+export function armSummarizer(ctx, engine) {
+  if (!engine || typeof engine.summarize !== 'function') return false
+  let armed = false
+  try {
+    const proto = Object.getPrototypeOf(engine)
+    if (proto && proto !== Object.prototype && typeof proto.summarize === 'function') {
+      armed = wrapSummarize(ctx, proto) || armed
+    }
+  } catch {
+    /* 无原型可打就只打实例 */
+  }
+  armed = wrapSummarize(ctx, engine) || armed
+  return armed
+}
+
+/**
+ * 布防摘要模型跟随：
+ *   1. 立即武装根引擎；
+ *   2. prepend 监听 agent/pre-step，按 agent 补装 preset 作用域引擎
+ *      （热重载换类后的新实例也在这一步兜住，与硬闸同源）。
+ * 与 autoGate 解耦：关掉自动压缩硬闸时，手动 /compact 照常跟随当前选中模型。
+ */
+export function armSummarizerSelection(ctx) {
+  const log = (msg) => {
+    try {
+      ctx.logger?.info?.(`[adapter-compat] ${msg}`)
+    } catch {
+      /* 无日志面 */
+    }
+  }
+  let root
+  try {
+    root = ctx.get?.('compaction')
+  } catch {
+    root = undefined
+  }
+  if (armSummarizer(ctx, root)) log('compaction summarizer follows selected model (root engine)')
+  try {
+    ctx.on?.(
+      'agent/pre-step',
+      ({ agent }, next) => {
+        try {
+          const engine = engineForAgent(ctx, agent)
+          if (engine && typeof engine.summarize === 'function' && !engine.summarize[SUMMARIZER_ARMED]) {
+            if (armSummarizer(ctx, engine)) log('compaction summarizer follows selected model (agent-scoped engine)')
+          }
+        } catch {
+          /* 包装失败不能影响 step */
+        }
+        return next()
+      },
+      { prepend: true },
+    )
+  } catch {
+    /* 内核无该事件面：根引擎包装已足够覆盖单一引擎拓扑 */
+  }
+}
+
 
 /**
  * 把一个 cordis runtime 上被固化为 null 的 Config 归一成 undefined。
@@ -2241,6 +2435,9 @@ export function apply(ctx, config = {}) {
     }, ms)
     if (typeof t.unref === 'function') t.unref()
   }
+
+  // 6) 压缩摘要跟随「当前选中模型」（与 autoGate 解耦：关掉自动压缩硬闸时手动 /compact 照样生效）
+  armSummarizerSelection(ctx)
 
   // 5) 自动压缩硬闸（默认开；cordis.patch.yml 本插件行 config.autoGate:false 可恢复官方行为）
   if (config?.autoGate === false) return
