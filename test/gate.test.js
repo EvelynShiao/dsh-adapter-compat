@@ -102,11 +102,13 @@ test('preset 作用域引擎经 pre-step 补闸', () => {
   const scoped = new ScopedEngine()
   const ctx = makeCtx({ engine: undefined, scopedEngine: scoped })
   apply(ctx)
-  const pre = ctx._handlers.find((h) => h.event === 'agent/pre-step')
-  assert.ok(pre, '应注册 pre-step 监听')
+  // 顺序无关：可能有多个 pre-step 监听（自动压缩补闸 + 摘要模型跟随），全部都要跑。
+  // 原先只取第一个，等价于假设「pre-step 只有闸一个监听」——加第二个合法监听就误判。
+  const pres = ctx._handlers.filter((h) => h.event === 'agent/pre-step')
+  assert.ok(pres.length > 0, '应注册 pre-step 监听')
   assert.throws(() => scoped.compactIfNeeded(), /should be gated/, 'pre-step 之前不应被误伤')
   let advanced = false
-  pre.handler({ agent: {} }, () => { advanced = true; return undefined })
+  for (const p of pres) p.handler({ agent: {} }, () => { advanced = true; return undefined })
   assert.equal(advanced, true, 'next() 必须放行，不能拦 step')
   assert.equal(scoped.compactIfNeeded(), null, 'scoped 引擎被补闸')
 })
