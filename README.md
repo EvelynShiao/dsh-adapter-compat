@@ -1,5 +1,9 @@
 # dsh-adapter-compat
 
+### 9999.9.23：统一清除正文占位
+
+瘦身、墓碑清除、缺失结果修复与请求出口统一使用 `[内容已清除]`，明确标识正文不可用，不再生成含义不明的 `[NaN]`。墓碑清除先擦正文再填占位，防止占位被二次擦空；缺失工具名单独使用协议标识符 `unknown_tool`。不批量改写既有历史或非空工具输出。
+
 DSH LLM adapter **兼容垫片** + **自动压缩硬闸**：
 
 1. **回填层**：在 adapter 注册时回填缺失的 `LlmAdapter` 基类默认方法，修复 `/compact` 因 `xxx is not a function` 静默失败；
@@ -110,7 +114,7 @@ stored session "session-xxx" is corrupt:
 - 只认从工具协议可**确定性推断**的形态：`tool/call` 后缺 1 行 → 补 `tool/result`；
   缺 2 行且下一跳是 `step/start` → 补 `[tool/result, step/end]`。其余形态一律只报告
   不动手（`unsupported`），绝不猜；
-- 合成行占位正文 `[NaN]`（与 slim 同一惯例）；`sourceEventSeqs`/`surfaceOp` 放顶层信封；
+- 合成行占位正文 `[内容已清除]`（与 slim 同一惯例）；`sourceEventSeqs`/`surfaceOp` 放顶层信封；
 - `verify`（宿主规则移植版）全绿才落盘：先备份到 `$DSH_HOME/backup-true-delete-repair/`，
   写完读回复核，不过就回滚；live 会话 409 拒写；
 - 干跑默认，`write: true` 才改文件。

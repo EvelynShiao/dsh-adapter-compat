@@ -1924,7 +1924,7 @@ export function repairScanAll(home = dshHomeDir()) {
 }
 
 /**
- * 文本层根治（2026-10-13）：把某会话盘上「正文全空的 tool 结果」修成 [NaN]。
+ * 文本层根治（2026-10-13）：把某会话盘上「正文全空的 tool 结果」修成 [内容已清除]。
  *
  * 设计取舍（用户明确要求「不要频繁扫盘吃内存」）：
  *   - **不做定时器、不做启动全盘扫** —— 出口守卫（wire-guard v3）在发送前逐请求兜底，
@@ -2129,7 +2129,7 @@ export function installRepairRoute(ctx, config = {}) {
       })
     } catch { /* 扫描路由失败不影响修复路由 */ }
     /* 文本层根治路由（2026-10-13，手动触发，无定时器/无启动扫盘 —— 出口守卫已兜实时流量）：
-       POST heal-tools {sessionId, write}  修某会话的空 tool 结果 → [NaN]
+       POST heal-tools {sessionId, write}  修某会话的空 tool 结果 → [内容已清除]
        POST heal-tools {write:true}        修全部（逐个过 live/备份/verify 门禁）
        GET  heal-scan                      只读统计，不写 */
     try {

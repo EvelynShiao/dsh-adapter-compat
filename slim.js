@@ -15,13 +15,14 @@
  */
 import { readSession, writeSession, verify } from './true-delete.js'
 import { emptyTextBlocks } from './purge.js'
+import { WIRE_PLACEHOLDER } from './wire-tap.js'
 
 /** 文本类字段名（擦正文用；不碰 id/role/kind/callId 等结构字符串）。 */
 const TEXT_KEYS = new Set(['text', 'texts', 'delta', 'deltas', 'reasoning', 'reasoning_content', 'reasoningContent', 'thinking'])
 
 /** 擦空后的占位符：正文确实没了（真删除语义不变），但 tool_result 不能是空数组，
- *  否则 Anthropic 风格 provider 把它当成「没有结果」直接拒收整轮。用 [NaN] 短且好认。 */
-export const SLIM_PLACEHOLDER = '[NaN]'
+ *  否则 Anthropic 风格 provider 把它当成「没有结果」直接拒收整轮。统一使用可读的正文清除标记。 */
+export const SLIM_PLACEHOLDER = WIRE_PLACEHOLDER
 
 /** 按 key 名递归擦文本：只把字符串置空，键/数组长度/dt/chunk 结构不动（宿主仍能解析）。 */
 export function scrubTexts(node, depth = 0) {

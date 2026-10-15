@@ -7,6 +7,7 @@
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { WIRE_PLACEHOLDER } from './wire-tap.js';
 import { readSession, writeSession, excise, verify, seqsOfTurn, decodeSeqRanges, foldSurfaceLoose, lateSystemAppends, SURFACE_TYPES } from './true-delete.js';
 
 /** 会写盘的调用方必须显式传 write:true；默认干跑。 */
@@ -649,19 +650,19 @@ export function redactEventPayload(event) {
   if (typeof data.result === 'string') data.result = ''
   if (data.output && typeof data.output === 'object') data.output = {}
   if (typeof data.output === 'string') data.output = ''
-  /* 出口修同伴（2026-10-11，2026-10-13 占位符统一为 [NaN]）：擦完不能留下「正文全空的 tool 结果」——
+  // 先彻底擦除正文，再填占位，避免 scrubDeep 把新占位再次清空。
+  scrubDeep(data)
+  /* 出口修同伴（正文清除标记统一）：擦完不能留下「正文全空的 tool 结果」——
      provider（Anthropic 风格）把 tool_result.content=[] 当成没有结果，直接拒收整轮：
        messages.N.M: tool_use ids were found without tool_result blocks immediately after
      实证 session-3a8e374a 的 #941/#946/#951/#956/#958/#963/#971 七条就是这样被擦空的。
      留占位符：清空语义不变（正文确实没了），但结构合法。
-     占位符与 slim.js / repair.js / wire-tap.js 的 WIRE_PLACEHOLDER 统一为 [NaN]。 */
+     占位符与 slim.js / repair.js / wire-tap.js 的 WIRE_PLACEHOLDER 统一为 [内容已清除]。 */
   if (event.type === 'tool/result' && data.message && typeof data.message === 'object') {
     const blocks = Array.isArray(data.message.content) ? data.message.content : []
     const hasText = blocks.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.length > 0)
-    if (!hasText) data.message = { ...data.message, content: [{ type: 'text', text: '[NaN]' }] }
+    if (!hasText) data.message = { ...data.message, content: [{ type: 'text', text: WIRE_PLACEHOLDER }] }
   }
-  /* 关键补充：按 key 名深度擦（内嵌提供方流 data.stream.*.texts 就在里面） */
-  scrubDeep(data)
   if (metaSnapshot !== undefined) data.meta = metaSnapshot
   if (typeof data.reasoning === 'string') data.reasoning = ''
   if (typeof data.reasoningContent === 'string') data.reasoningContent = ''

@@ -90,7 +90,7 @@ test('R1（missing=2，tool/call 后断到 step/start）：补 [tool/result, ste
   assert.equal(tr.type, 'tool/result')
   assert.equal(tr.data.message.toolCallId, 'call_A')
   assert.equal(tr.data.message.source.callId, 'call_A')
-  assert.equal(tr.data.message.content[0].text, '[NaN]', '占位必须是 [NaN]')
+  assert.equal(tr.data.message.content[0].text, '[内容已清除]', '占位必须是 [内容已清除]')
   assert.equal(tr.data.turn, 1)
   assert.equal(tr.data.step, 1)
   assert.deepEqual(tr.sourceEventSeqs, [3], 'sourceEventSeqs 在顶层信封')
@@ -113,7 +113,7 @@ test('R2（missing=1，tool/call 后断到同 step 的 step/end）：只补 tool
   assert.equal(plan.ok, true, plan.problems.join('; '))
   assert.equal(plan.inserted.length, 1)
   assert.equal(plan.inserted[0].type, 'tool/result')
-  assert.equal(plan.inserted[0].data.message.content[0].text, '[NaN]')
+  assert.equal(plan.inserted[0].data.message.content[0].text, '[内容已清除]')
   plan.fixed.forEach((ev, i) => assert.equal(ev.seq, i))
 })
 

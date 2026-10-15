@@ -102,7 +102,7 @@ export function repairWireRequest(options) {
     const content = Array.isArray(m.content) ? m.content : []
     return !content.some((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.length > 0)
   }
-  const fixed = (m) => ({ ...m, content: [{ type: 'text', text: '[NaN]' }] })
+  const fixed = (m) => ({ ...m, content: [{ type: 'text', text: WIRE_PLACEHOLDER }] })
   let repaired = 0
   for (let i = 0; i < messages.length; i += 1) {
     if (!isBlank(messages[i])) continue
@@ -125,12 +125,10 @@ export function repairWireRequest(options) {
   return repaired
 }
 
-/**
- * 空正文占位符 —— 全局统一为 [NaN]（2026-10-13 用户定案）。
- * 之前是中文「[内容已清除]」：CJK 计 token 贵，且与 slim.js / repair.js 的 [NaN] 不一致。
- * 清空语义不变（正文确实没了），结构合法、provider 不拒收。
- */
-export const WIRE_PLACEHOLDER = '[NaN]'
+/** 缺失/已清除正文的统一标记：不是工具真实输出，不暗示恢复了原文。 */
+export const WIRE_PLACEHOLDER = '[内容已清除]'
+/** 工具名属于协议标识符，不能拿正文占位文本充当工具名。 */
+export const UNKNOWN_TOOL_NAME = 'unknown_tool'
 
 /** 打标用（instance + prototype 双层，防重复包装）。 */
 const WIRE_GUARD_MARK = Symbol.for('dsh-adapter-compat.wire-guard')
@@ -149,7 +147,7 @@ export function countBlankToolMessages(options) {
 }
 
 /**
- * 文本层根治（2026-10-13）：把盘上事件里的「正文全空 tool 结果」直接修成 [NaN]。
+ * 文本层根治（2026-10-13）：把盘上事件里的「正文全空 tool 结果」直接修成 [内容已清除]。
  *
  * 出口守卫（guardRequestMessages）只拦「发出去的那一份」，盘上历史残缺还在 ——
  * 实测 session-34da7d62 43 条、session-3a8e374a 7 条空 tool 结果（都是断流/擦除留下的
@@ -197,7 +195,7 @@ export function isBrokenAttachmentBlock(block) {
 /**
  * 修一条 assistant 的 tool-call 块（断流会留下缺参/缺名的半截调用）：
  *   arguments 缺失/空/非法 JSON → '{}'（结构合法；调用本已执行过，参数只是回显）
- *   name 缺失 → [NaN]（保 id 配对，名字无法凭空造）
+ *   name 缺失 → unknown_tool（保 id 配对，名字无法凭空造）
  *   id 缺失 → 返回 null = 无法修复，调用方丢弃该块（无 id 无法与 tool_result 配对）
  * @returns {object|null} 修复后的新块；null = 建议丢弃
  */
@@ -207,7 +205,7 @@ export function repairToolCallBlock(block) {
   let changed = false
   if (typeof nb.arguments !== 'string' || nb.arguments.length === 0) { nb.arguments = '{}'; changed = true }
   else { try { JSON.parse(nb.arguments) } catch { nb.arguments = '{}'; changed = true } }
-  if (typeof nb.name !== 'string' || nb.name.length === 0) { nb.name = WIRE_PLACEHOLDER; changed = true }
+  if (typeof nb.name !== 'string' || nb.name.length === 0) { nb.name = UNKNOWN_TOOL_NAME; changed = true }
   return changed ? nb : null
 }
 
@@ -238,11 +236,11 @@ export function reorderAssistantContent(content) {
  *
  * 残缺不是本插件造成的（DeepSeek 断流截断、附件加载失败等），本插件只在出口拦截。
  * v2 只修两件事；v3 扩到六类（都实证过会被 provider 拒收整轮）：
- *   ① 空正文 tool 结果       → 补 [NaN]（provider 当成「没有结果」→ 拒收）
- *   ② assistant tool-call 缺参数/缺名 → arguments='{}'、name=[NaN]
+ *   ① 空正文 tool 结果       → 补 [内容已清除]（provider 当成「没有结果」→ 拒收）
+ *   ② assistant tool-call 缺参数/缺名 → arguments='{}'、name=unknown_tool
  *   ③ assistant tool-call 无 id      → 丢块（无 id 无法配对，留着必拒）
  *   ④ tool 结果找不到对应 tool_use（孤儿）→ 丢条（留着拒整轮，丢只丢一条）
- *   ⑤ tool_use 没有对应结果（断流断在工具执行中）→ 合成 [NaN] 占位结果
+ *   ⑤ tool_use 没有对应结果（断流断在工具执行中）→ 合成 [内容已清除] 占位结果
  *   ⑥ image/file 块 attachment 残缺（加载失败）→ 丢块保会话
  * 外加重排：assistant 里 tool-call 之后不许再有 text。
  *

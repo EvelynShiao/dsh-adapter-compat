@@ -16,7 +16,7 @@
  *   - verify（true-delete.js 移植的宿主全套校验：seq dense + 状态机 + callId 配对）
  *     全绿才允许落盘，写完回读复核，不过就回滚——补错宁可不修。
  *
- * 占位正文用 [NaN]（与 slim.js 的 SLIM_PLACEHOLDER 同一惯例：结构合法、正文确实
+ * 占位正文用 [内容已清除]（与 slim.js 的 SLIM_PLACEHOLDER 同一惯例：结构合法、正文确实
  * 没了、一眼识别是修复占位而非真实输出）。
  */
 import { randomUUID } from 'node:crypto'
@@ -104,7 +104,7 @@ function makeStepEnd(seq, time, prev) {
  *     坐标只能前进，且只能经 step/end+step/start、turn/end+turn/start 走过去，
  *     每一步是确定的行数。用 0-1 BFS 在 (open 状态 × 已用行数) 上找「恰好 missing 行、
  *     落点满足 next 硬约束」的最省结构路径（结构行越少 ⇒ 不可见填充越多）。
- *   不能确定的：**正文**。合成行一律 [NaN] 占位；填充优先用 assistant/attempt ——
+ *   不能确定的：**正文**。合成行一律 [内容已清除] 占位；填充优先用 assistant/attempt ——
  *     它不是表层事件（不带 surfaceOp），界面上不会多出假消息。
  *
  * 三条底线（都是宿主真实拒载规则，见 dsh-session/lib/{index,invariant}.js）：
@@ -162,7 +162,7 @@ function makeAssistantMessageSeq(seq, time, turn, step, content, source) {
 }
 
 /**
- * 合成 tool/result。started 的 call → [NaN] 占位成功结果（与 base 规则同款）；
+ * 合成 tool/result。started 的 call → [内容已清除] 占位成功结果（与 base 规则同款）；
  * 未 started 的 call → 照宿主 openTurnClosers 的 TOOL_NOT_STARTED 错误形态。
  */
 function makeResultSeq(seq, time, turn, step, call) {
@@ -574,7 +574,7 @@ function buildInsertsBase(gap, events) {
     return [makeToolResult(gap.expected, prev.time, prev)]
   }
   // 1~2 行的其余形态一律不猜（形态学上还有别的可能，宁可报告）。
-  // missing ≥ 3 只可能是整帧丢失 —— 结构可从 turn/step 坐标确定性重建，正文用 [NaN] 占位。
+  // missing ≥ 3 只可能是整帧丢失 —— 结构可从 turn/step 坐标确定性重建，正文用 [内容已清除] 占位。
   return buildInsertsExtended(gap, events)
 }
 
