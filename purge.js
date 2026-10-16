@@ -165,45 +165,20 @@ export function planPurge(events, options = {}) {
     if (sinceMs !== undefined && !(Number.isFinite(e.time) && e.time >= sinceMs)) continue;
     if (c.skip) { skipped.push({ seq: e.seq, why: c.why }); continue }
     if (c.needsNodeLookup) {
-      /* 记忆上下文快照轮换（kind=dsh-session-kit-memory-context 的 snapshot 替换）：
-         那是 session-kit 刷新自己的上下文快照，不是用户删轮——只外科摘除被遮蔽的旧快照
-         节点本身（孤儿 replace 标记由 excise 摘除逻辑自清），绝不整轮（整轮会吃掉轮内
-         真消息：Chrome 会话 turn15 实测 -6 用户 -1 AI）。 */
-      if (e.data?.source?.kind === 'dsh-session-kit-memory-context') {
-        for (const sq of c.sourcesFor) if (Number.isFinite(sq) && byseq.has(sq)) surgical.add(sq);
-        continue;
-      }
-      /* legacy-turn-fallback：旧格式墓碑没有 summary.turn，两步反推：
-         ① 被遮蔽的表层节点自带的 data.turn；
-         ② 兜底：这些节点里最早那个 seq 之前最近的 turn/start。 */
-      let earliest = Infinity;
-      for (const sq of c.sourcesFor) {
-        const node = byseq.get(sq);
-        if (node && Number.isSafeInteger(node.data?.turn)) turnSet.add(node.data.turn);
-        if (Number.isFinite(sq) && sq < earliest) earliest = sq;
-      }
-      /* legacy-surfacepos-fallback：更老的墓碑连 sourceEventSeqs 都没有，只有
-         surfaceOp.{startSeq,endSeq} —— 那是**表层位置**（surface 节点数组下标），
-         用容错 fold 取出对应节点再推轮号。 */
-      if (c.sourcesFor.length === 0 && c.surfaceRange !== undefined) {
-        let nodes = [];
-        try { nodes = [...foldSurfaceLoose(events).nodes] } catch { nodes = [] }
-        /* 注意：surfaceOp.startSeq/endSeq 是**表层节点的 seq**（源码用 nodes.indexOf(op.startSeq) 定位），不是数组下标。 */
-        const from = nodes.includes(c.surfaceRange.start) ? c.surfaceRange.start : undefined;
-        const to = nodes.includes(c.surfaceRange.end) ? c.surfaceRange.end : undefined;
-        if (Number.isSafeInteger(from) && Number.isSafeInteger(to)) {
-          for (const sq of [from, to]) {
-            const node = byseq.get(sq);
-            if (node && Number.isSafeInteger(node.data?.turn)) turnSet.add(node.data.turn);
-            if (Number.isFinite(sq) && sq < earliest) earliest = sq;
-          }
-        }
-      }
-      if (turnSet.size === 0 && Number.isFinite(earliest)) {
-        const starts = events.filter((e) => e.type === 'turn/start' && e.seq < earliest && Number.isSafeInteger(e.data?.turn));
-        const last = starts[starts.length - 1];
-        if (last) turnSet.add(last.data.turn);
-      }
+      /* 【治本 · 2026-10-16 事故】这条分支的含义就是「**没有轮次信息、只能猜**」。
+         而本分类器只认 `dsh-session-kit-` 前缀的载体 —— 它们全是 session-kit 在轮换
+         自己的记忆上下文快照（memory-context 一次事故、memory-eject 又一次），
+         与「用户删某一轮」毫无关系。
+         猜出整轮的代价是**一次吃掉几百个事件**（实测 -245 / -318 个真对话事件：
+         手机 session-7e75046b 712→467、电脑 session-afa6ba0b 2077→1759），
+         表现为「每重启一次 DSH 就少一大段对话」。
+         所以这里**一律只外科摘除被遮蔽的节点本身**，绝不整轮：宁可留一个无害的
+         孤儿标记，也不能切掉用户还活着的对话。
+         历史教训：memory-context 曾单独放行（这段原是等值判断），session-kit 加了
+         memory-eject 变体就又踩进来 —— 只有「按前缀一律外科」才不会第三次再犯。
+         同理不再用 legacy-turn-fallback / surfacepos 反推轮号：反推猜错一次就是
+         用户一大段对话，收益（清掉一个标记）远小于风险。 */
+      for (const sq of c.sourcesFor) if (Number.isFinite(sq) && byseq.has(sq)) surgical.add(sq);
       continue;
     }
     /* 轮次取值：surfaceOp 反推优先（见上方 turnOfSeq 注释），summary 兜底。 */

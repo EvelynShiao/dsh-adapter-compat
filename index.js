@@ -2572,132 +2572,6 @@ export function versionFamilyIds(home = dshHomeDir(), { ttlMs = 30000 } = {}) {
   return ids
 }
 
-/** 真删一个会话目录（含 projcache），返回释放字节数；live 会话拒删。 */
-export function deleteSessionDir(ctx, home, sid) {
-  const dirs = sessionDirs(home)
-  const info = dirs.get(sid)
-  if (!info) return { id: sid, status: 'not-found', freedMB: 0 }
-  if (isSessionLive(ctx, sid)) return { id: sid, status: 'live-refused', freedMB: 0 }
-  const freed = info.sizeBytes
-  try {
-    rmSync(info.dir, { recursive: true, force: true })
-    try { rmSync(`${home}/storages/session_projcache/sessions/${sid}.json`, { force: true }) } catch { /* ignore */ }
-    familyCache = { at: 0, ids: new Set() }
-    return { id: sid, status: 'deleted', freedMB: +(freed / 1048576).toFixed(2) }
-  } catch (error) {
-    return { id: sid, status: 'failed', error: String(error?.message ?? error), freedMB: 0 }
-  }
-}
-
-/** 版本家族路由：GET 清单 / POST 真删。 */
-export function installVersionsRoute(ctx, config = {}) {
-  if (config?.versionsPanel === false) return false
-  try {
-    const web = serviceOf(ctx, 'webServer')
-    if (!web || typeof web.register !== 'function') {
-      appendCompatLog('versions route: webServer unavailable')
-      return false
-    }
-    const reply = (res, status, obj) => {
-      try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
-    }
-    web.register({
-      kind: 'exact',
-      path: '/dsh-adapter-compat/versions',
-      handler: async (req, res) => {
-        if (req.method !== 'GET') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
-        try { return reply(res, 200, { ok: true, value: scanVersionFamilies() }) }
-        catch (e) { return reply(res, 500, { ok: false, error: String(e?.message ?? e) }) }
-      },
-    })
-    web.register({
-      kind: 'exact',
-      path: '/dsh-adapter-compat/versions/purge',
-      handler: async (req, res) => {
-        if (req.method !== 'POST') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
-        let body = ''
-        try {
-          for await (const chunk of req) { body += chunk; if (body.length > 65536) throw new Error('body too large') }
-          const parsed = JSON.parse(body || '{}')
-          const ids = Array.isArray(parsed?.ids) ? parsed.ids.filter((x) => typeof x === 'string' && x) : []
-          if (ids.length === 0) return reply(res, 400, { ok: false, error: 'ids required' })
-          if (parsed.write !== true) {
-            return reply(res, 200, {
-              ok: true,
-              dryRun: true,
-              results: ids.map((id) => ({ id, status: 'planned' })),
-            })
-          }
-          const home = dshHomeDir()
-          const results = ids.map((id) => deleteSessionDir(ctx, home, id))
-          const freedMB = +results.reduce((a, b) => a + (b.freedMB ?? 0), 0).toFixed(2)
-          appendCompatLog(`versions purge: freed ${freedMB}MB ids=${ids.join(' ')}`)
-          return reply(res, 200, { ok: true, results, freedMB })
-        } catch (error) {
-          return reply(res, 400, { ok: false, error: String(error?.message ?? error) })
-        }
-      },
-    })
-    appendCompatLog('versions route registered')
-    return true
-  } catch (e) {
-    appendCompatLog('versions route FAILED: ' + String(e?.message ?? e).slice(0, 200))
-    return false
-  }
-}
-
-/* ============ 第十二层：可见性清理（9999.9.26） ============
- *
- * 用户规则（2026-10-16 原话）：「我只要左边我用的能看见的，不看见的不要留着，
- * 从源头上断绝」。
- *
- * 判据来自宿主登记表 `storages/workspace.json`：
- *   - `tables.workspaces[<wid>].sessionIds` = 侧栏能选出来的会话（**正本**）
- *   - `global.archivedSessionIds`           = 收起但可展开的会话
- *   - 其余（盘上有文件、登记表里没有）= **不可见**，按用户规则属于「不用的副本」
- *
- * 实测：按此规则本机只剩 11 条 1.88MB 不可见（另 91 条 31.7MB 全在侧栏里），
- * 那次清理已执行（freedMB=1.88）。
- */
-
-/** 当前会话 id（DSH 注入环境变量；扫除器永远不碰它）。 */
-function currentSessionId() {
-  const v = process.env?.DSH_SESSION_ID
-  return typeof v === 'string' && v.length > 0 ? v : undefined
-}
-
-/**
- * 读宿主登记表，返回可见/归档/工作区三组 id。
- * 读不到时返回 null —— 调用方必须据此**放弃清理**
- * （宁可不清，也不能把可见会话当不可见删掉）。
- */
-export function readRegistryIds(home = dshHomeDir()) {
-  try {
-    const file = `${home}/storages/workspace.json`
-    if (!existsSync(file)) return null
-    const doc = JSON.parse(readFileSync(file, 'utf8'))
-    const tables = doc?.tables?.workspaces
-    /* ⚠️ 数组也是 object：不显式挡掉的话，tables.workspaces=[] 会通过校验、
-       visible 空集 → 全部会话被当成「不可见」→ 退化成全删（单测抓到过）。 */
-    if (!tables || typeof tables !== 'object' || Array.isArray(tables)) return null
-    const visible = new Set()
-    const workspaceIds = new Set()
-    for (const wid of Object.keys(tables)) {
-      workspaceIds.add(wid)
-      const rec = tables[wid]
-      if (Array.isArray(rec?.sessionIds)) for (const sid of rec.sessionIds) if (typeof sid === 'string') visible.add(sid)
-    }
-    const archived = new Set()
-    if (Array.isArray(doc?.global?.archivedSessionIds)) {
-      for (const sid of doc.global.archivedSessionIds) if (typeof sid === 'string') archived.add(sid)
-    }
-    return { visible, archived, workspaceIds }
-  } catch {
-    return null
-  }
-}
-
-/** 扫不可见会话：盘上有、登记表里任何列表都没有。 */
 export function scanInvisibleSessions(home = dshHomeDir()) {
   const reg = readRegistryIds(home)
   if (reg === null) {
@@ -2740,6 +2614,7 @@ export function scanInvisibleSessions(home = dshHomeDir()) {
 }
 
 /** 不可见会话路由：GET 清单 / POST 删除（不带 write 即干跑）。 */
+
 export function installInvisibleRoute(ctx, config = {}) {
   if (config?.invisiblePanel === false) return false
   try {
@@ -2807,6 +2682,7 @@ export function installInvisibleRoute(ctx, config = {}) {
  *
  * 默认**关**：真删不可逆，要用户在面板里显式打开（config.sweepInvisible === true）。
  */
+
 export function installInvisibleSweeper(ctx, config = {}) {
   if (config?.sweepInvisible !== true) {
     appendCompatLog('invisible sweeper: disabled (config.sweepInvisible !== true)')
@@ -2837,14 +2713,41 @@ export function installInvisibleSweeper(ctx, config = {}) {
       appendCompatLog(`invisible sweep(${trigger}) FAILED: ${String(error?.message ?? error)}`)
     }
   }
-  const first = setTimeout(() => run('boot'), 90e3)
-  const timer = setInterval(() => run('interval'), intervalMs)
-  if (typeof timer.unref === 'function') timer.unref()
-  appendCompatLog(`invisible sweeper: enabled (grace ${Math.round(graceMs / 60000)}min, interval ${Math.round(intervalMs / 60000)}min)`)
-  return () => { clearTimeout(first); clearInterval(timer) }
+  /* 自动扫除已取消（2026-10-16）：不再有 boot / interval 定时器，
+     只能由面板「一键清理不可见会话」显式触发一次 run()。 */  appendCompatLog(`invisible sweeper: enabled (grace ${Math.round(graceMs / 60000)}min, interval ${Math.round(intervalMs / 60000)}min)`)
+  return () => {}
 }
 
 /** 客户端半身自我报到路由：把浏览器侧的注册结果落进宿主日志（诊断用，带 UA 以区分爬。便于区分「浏览器没加载新代码」与「加载了但注册失败」）。 */
+
+export function readRegistryIds(home = dshHomeDir()) {
+  try {
+    const file = `${home}/storages/workspace.json`
+    if (!existsSync(file)) return null
+    const doc = JSON.parse(readFileSync(file, 'utf8'))
+    const tables = doc?.tables?.workspaces
+    /* ⚠️ 数组也是 object：不显式挡掉的话，tables.workspaces=[] 会通过校验、
+       visible 空集 → 全部会话被当成「不可见」→ 退化成全删（单测抓到过）。 */
+    if (!tables || typeof tables !== 'object' || Array.isArray(tables)) return null
+    const visible = new Set()
+    const workspaceIds = new Set()
+    for (const wid of Object.keys(tables)) {
+      workspaceIds.add(wid)
+      const rec = tables[wid]
+      if (Array.isArray(rec?.sessionIds)) for (const sid of rec.sessionIds) if (typeof sid === 'string') visible.add(sid)
+    }
+    const archived = new Set()
+    if (Array.isArray(doc?.global?.archivedSessionIds)) {
+      for (const sid of doc.global.archivedSessionIds) if (typeof sid === 'string') archived.add(sid)
+    }
+    return { visible, archived, workspaceIds }
+  } catch {
+    return null
+  }
+}
+
+/** 扫不可见会话：盘上有、登记表里任何列表都没有。 */
+
 export function installHelloRoute(ctx, config = {}) {
   if (config?.helloRoute === false) return false
   try {
@@ -2876,6 +2779,89 @@ export function installHelloRoute(ctx, config = {}) {
     return false
   }
 }
+
+/** 真删一个会话目录（含 projcache），返回释放字节数；live 会话拒删。 */
+export function deleteSessionDir(ctx, home, sid) {
+  const dirs = sessionDirs(home)
+  const info = dirs.get(sid)
+  if (!info) return { id: sid, status: 'not-found', freedMB: 0 }
+  if (isSessionLive(ctx, sid)) return { id: sid, status: 'live-refused', freedMB: 0 }
+  const freed = info.sizeBytes
+  try {
+    /* ⚠️ 语义就是**真删除**（用户的插件本来就叫 true-delete：删掉不留墓碑、不留副本）。
+        2026-10-16 曾被我加过「回收站」，用户否决：那不是真删除。
+        真正的护栏不在这里 —— 第一层防护是「**只允许显式用户操作触发**」：
+          · 自动扫除已停（sweepInvisible 默认 false，且不再有定时器）；
+          · 版本家族清理必须走面板两步确认；
+          · 墓碑切除的整轮误判已在 purge.js 修掉（memory-* 载体一律只外科摘除）。
+        调用方若来自自动化路径，请先回到「用户点了什么」这件事上重新想。 */
+    rmSync(info.dir, { recursive: true, force: true })
+    try { rmSync(`${home}/storages/session_projcache/sessions/${sid}.json`, { force: true }) } catch { /* ignore */ }
+    familyCache = { at: 0, ids: new Set() }
+    appendCompatLog(`true-delete: removed ${sid} (${(freed / 1048576).toFixed(2)}MB)`)
+    return { id: sid, status: 'deleted', freedMB: +(freed / 1048576).toFixed(2) }
+  } catch (error) {
+    return { id: sid, status: 'failed', error: String(error?.message ?? error), freedMB: 0 }
+  }
+}
+
+/** 版本家族路由：GET 清单 / POST 真删。 */
+export function installVersionsRoute(ctx, config = {}) {
+  if (config?.versionsPanel === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') {
+      appendCompatLog('versions route: webServer unavailable')
+      return false
+    }
+    const reply = (res, status, obj) => {
+      try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+    }
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/versions',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        try { return reply(res, 200, { ok: true, value: scanVersionFamilies() }) }
+        catch (e) { return reply(res, 500, { ok: false, error: String(e?.message ?? e) }) }
+      },
+    })
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/versions/purge',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        let body = ''
+        try {
+          for await (const chunk of req) { body += chunk; if (body.length > 65536) throw new Error('body too large') }
+          const parsed = JSON.parse(body || '{}')
+          const ids = Array.isArray(parsed?.ids) ? parsed.ids.filter((x) => typeof x === 'string' && x) : []
+          if (ids.length === 0) return reply(res, 400, { ok: false, error: 'ids required' })
+          if (parsed.write !== true) {
+            return reply(res, 200, {
+              ok: true,
+              dryRun: true,
+              results: ids.map((id) => ({ id, status: 'planned' })),
+            })
+          }
+          const home = dshHomeDir()
+          const results = ids.map((id) => deleteSessionDir(ctx, home, id))
+          const freedMB = +results.reduce((a, b) => a + (b.freedMB ?? 0), 0).toFixed(2)
+          appendCompatLog(`versions purge（用户显式操作）: freed ${freedMB}MB ids=${ids.join(' ')}`)
+          return reply(res, 200, { ok: true, results, freedMB })
+        } catch (error) {
+          return reply(res, 400, { ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    })
+    appendCompatLog('versions route registered')
+    return true
+  } catch (e) {
+    appendCompatLog('versions route FAILED: ' + String(e?.message ?? e).slice(0, 200))
+    return false
+  }
+}
+
 
 export function apply(ctx, config = {}) {
   // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
