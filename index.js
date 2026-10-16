@@ -92,6 +92,7 @@
 export const name = 'adapter-compat'
 
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, watch, writeFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { zstdCompressSync, constants as zstdConstants, zstdDecompressSync } from 'node:zlib'
 import { purgeSessionFile, readPendingLedger, writePendingLedger, assertRowsDense } from './purge.js'
 import { redactEventPayload, redactSessionFile } from './purge.js'
@@ -101,6 +102,24 @@ import { installWireTap, healBlankToolResults } from './wire-tap.js'
 import { slimSession } from './slim.js'
 import { repairEvents, scanFile, describeGap } from './repair.js'
 import { installOrderRoute } from './order.js'
+import {
+  installEgressNormalizer as installEgressNormalizerImpl,
+  stripLeadingThinking as stripLeadingThinkingPure,
+  isWebRoute,
+  egressStats,
+  EGRESS_NORMALIZER,
+} from './egress.js'
+
+/* 出口规范化的纯函数与判定再导出（单测/排查直接 import 本插件即可）。 */
+export {
+  stripLeadingThinking as stripLeadingThinkingPure,
+  parseXmlToolCalls,
+  stripXmlToolMarkers,
+  pushEgressDelta,
+  finalizeEgressText,
+  createEgressState,
+  isWebRoute,
+} from './egress.js'
 
 /* 与其他层一致地再导出（单测/排查直接 import 用）。 */
 export { installOrderRoute }
@@ -110,7 +129,7 @@ export const inject = ['llm', 'webServer']
 /** 标记已包装，防止热重载后二次包装。 */
 const WRAPPED = Symbol.for('dsh-adapter-compat.wrapped')
 
-/** thinking 标签过滤器标记（防止重复包装）。 */
+/** 历史标记名：旧版只装了 thinking 剥离，热重载时靠它判重。 */
 const THINK_FILTER = Symbol.for('dsh-adapter-compat.thinking-tag-filter')
 
 /** 自动压缩硬闸标记：挂在替换后的 compactIfNeeded 上。 */
@@ -2084,8 +2103,14 @@ const HEAL_STATE_FILE = 'adapter-compat-heal-state.json'
  *   watchDebounceMs 会话盘变化后的稳定防抖（越小越灵敏、越费 IO）
  *   watchPollMs     兜底轮询间隔（fs.watch 漏事件时用它发现变化）
  *   pressureCalibrationIntervalMs 校准重试间隔（0 = 只在启动那几轮跑一次）
+ * 枚举（字符串，只认白名单内的值，其余回默认）：
+ *   egressScope    出口规范化作用域：'all' 全局 | 'web' 只对网页端路由 | 'off' 关
+ *   egressXmlTools XML 式工具调用处理：'strip' 只剥标记（默认，安全）| 'convert' 转成真调用 | 'off' 不管
+ * 布尔：
+ *   egressThinking 是否剥正文开头的 <thinking> 段
  *
  * ⚠️ 这些值在**安装器启动时读一次** ⇒ 改完要重启 DSH 才生效（UI 上已注明）。
+ *    例外：egress* 三项是**每个请求现读**（走 llm/stream 瀑布时读），改完即生效。
  */
 const HEAL_DEFAULTS = {
   bootScan: false,
@@ -2101,6 +2126,14 @@ const HEAL_DEFAULTS = {
   watchDebounceMs: 1500,
   watchPollMs: 60000,
   pressureCalibrationIntervalMs: 0,
+  egressScope: 'all',
+  egressThinking: true,
+  egressXmlTools: 'strip',
+}
+/** 枚举选项的白名单（不在表内 = 非法，回 base 值）。 */
+const HEAL_ENUMS = {
+  egressScope: ['all', 'web', 'off'],
+  egressXmlTools: ['strip', 'convert', 'off'],
 }
 /** 数值选项的上下限（越界回退默认并记 problem）。 */
 const HEAL_NUMBER_LIMITS = {
@@ -2138,6 +2171,13 @@ function applyHealPatch(base, raw) {
       if (!Number.isFinite(n)) continue
       const lim = HEAL_NUMBER_LIMITS[k]
       value[k] = lim === undefined ? n : Math.min(lim.max, Math.max(lim.min, Math.round(n)))
+      continue
+    }
+    /* 枚举（字符串）：只认白名单内的值。大小写不敏感、去空白；非法一律保留 base 值。 */
+    const allowed = HEAL_ENUMS[k]
+    if (allowed !== undefined) {
+      const s = typeof v === 'string' ? v.trim().toLowerCase() : ''
+      if (allowed.includes(s)) value[k] = s
     }
   }
   return value
@@ -3099,123 +3139,113 @@ export function installManualRoutes(ctx, config = {}) {
   }
 }
 
-/* ============ 第十三层：正文里的 <thinking> 标签剥离（2026-10-16） ============
+/* ============ 第十三层：出口规范化（2026-10-17 重做） ============
  *
- * 症状（用户截图实证，session-1895273e / 模型 dsh:deepseek-v4.1-flash）：
- * **思考链被当正文打印**，正文里出现字面 `<thinking>…</thinking>`。
- * 实测：该消息正文长度 4896、reasoning 块长度 4896 —— 同一段思考既走了 reasoning
- * 通道、又被原样写进 content（另有多条「正文除标签外其余长度 = 0」，即整条回复只有思考）。
+ * 前身是 2026-10-16 的「正文 <thinking> 标签剥离」，**挂载点搞错了**：
+ * 它包的是 `ctx.llm.stream`，而主循环（dsh-agent-loop）走的是
+ * `preparedCall.stream(request)` → `LlmRuntime.streamWithRegistration` →
+ * `ctx.waterfall(this, 'llm/stream', …)` —— **根本不经过 llm.stream**。
+ * 证据：本插件日志里「剥离正文开头」计数恒为 0（装了，但从未被调到）。
  *
- * 这是上游 provider 的行为（inai.top 的 deepseek-v4.1-flash 把 thinking 塞进 content），
- * 不是 webin / our-free-model / 本插件产生的；DSH 只按块类型渲染，于是照实显示成正文。
+ * 现在统一挂 `llm/stream` 瀑布（provider 产出 chunk 的唯一必经点），
+ * 并扩到两类症状（都见 egress.js 顶部注释）：
+ *   ① 思考链被当正文（上游把 thinking 同时写进 content）
+ *   ② XML 式工具调用漏成正文（解析失败被原样吐出）
  *
- * 修法（垫片层，不动核心包）：包住 `ctx.llm.stream`，只剥掉**正文开头**的
- * `<thinking>…</thinking>` 段；正文**中间/后面**出现的标签一律保留（那可能是在引用
- * 别人的输出、或在讨论标签本身）。流式安全：标签可能被切在两个 delta 之间，
- * 用 pending 缓冲处理。
- * 关闭：cordis.patch.yml 本插件行 config.stripInlineThinking: false。
+ * 实现全在 egress.js（纯函数 + 流式状态机），这里只负责接线与配置读取。
+ * 关闭：cordis.patch.yml 本插件行 config.egressNormalize: false。
  */
 
-/** 正文开头是否以 `<thinking…>` 起头（允许前导空白；大小写不敏感、允许属性）。 */
-const THINK_OPEN_RE = /^\s*<thinking(\s[^>]*)?>/i
-
-/**
- * 剥离「正文开头」的 thinking 段（纯函数，便于单测与流式复用）。
- * @param {string} text - 累计要处理的正文（已含上次 pending）。
- * @param {boolean} inTag - 进入时是否已在 thinking 段内。
- * @returns {{text:string, inTag:boolean, changed:boolean, pending?:string}}
- */
+/** 思考标签剥离（薄封装，保留旧导出名给单测/排查用）。 */
 export function stripLeadingThinking(text, inTag = false) {
-  let out = text
-  let inside = inTag === true
-  let changed = false
-  for (;;) {
-    if (inside) {
-      const close = out.search(/<\/thinking>/i)
-      if (close === -1) {
-        /* 闭合标签可能也被切开了（`…</thin`）：把结尾的半个标签留进 pending，
-           否则下一段补上的 `king>` 永远拼不回来 —— 后面的正文会被永久吞掉
-           （单测抓到过）。 */
-        const partial = /<\/?t?h?i?n?k?i?n?g?$/i.exec(out)
-        return { text: '', inTag: true, changed: true, pending: partial === null ? '' : partial[0] }
-      }
-      out = out.slice(close + '</thinking>'.length)
-      inside = false
-      changed = true
-      continue
-    }
-    const m = THINK_OPEN_RE.exec(out)
-    if (m === null) {
-      /* 开头不是 thinking 标签。若看起来像「半个开标签」（`<thin` 之类），缓冲等下一段。 */
-      const looksPartial = /^\s*<[a-z]*$/i.test(out)
-      if (looksPartial) return { text: '', inTag: false, changed, pending: out }
-      return { text: out, inTag: false, changed }
-    }
-    const close = out.search(/<\/thinking>/i)
-    if (close === -1) return { text: '', inTag: true, changed: true }     // 开标签完整、闭合还没来
-    out = out.slice(close + '</thinking>'.length)
-    changed = true
-  }
+  return stripLeadingThinkingPure(text, inTag)
 }
 
 /**
- * 包住 ctx.llm.stream，剥离正文开头的 thinking 段。
- * @returns {boolean} 是否安装成功
+ * 装出口规范化器。作用域与开关全部走 heal options（设置页可改，重启生效）：
+ *   egressScope: 'all' | 'web' | 'off'   （web = 只对网页端路由生效）
+ *   egressThinking: boolean
+ *   egressXmlTools: 'strip' | 'convert' | 'off'
+ */
+export function installEgressNormalizer(ctx, config = {}) {
+  return installEgressNormalizerImpl(ctx, config, {
+    log: (line) => appendCompatLog(line),
+    readOptions: () => readHealOptions(),
+  })
+}
+
+/**
+ * 向后兼容别名（旧名）。旧实现是包 `ctx.llm.stream` —— **那条路主循环根本不走**，
+ * 所以旧版实际上没生效；这里直接指向新的正确实现，避免旧配置/脚本引用悬空。
  */
 export function installThinkingTagFilter(ctx, config = {}) {
-  if (config?.stripInlineThinking === false) {
-    appendCompatLog('thinking tag filter: disabled (config.stripInlineThinking === false)')
-    return false
-  }
+  return installEgressNormalizer(ctx, config)
+}
+
+/**
+ * 自检状态：供两端（电脑/手机）一眼确认出口规范化到底装没装、有没有生效。
+ * 2026-10-16 用户「搬到手机后思考链又出现在正文」——最常见原因就是那台机器上的
+ * adapter-compat 还是旧版（没有本层）。
+ */
+export function pluginSelfCheck(ctx) {
   const llm = ctx?.llm ?? (typeof ctx?.get === 'function' ? ctx.get('llm') : undefined)
-  if (!llm || typeof llm.stream !== 'function') {
-    appendCompatLog('thinking tag filter: llm.stream unavailable')
+  const heals = readHealOptions()
+  let installed = false
+  try { installed = llm?.[EGRESS_NORMALIZER] === true } catch { installed = false }
+  let version = 'unknown'
+  try {
+    const here = fileURLToPath(import.meta.url)
+    const pkg = JSON.parse(readFileSync(`${here.replace(/[\\/][^\\/]*$/, '')}/../package.json`, 'utf8'))
+    version = String(pkg.version ?? 'unknown')
+  } catch { /* ignore */ }
+  return {
+    version,
+    egress: {
+      installed,
+      scope: heals.egressScope,
+      thinking: heals.egressThinking !== false,
+      xmlToolCalls: heals.egressXmlTools,
+      stats: { ...egressStats },
+    },
+    cadence: {
+      changeRescan: heals.changeRescan !== false,
+      changePurge: heals.changePurge !== false,
+      changeHeadGuard: heals.changeHeadGuard !== false,
+      watchDebounceMs: heals.watchDebounceMs,
+      watchPollMs: heals.watchPollMs,
+      bootTitleWarm: heals.bootTitleWarm !== false,
+      bootHeadGuard: heals.bootHeadGuard !== false,
+      bootTrueDelete: heals.bootTrueDelete !== false,
+      pressureCalibration: heals.pressureCalibration !== false,
+      pressureCalibrationIntervalMs: heals.pressureCalibrationIntervalMs,
+    },
+  }
+}
+
+/** 自检路由：GET /dsh-adapter-compat/selfcheck（手机端也能 curl 一眼看）。 */
+export function installSelfCheckRoute(ctx, config = {}) {
+  if (config?.selfCheckRoute === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') return false
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/selfcheck',
+      handler: async (req, res) => {
+        try {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ ok: true, value: pluginSelfCheck(ctx) }, null, 1))
+        } catch (error) {
+          try { res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify({ ok: false, error: String(error?.message ?? error) })) } catch { /* ignore */ }
+        }
+      },
+    })
+    appendCompatLog('selfcheck route registered')
+    return true
+  } catch (e) {
+    appendCompatLog('selfcheck route FAILED: ' + String(e?.message ?? e).slice(0, 200))
     return false
   }
-  if (llm.stream[THINK_FILTER] === true) return true
-  const original = llm.stream
-  let logged = false
-  const wrapped = function streamWithThinkingFilter(...args) {
-    const inner = original.apply(this, args)
-    if (!inner || typeof inner[Symbol.asyncIterator] !== 'function') return inner
-    return (async function* () {
-      const state = new Map()   // 每个 block index 一份：pending 缓冲 + 是否在 thinking 段内
-      for await (const chunk of inner) {
-        if (chunk === null || typeof chunk !== 'object') { yield chunk; continue }
-        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-          const key = chunk.index ?? 0
-          const st = state.get(key) ?? { pending: '', inTag: false }
-          const r = stripLeadingThinking(st.pending + chunk.text, st.inTag)
-          st.pending = r.pending ?? ''
-          st.inTag = r.inTag
-          state.set(key, st)
-          if (r.changed && !logged) {
-            logged = true
-            appendCompatLog('thinking tag filter: 剥离正文开头的 <thinking> 段（上游把思考写进了 content）')
-          }
-          if (r.text === '') continue
-          yield { ...chunk, text: r.text }
-          continue
-        }
-        if (chunk.type === 'block-end' && chunk.block?.type === 'text' && typeof chunk.block.text === 'string') {
-          const key = chunk.index ?? 0
-          const st = state.get(key) ?? { pending: '', inTag: false }
-          const r = stripLeadingThinking(st.pending + chunk.block.text, st.inTag)
-          state.delete(key)
-          yield { ...chunk, block: { ...chunk.block, text: r.text } }
-          continue
-        }
-        yield chunk
-      }
-    })()
-  }
-  try { Object.defineProperty(wrapped, THINK_FILTER, { value: true }) } catch { /* ignore */ }
-  try { llm.stream = wrapped } catch {
-    appendCompatLog('thinking tag filter: llm.stream 不可写，跳过')
-    return false
-  }
-  appendCompatLog('thinking tag filter: installed')
-  return true
 }
 
 export function apply(ctx, config = {}) {
@@ -3282,11 +3312,18 @@ export function apply(ctx, config = {}) {
     /* 路由注册失败绝不拖垮 apply */
   }
 
-  // -3.7) 正文里的 <thinking> 标签剥离（上游把思考写进 content；越早装越好）
+  // -3.7) 出口规范化（思考链/XML 工具调用被当正文；挂 llm/stream 瀑布，越早装越好）
   try {
-    installThinkingTagFilter(ctx, config)
+    installEgressNormalizer(ctx, config)
   } catch {
-    /* 过滤器装不上不能拖垮 apply */
+    /* 规范化装不上不能拖垮 apply */
+  }
+
+  // -3.71) 自检路由（两端一眼确认版本与出口规范化状态）
+  try {
+    installSelfCheckRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
   }
 
   /* -3.56) 开机一次性扫（2026-10-13 用户定案）：
