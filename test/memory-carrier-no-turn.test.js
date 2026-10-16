@@ -18,7 +18,7 @@ import assert from 'node:assert/strict'
 import { planPurge, classifyTombstoneCarrier } from '../purge.js'
 
 /** 造一段会话：3 个完整轮次，每轮里有若干真消息。 */
-function sessionWithCarrier(carrierKind, { carrierInTurn = 3, summary = undefined } = {}) {
+function sessionWithCarrier(carrierKind, { carrierInTurn = 3, summary = undefined, markRotation = false } = {}) {
   const events = []
   let seq = 0
   const push = (e) => { seq += 1; events.push({ seq, ...e }) }
@@ -37,7 +37,14 @@ function sessionWithCarrier(carrierKind, { carrierInTurn = 3, summary = undefine
     type: 'user/message',
     surfaceOp: { op: 'replace', startSeq: shadowedSeq, endSeq: shadowedSeq },
     sourceEventSeqs: [shadowedSeq],
-    data: { turn: carrierInTurn, source: { kind: carrierKind, ...(summary === undefined ? {} : { summary: JSON.stringify(summary) }) } },
+    data: {
+      turn: carrierInTurn,
+      source: {
+        kind: carrierKind,
+        ...(markRotation ? { snapshotRotation: true } : {}),
+        ...(summary === undefined ? {} : { summary: JSON.stringify(summary) }),
+      },
+    },
   })
   return { events, shadowedSeq, carrierSeq: seq }
 }
@@ -75,6 +82,17 @@ test('将来再加 -memory-xxx 变体：一律不整轮（治本：不再靠 kin
     const { events } = sessionWithCarrier(kind)
     const plan = planPurge(events, { purgeRegenerate: true, sinceMs: 0 })
     assert.deepEqual(plan.turns, [], `${kind} 不得整轮`)
+  }
+})
+
+test('显式标记 snapshotRotation 优先于 kind 前缀（换名字也不会误判）', () => {
+  /* session-kit 现在给快照轮换事件加 `source.snapshotRotation = true`。
+     万一它以后把 kind 改成不带 `-memory-` 的名字，只要带标记就必须走「只外科摘除」。 */
+  for (const kind of ['dsh-session-kit-snapshot-rotate', 'dsh-session-kit-whatever-future']) {
+    const { events } = sessionWithCarrier(kind, { markRotation: true })
+    const plan = planPurge(events, { purgeRegenerate: true, sinceMs: 0 })
+    assert.deepEqual(plan.turns, [], `${kind}（带标记）不得整轮`)
+    assert.ok(plan.remove.length < 5, `${kind} 删除量应为个位数（实际 ${plan.remove.length}）`)
   }
 })
 

@@ -126,6 +126,19 @@ export function planPurge(events, options = {}) {
   const surgical = new Set();
   const skipped = [];
   for (const e of events) {
+    /* 【双保险 · 2026-10-16】session-kit 的快照轮换事件现在自带显式标记
+       `source.snapshotRotation === true`（见 dsh-session-kit/lib/memory.js）。判据优先级：
+       **显式标记 > kind 前缀** —— 这样即使 session-kit 以后再加一个不叫 `-memory-*` 的变体，
+       也不会再被当成删轮墓碑而整轮切除。 */
+    const src0 = e.data?.source ?? e.data?.message?.source;
+    const isRotation = src0?.snapshotRotation === true
+      || (typeof src0?.kind === 'string' && src0.kind.startsWith('dsh-session-kit-memory'));
+    if (isRotation && e.surfaceOp && typeof e.surfaceOp === 'object' && e.surfaceOp.op === 'replace') {
+      if (sinceMs !== undefined && !(Number.isFinite(e.time) && e.time >= sinceMs)) continue;
+      const seqs0 = Array.isArray(e.sourceEventSeqs) ? e.sourceEventSeqs : [];
+      for (const sq of seqs0) if (Number.isFinite(sq) && byseq.has(sq)) surgical.add(sq);
+      continue;
+    }
     const c = classifyTombstoneCarrier(e, { purgeRegenerate });
     if (!c) {
       /* delete-turn 遮蔽（kind=plugin:dsh-delete-turn）：分类器只认 dsh-session-kit- 前缀
