@@ -320,6 +320,7 @@ window.__ModuleLoader__.load({
        compactionFileMode / compactionFileThresholdChars；
        webin 每次请求都 readConfig() 现读，所以改完即时生效、不用重启。 */
     const EXIT_PREFS = '/dsh-adapter-compat/exit-prefs'
+    const HELLO = '/dsh-adapter-compat/client-hello'
     /** session-kit 在「会话与提示词」分区里声明的子插槽（见它对 settings.section 的 children 表）。 */
     const SK_EXTRA = 'dsh-session-kit.settings.extra'
     const PAGER_SELECTOR = '[data-dsh-easyrewrite="version-pager"]'
@@ -793,23 +794,35 @@ window.__ModuleLoader__.load({
          兜底：session-kit 不在时保留独立分区（order 36）；子插槽一旦挂上就撤掉兜底，避免重复。 */
       let standaloneExitDispose = null
       let nestedExitActive = false
+      let injectThrew = ''
       try {
         ctx.effect(() => ctx.slots.inject(SK_EXTRA, () => {
-          nestedExitActive = true
           try {
-            if (typeof standaloneExitDispose === 'function') {
-              standaloneExitDispose()
-              standaloneExitDispose = null
-            }
-          } catch { /* ignore */ }
-          return ctx.slots.register({
-            name: SK_EXTRA,
-            id: `${NS}-exit`,
-            order: 0,
-          }, ExitSection)
+            const dispose = ctx.slots.register({
+              name: SK_EXTRA,
+              id: `${NS}-exit`,
+              order: 0,
+            }, ExitSection)
+            /* ⚠️ 只有**注册成功**才置位。上一版先置位再注册：register 一旦抛错
+               （槽位其实没声明），标志位已是 true ⇒ 兜底分区被静默跳过 ⇒ 两边都不显示。
+               这就是「压缩出口根本不出现」的根因。 */
+            nestedExitActive = true
+            try {
+              if (typeof standaloneExitDispose === 'function') {
+                standaloneExitDispose()
+                standaloneExitDispose = null
+              }
+            } catch { /* ignore */ }
+            return dispose
+          } catch (error) {
+            injectThrew = String(error && error.message ? error.message : error).slice(0, 120)
+            nestedExitActive = false
+            return () => {}
+          }
         }), `${NS}: exit section (session-kit sub-slot)`)
-      } catch {
-        /* 注册失败不影响插件其余部分 */
+      } catch (error) {
+        injectThrew = String(error && error.message ? error.message : error).slice(0, 120)
+        nestedExitActive = false
       }
       try {
         ctx.effect(() => ctx.slots.inject('settings.section', () => {
@@ -832,6 +845,25 @@ window.__ModuleLoader__.load({
         fetchJson(EXIT_PREFS).then((r) => {
           if (r.ok && r.data && r.data.value) applyPagerHidden(r.data.value.hideVersionPager !== false)
         }).catch(() => { /* 读不到就保持默认（不隐藏），不影响其它功能 */ })
+      } catch {
+        /* ignore */
+      }
+      /* 报到（诊断）：把浏览器侧的真实注册结果写进宿主日志 —— 我自己 curl 不会带这个 marker，
+         所以日志里出现 marker=adapter-client 就证明**浏览器确实加载了这一版**。 */
+      try {
+        let skExtraEntries = -1
+        try { skExtraEntries = typeof ctx.slots.entries === 'function' ? ctx.slots.entries(SK_EXTRA).length : -1 } catch { /* ignore */ }
+        fetch(HELLO, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            marker: 'adapter-client-9999.9.30',
+            nested: nestedExitActive,
+            fallback: typeof standaloneExitDispose === 'function',
+            skExtraEntries,
+            injectThrew,
+          }),
+        }).catch(() => { /* 报到失败无关功能 */ })
       } catch {
         /* ignore */
       }

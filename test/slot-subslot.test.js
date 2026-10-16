@@ -61,9 +61,16 @@ function applyAdapter(core, pending) {
   let standaloneDispose = null
   let nestedActive = false
   ctx.slots.inject(SK_EXTRA, () => {
-    nestedActive = true
-    if (typeof standaloneDispose === 'function') { standaloneDispose(); standaloneDispose = null }
-    return ctx.slots.register({ name: SK_EXTRA, id: 'adapter-compat-exit', order: 0 }, () => null)
+    try {
+      const dispose = ctx.slots.register({ name: SK_EXTRA, id: 'adapter-compat-exit', order: 0 }, () => null)
+      /* 只有注册成功才置位 —— 见「register 抛错」那条回归测试 */
+      nestedActive = true
+      if (typeof standaloneDispose === 'function') { standaloneDispose(); standaloneDispose = null }
+      return dispose
+    } catch {
+      nestedActive = false
+      return () => {}
+    }
   })
   ctx.slots.inject('settings.section', () => {
     if (nestedActive) return () => {}
@@ -121,4 +128,35 @@ test('注册进未声明的槽位确实会抛（锁住这条约束本身）', { 
   const core = new SlotCore()
   declareHost(core)
   assert.throws(() => core.register({ name: 'nobody.declared.this', id: 'x' }, () => null), /is not declared/)
+})
+
+/**
+ * 回归（2026-10-16 实测事故）：inject 回调里**先置位再注册**时，一旦 register 抛错，
+ * 兜底分区会被静默跳过 ⇒ 「压缩出口」在两处都不出现。修法是成功后才置位。
+ * 这里用一个「SK_EXTRA 声明存在但 register 会抛」的假 core 复现那条路径。
+ */
+test('register 抛错时必须保留兜底分区（回归：曾经静默跳过导致两处都不显示）', () => {
+  const records = new Map([
+    ['settings.section', { spec: { kind: 'list', scope: 'root' }, entries: [] }],
+    [SK_EXTRA, { spec: { kind: 'list', scope: 'root' }, entries: [] }],
+  ])
+  const entriesOf = (name) => records.get(name).entries
+  const fakeCore = {
+    records,
+    entries: entriesOf,
+    register(options) {
+      if (options.name === SK_EXTRA) throw new Error(`slot "${SK_EXTRA}" is not declared (fake)`)
+      const entry = { options }
+      records.get(options.name).entries.push(entry)
+      return () => {
+        const list = records.get(options.name).entries
+        const i = list.indexOf(entry)
+        if (i >= 0) list.splice(i, 1)
+      }
+    },
+  }
+  const pending = []
+  applyAdapter(fakeCore, pending)
+  const ids = entriesOf('settings.section').map((e) => e.options.id)
+  assert.deepEqual(ids, ['adapter-compat-exit-standalone'], '注册失败时兜底必须还在')
 })

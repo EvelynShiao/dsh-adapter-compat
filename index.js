@@ -2844,6 +2844,39 @@ export function installInvisibleSweeper(ctx, config = {}) {
   return () => { clearTimeout(first); clearInterval(timer) }
 }
 
+/** 客户端半身自我报到路由：把浏览器侧的注册结果落进宿主日志（诊断用，带 UA 以区分爬。便于区分「浏览器没加载新代码」与「加载了但注册失败」）。 */
+export function installHelloRoute(ctx, config = {}) {
+  if (config?.helloRoute === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') return false
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/client-hello',
+      handler: async (req, res) => {
+        const reply = (status, obj) => {
+          try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+        }
+        if (req.method !== 'POST') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        let body = ''
+        try {
+          for await (const chunk of req) { body += chunk; if (body.length > 16384) throw new Error('body too large') }
+          const f = JSON.parse(body || '{}')
+          const ua = String(req.headers['user-agent'] ?? '').slice(0, 110)
+          appendCompatLog(`client-hello marker=${f.marker ?? '?'} nested=${f.nested} fallback=${f.fallback} skExtraEntries=${f.skExtraEntries} injectThrew=${f.injectThrew ?? '-'} renderSlotSeen=${f.renderSlotSeen ?? '-'} ua=${ua}`)
+          return reply(res, 200, { ok: true })
+        } catch (error) {
+          return reply(res, 400, { ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    })
+    return true
+  } catch (e) {
+    appendCompatLog('hello route FAILED: ' + String(e?.message ?? e).slice(0, 200))
+    return false
+  }
+}
+
 export function apply(ctx, config = {}) {
   // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
   try {
@@ -2876,6 +2909,13 @@ export function apply(ctx, config = {}) {
   // -3.58) 版本家族清单 + 手动清理路由（不依赖 llm）
   try {
     installVersionsRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.59) 客户端自我报到路由（诊断：区分「浏览器缓存旧代码」与「注册失败」）
+  try {
+    installHelloRoute(ctx, config)
   } catch {
     /* 路由注册失败绝不拖垮 apply */
   }
