@@ -75,6 +75,11 @@ window.__ModuleLoader__.load({
       verGuard: '旧版本受保护（不自动真删）',
       verGuardDesc: '切换版本时另一个分支会被标墓碑，本插件的真删除默认跳过这些家族成员，只记账不动刀',
       verNote: '清理是真删（不留副本），正在运行的会话会被跳过',
+      /* 不可见会话（2026-10-16 用户规则：看不见的不要留） */
+      invNav: '不可见会话清理',
+      invDesc: '左边侧栏选不出来的会话（盘上有文件、宿主登记表里没有）——按「只要看得见的」规则属于残留',
+      invSweepNote: '自动扫除（开机 + 每 10 分钟）需要用户显式开启；当前默认关，避免误删刚分叉还没登记的会话',
+      invNote: '删除是真删不留副本；正在运行的会话会被跳过',
       /* 会话日志修复分区文案（2026-10-13） */
       healNav: '会话日志修复',
       healDesc: '清理会话日志里的残缺工具结果（断流/加载失败留下），修复前自动备份',
@@ -530,6 +535,91 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'ac-settings' }, head, summary, protection, ...famRows, foot)
     }
 
+    /* ── 不可见会话（侧栏选不出来的）（9999.9.26）──────────────────
+       用户规则：「我只要左边我用的能看见的，不看见的不要留着，从源头上断绝」。
+       判据 = 宿主登记表 storages/workspace.json：
+         tables.workspaces[].sessionIds = 侧栏能选出来的（正本）
+         global.archivedSessionIds      = 收起可展开的
+         其余（盘上有文件、登记表没有）= 不可见 → 清理对象
+       注：DSH 登记表没有「移除会话」API，所以侧栏里点不开的空条目
+       （登记了但文件已删）只能停机改文件；这里只处理「文件存在但看不见」。 */
+    const INVISIBLE = '/dsh-adapter-compat/invisible'
+    const INVISIBLE_PURGE = '/dsh-adapter-compat/invisible/purge'
+
+    function InvisibleSection() {
+      const [data, setData] = useState(null)
+      const [note, setNote] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [confirming, setConfirming] = useState(false)
+
+      const load = useCallback(async () => {
+        try {
+          const r = await fetchJson(INVISIBLE)
+          if (r.ok && r.data && r.data.value) setData(r.data.value)
+          else setNote('读取失败')
+        } catch { setNote('读取失败') }
+      }, [])
+
+      useEffect(() => { void load() }, [load])
+
+      const purge = async () => {
+        setBusy(true)
+        setNote('')
+        try {
+          const r = await fetchJson(INVISIBLE_PURGE, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ write: true }),
+          })
+          if (r.ok && r.data && r.data.ok) {
+            const refused = (r.data.results || []).filter((x) => x.status === 'live-refused').length
+            setNote(`已释放 ${r.data.freedMB ?? 0} MB${refused > 0 ? `（${refused} 条运行中跳过）` : ''}`)
+            await load()
+          } else setNote('清理失败：' + String(r.data && r.data.error ? r.data.error : '未知'))
+        } catch (e) {
+          setNote('清理失败：' + String(e && e.message ? e.message : e))
+        } finally {
+          setBusy(false)
+          setConfirming(false)
+        }
+      }
+
+      const head = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.invNav),
+          h('div', { className: 'ac-row-desc' }, ZH.invDesc)),
+        h('button', { className: 'ac-btn', onClick: () => void load() }, '刷新'))
+
+      if (!data) {
+        return h('div', { className: 'ac-settings' }, head, h('div', { className: 'ac-row-desc' }, note || '正在扫描…'))
+      }
+      if (data.ok !== true) {
+        return h('div', { className: 'ac-settings' }, head, h('div', { className: 'ac-row-desc' }, data.reason || '扫描不可用'))
+      }
+
+      const summary = h('div', { className: 'ac-row' },
+        h('div', { className: 'ac-row-desc' },
+          data.sessions.length === 0
+            ? `干净：${data.visibleCount ?? 0} 条可见会话，没有看不见的残留`
+            : `不可见 ${data.sessions.length} 条 · ${data.totalMB} MB（可见 ${data.visibleCount ?? 0} 条）`))
+
+      const rows = data.sessions.slice(0, 12).map((s) => h('div', { key: s.id, className: 'ac-row-desc', style: { fontFamily: 'monospace' } },
+        `${s.id.slice(0, 26)}  ${s.sizeMB}MB  ${s.mtime}（${s.ageMinutes} 分钟前）`))
+
+      const actionRow = h('div', { className: 'ac-row' },
+        h('div', { className: 'ac-row-desc' }, ZH.invSweepNote),
+        h('div', { style: { display: 'flex', gap: '8px' } },
+          data.sessions.length === 0
+            ? null
+            : (confirming
+              ? h('button', { className: 'ac-btn', disabled: busy, onClick: () => void purge() }, `确认删除 ${data.sessions.length} 条`)
+              : h('button', { className: 'ac-btn', disabled: busy, onClick: () => setConfirming(true) }, '一键清理不可见会话')),
+          confirming ? h('button', { className: 'ac-btn', onClick: () => setConfirming(false) }, '取消') : null))
+
+      return h('div', { className: 'ac-settings' }, head, summary, actionRow, ...rows,
+        h('div', { className: 'ac-row' }, h('div', { className: 'ac-row-desc' }, note || ZH.invNote)))
+    }
+
     function HealSection() {      const [opts, setOpts] = useState({ bootScan: false, sendScan: false, skipUnchanged: false })
       const [loaded, setLoaded] = useState(false)
       const [saving, setSaving] = useState(false)
@@ -690,6 +780,17 @@ window.__ModuleLoader__.load({
           order: 38,
           label: ZH.exitNav,
         }, ExitSection)), `${NS}: exit section`)
+      } catch {
+        /* 注册失败不影响插件其余部分 */
+      }
+      /* 2026-10-16：设置页第四个分区「不可见会话清理」（order 40）。 */
+      try {
+        ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
+          name: 'settings.section',
+          id: `${NS}-invisible`,
+          order: 40,
+          label: ZH.invNav,
+        }, InvisibleSection)), `${NS}: invisible section`)
       } catch {
         /* 注册失败不影响插件其余部分 */
       }

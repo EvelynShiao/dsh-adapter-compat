@@ -291,3 +291,40 @@ node --test test/compat.test.js test/gate.test.js test/guard.test.js test/inbox-
 ## License
 
 MIT
+
+## 第十二层：可见性清理（9999.9.26）
+
+用户规则（原话）：「我只要左边我用的能看见的，不看见的不要留着，从源头上断绝」。
+
+判据来自宿主登记表 `storages/workspace.json`：
+
+| 来源 | 含义 | 处理 |
+|---|---|---|
+| `tables.workspaces[<wid>].sessionIds` | 侧栏能选出来的会话 | **正本，保留** |
+| `global.archivedSessionIds` | 收起但能展开的 | 保留 |
+| 盘上有文件、登记表里都没有 | **不可见** | 清理对象 |
+
+实测（本机）：可见 91 条 / 31.75 MB，不可见 11 条 / 1.88 MB —— 那 11 条已按此规则删除（freedMB=1.88）。
+注意：3~4.6 MB 的大文件全在侧栏里（是正本），所以「删所有分叉」会误删在用会话。
+
+### 自动扫除（默认关，本机已在 cordis.patch.yml 打开）
+
+`sweepInvisible: true` 后：开机 90s 首扫 + 每 10 分钟一次，删「不可见 && 非 live && 静默超 30 分钟」的会话。
+
+四道安全阀（缺一不可，任一不满足就跳过）：
+
+1. 登记表读不到 / 结构异常（含 `tables.workspaces` 是数组）→ 整轮放弃；
+2. `DSH_SESSION_ID` 指向的当前会话 → 永不删；
+3. live（内存里活着）→ 跳过；
+4. 静默未满宽限（默认 30 分钟）→ 跳过（刚分叉/刚建那会儿会话还没登记）。
+
+另有一条兜底闸：**可见数为 0 而盘上却有会话 ⇒ 拒绝清理**（疑似登记表被重置，否则一次就把所有会话扫光）。
+
+### 已知限制（诚实说明）
+
+DSH 的 workspace registry **没有「移除会话」API**（只有 create / rename / delete 工作区 / insertBefore /
+insertSessionBefore / archive / unarchive / pin）。所以侧栏里那些「登记了但文件已删」的空条目只能
+**停机改 workspace.json**：`clean-dangling.cjs`（干跑默认，`--apply` 才写，写前自动备份）——
+2026-10-16 已清掉 18 条 archived 残留。
+
+单测：`node --test test/invisible.test.js`（可见/归档/workspace-id/登记表损坏四档）。

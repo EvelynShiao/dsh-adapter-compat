@@ -2646,6 +2646,204 @@ export function installVersionsRoute(ctx, config = {}) {
   }
 }
 
+/* ============ 第十二层：可见性清理（9999.9.26） ============
+ *
+ * 用户规则（2026-10-16 原话）：「我只要左边我用的能看见的，不看见的不要留着，
+ * 从源头上断绝」。
+ *
+ * 判据来自宿主登记表 `storages/workspace.json`：
+ *   - `tables.workspaces[<wid>].sessionIds` = 侧栏能选出来的会话（**正本**）
+ *   - `global.archivedSessionIds`           = 收起但可展开的会话
+ *   - 其余（盘上有文件、登记表里没有）= **不可见**，按用户规则属于「不用的副本」
+ *
+ * 实测：按此规则本机只剩 11 条 1.88MB 不可见（另 91 条 31.7MB 全在侧栏里），
+ * 那次清理已执行（freedMB=1.88）。
+ */
+
+/** 当前会话 id（DSH 注入环境变量；扫除器永远不碰它）。 */
+function currentSessionId() {
+  const v = process.env?.DSH_SESSION_ID
+  return typeof v === 'string' && v.length > 0 ? v : undefined
+}
+
+/**
+ * 读宿主登记表，返回可见/归档/工作区三组 id。
+ * 读不到时返回 null —— 调用方必须据此**放弃清理**
+ * （宁可不清，也不能把可见会话当不可见删掉）。
+ */
+export function readRegistryIds(home = dshHomeDir()) {
+  try {
+    const file = `${home}/storages/workspace.json`
+    if (!existsSync(file)) return null
+    const doc = JSON.parse(readFileSync(file, 'utf8'))
+    const tables = doc?.tables?.workspaces
+    /* ⚠️ 数组也是 object：不显式挡掉的话，tables.workspaces=[] 会通过校验、
+       visible 空集 → 全部会话被当成「不可见」→ 退化成全删（单测抓到过）。 */
+    if (!tables || typeof tables !== 'object' || Array.isArray(tables)) return null
+    const visible = new Set()
+    const workspaceIds = new Set()
+    for (const wid of Object.keys(tables)) {
+      workspaceIds.add(wid)
+      const rec = tables[wid]
+      if (Array.isArray(rec?.sessionIds)) for (const sid of rec.sessionIds) if (typeof sid === 'string') visible.add(sid)
+    }
+    const archived = new Set()
+    if (Array.isArray(doc?.global?.archivedSessionIds)) {
+      for (const sid of doc.global.archivedSessionIds) if (typeof sid === 'string') archived.add(sid)
+    }
+    return { visible, archived, workspaceIds }
+  } catch {
+    return null
+  }
+}
+
+/** 扫不可见会话：盘上有、登记表里任何列表都没有。 */
+export function scanInvisibleSessions(home = dshHomeDir()) {
+  const reg = readRegistryIds(home)
+  if (reg === null) {
+    return { ok: false, reason: 'workspace.json 读不到或结构异常 —— 放弃扫描（避免误删可见会话）', sessions: [], totalMB: 0, visibleCount: 0 }
+  }
+  const dirs = sessionDirs(home)
+  const out = []
+  let totalBytes = 0
+  for (const [sid, info] of dirs) {
+    if (reg.visible.has(sid) || reg.archived.has(sid) || reg.workspaceIds.has(sid)) continue
+    totalBytes += info.sizeBytes
+    out.push({
+      id: sid,
+      sizeMB: +(info.sizeBytes / 1048576).toFixed(2),
+      mtimeMs: info.mtimeMs,
+      mtime: new Date(info.mtimeMs).toISOString().slice(0, 16).replace('T', ' '),
+      ageMinutes: Math.round((Date.now() - info.mtimeMs) / 60000),
+    })
+  }
+  out.sort((a, b) => b.sizeMB - a.sizeMB)
+  /* 安全闸：可见数为 0 而盘上却有会话 —— 只可能是登记表被重置/损坏。
+     这时「一切皆残留」的判断不可信，拒绝清理（否则一次就把所有会话扫光）。 */
+  if (reg.visible.size === 0 && out.length > 0) {
+    return {
+      ok: false,
+      reason: `登记表里一条可见会话都没有，但盘上有 ${out.length} 条 —— 疑似登记表异常，拒绝清理`,
+      sessions: [],
+      totalMB: 0,
+      visibleCount: 0,
+    }
+  }
+  return {
+    ok: true,
+    sessions: out,
+    totalMB: +(totalBytes / 1048576).toFixed(2),
+    totalBytes,
+    visibleCount: reg.visible.size,
+    scannedAt: new Date().toISOString(),
+  }
+}
+
+/** 不可见会话路由：GET 清单 / POST 删除（不带 write 即干跑）。 */
+export function installInvisibleRoute(ctx, config = {}) {
+  if (config?.invisiblePanel === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') {
+      appendCompatLog('invisible route: webServer unavailable')
+      return false
+    }
+    const reply = (res, status, obj) => {
+      try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+    }
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/invisible',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        try { return reply(res, 200, { ok: true, value: scanInvisibleSessions() }) }
+        catch (e) { return reply(res, 500, { ok: false, error: String(e?.message ?? e) }) }
+      },
+    })
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/invisible/purge',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        let body = ''
+        try {
+          for await (const chunk of req) { body += chunk; if (body.length > 65536) throw new Error('body too large') }
+          const parsed = JSON.parse(body || '{}')
+          const home = dshHomeDir()
+          const scan = scanInvisibleSessions(home)
+          if (scan.ok !== true) return reply(res, 409, { ok: false, error: scan.reason })
+          const wanted = Array.isArray(parsed?.ids) && parsed.ids.length > 0
+            ? scan.sessions.filter((s) => parsed.ids.includes(s.id))
+            : scan.sessions
+          if (wanted.length === 0) return reply(res, 200, { ok: true, results: [], freedMB: 0, note: '没有不可见会话' })
+          if (parsed.write !== true) {
+            return reply(res, 200, { ok: true, dryRun: true, results: wanted.map((s) => ({ id: s.id, status: 'planned', sizeMB: s.sizeMB })) })
+          }
+          const results = wanted.map((s) => deleteSessionDir(ctx, home, s.id))
+          const freedMB = +results.reduce((a, b) => a + (b.freedMB ?? 0), 0).toFixed(2)
+          appendCompatLog(`invisible purge: freed ${freedMB}MB of ${wanted.length} (${results.filter((r) => r.status === 'deleted').length} deleted)`)
+          return reply(res, 200, { ok: true, results, freedMB })
+        } catch (error) {
+          return reply(res, 400, { ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    })
+    appendCompatLog('invisible route registered')
+    return true
+  } catch (e) {
+    appendCompatLog('invisible route FAILED: ' + String(e?.message ?? e).slice(0, 200))
+    return false
+  }
+}
+
+/**
+ * 扫除器：把「不可见 && 非 live && 静默超过宽限」的会话定期真删。
+ *
+ * 安全阀（缺一不可；任何一个不满足就跳过，宁可留着）：
+ *   1. 登记表读不到 → 整轮放弃；
+ *   2. 是当前会话（DSH_SESSION_ID）→ 永不删；
+ *   3. live（内存里活着）→ 跳过，交给下一轮；
+ *   4. 静默未满宽限（默认 30 分钟）→ 跳过（刚分叉/刚建那会儿会话还没登记）。
+ *
+ * 默认**关**：真删不可逆，要用户在面板里显式打开（config.sweepInvisible === true）。
+ */
+export function installInvisibleSweeper(ctx, config = {}) {
+  if (config?.sweepInvisible !== true) {
+    appendCompatLog('invisible sweeper: disabled (config.sweepInvisible !== true)')
+    return () => {}
+  }
+  const home = dshHomeDir()
+  const graceMs = Number.isFinite(config?.sweepGraceMs) ? Number(config.sweepGraceMs) : 30 * 60e3
+  const intervalMs = Number.isFinite(config?.sweepIntervalMs) ? Number(config.sweepIntervalMs) : 10 * 60e3
+  const run = (trigger) => {
+    try {
+      const scan = scanInvisibleSessions(home)
+      if (scan.ok !== true) { appendCompatLog(`invisible sweep(${trigger}): skipped — ${scan.reason}`); return }
+      const now = Date.now()
+      const me = currentSessionId()
+      const targets = scan.sessions.filter((s) => s.id !== me && now - s.mtimeMs > graceMs && !isSessionLive(ctx, s.id))
+      if (targets.length === 0) {
+        appendCompatLog(`invisible sweep(${trigger}): nothing to do (${scan.sessions.length} invisible, all within grace or live)`)
+        return
+      }
+      let freed = 0
+      const done = []
+      for (const t of targets) {
+        const r = deleteSessionDir(ctx, home, t.id)
+        if (r.status === 'deleted') { freed += r.freedMB ?? 0; done.push(t.id) }
+      }
+      appendCompatLog(`invisible sweep(${trigger}): deleted ${done.length}, freed ${freed.toFixed(2)}MB [${done.join(' ')}]`)
+    } catch (error) {
+      appendCompatLog(`invisible sweep(${trigger}) FAILED: ${String(error?.message ?? error)}`)
+    }
+  }
+  const first = setTimeout(() => run('boot'), 90e3)
+  const timer = setInterval(() => run('interval'), intervalMs)
+  if (typeof timer.unref === 'function') timer.unref()
+  appendCompatLog(`invisible sweeper: enabled (grace ${Math.round(graceMs / 60000)}min, interval ${Math.round(intervalMs / 60000)}min)`)
+  return () => { clearTimeout(first); clearInterval(timer) }
+}
+
 export function apply(ctx, config = {}) {
   // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
   try {
@@ -2680,6 +2878,20 @@ export function apply(ctx, config = {}) {
     installVersionsRoute(ctx, config)
   } catch {
     /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.59) 不可见会话（侧栏选不出来的）清单 + 清理路由
+  try {
+    installInvisibleRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.60) 不可见扫除器（默认关，面板里显式打开）
+  try {
+    installInvisibleSweeper(ctx, config)
+  } catch {
+    /* 扫除器起不来不拖垮 apply */
   }
 
   /* -3.56) 开机一次性扫（2026-10-13 用户定案）：
