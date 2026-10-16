@@ -1,5 +1,36 @@
 # dsh-adapter-compat
 
+### 9999.9.33：删除守卫 —— 可见会话永不真删
+
+**事故（2026-10-16，双侧实测）**：真删除把 `dsh-session-kit` 的记忆快照轮换事件
+（`kind = dsh-session-kit-memory-eject`）误判成「用户删轮墓碑」，按被遮蔽节点的
+`data.turn` 反推出整轮 → `excise` 整轮物理切除。实测手机 `session-7e75046b` 712→467、
+电脑 `session-afa6ba0b` 2077→1759；表现是「每重启一次 DSH 就少一大段对话」，
+而**用户没有删任何东西**。另有一次人工误操作：用 API 调 `/versions/purge`
+删掉 11 个在侧栏里**用户看得见**的会话（6 个无法找回）。
+
+三层加固（本次提交）：
+
+1. **整轮切除的误判修掉**（`purge.js`）：`needsNodeLookup` 分支**一律只外科摘除被遮蔽节点**，
+   绝不整轮。该类载体只可能来自 `dsh-session-kit-` 前缀（`memory-context` / `memory-eject` /
+   将来的变体），与「用户删轮」无关；不再用 `legacy-turn-fallback` / `surfacepos` 猜轮号
+   —— 猜错一次就是用户几百个事件。真实备份干跑复验：要删事件 245/318 → 2/2/7，整轮 0。
+2. **删除守卫**（`guardDeletion`，所有真删入口强制经过）：
+   - 登记表（`storages/workspace.json` 的 `sessionIds` / `archivedSessionIds`）里的
+     **可见会话 → 硬拒绝**（不是提示，是拒绝执行，`confirmBulk` 也无效）；
+   - 当前会话（`DSH_SESSION_ID`）→ 拒绝；
+   - 一次超过 3 个 → 必须显式 `confirmBulk: true`。
+3. **取消一切自动删除**：`installInvisibleSweeper` 的 boot / interval 定时器移除，
+   只能由面板按钮显式触发一次；`cordis.patch.yml` 里 `sweepInvisible: false`。
+   真删除保持**真删除**语义（不加回收站——用户否决：「这不是真删除」）。
+
+顺带修掉一个潜伏 bug：`currentSessionId()` 被调用但**从未定义**（HEAD 里就是悬空的），
+扫除器一旦运行就会 `ReferenceError`；守卫上线后被单测抓到并补上定义。
+
+测试：`test/memory-carrier-no-turn.test.js`（4 例：eject / context / 未来变体 / 带 turn 也不整轮）、
+`test/delete-guard.test.js`（7 例：可见拒绝 / 归档保护 / 批量上限 / 登记表坏形状 / 空输入）。
+全量 139 通过 / 0 失败。
+
 ### 9999.9.23：统一清除正文占位
 
 瘦身、墓碑清除、缺失结果修复与请求出口统一使用 `[内容已清除]`，明确标识正文不可用，不再生成含义不明的 `[NaN]`。墓碑清除先擦正文再填占位，防止占位被二次擦空；缺失工具名单独使用协议标识符 `unknown_tool`。不批量改写既有历史或非空工具输出。

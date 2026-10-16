@@ -2651,14 +2651,16 @@ export function installInvisibleRoute(ctx, config = {}) {
             ? scan.sessions.filter((s) => parsed.ids.includes(s.id))
             : scan.sessions
           if (wanted.length === 0) return reply(res, 200, { ok: true, results: [], freedMB: 0, note: '没有不可见会话' })
+          /* 删除守卫（可见会话硬拒绝 + 批量需 confirmBulk）——见 guardDeletion 注释。 */
+          const guard = guardDeletion(home, wanted.map((s) => s.id), parsed)
+          if (guard.ok !== true) return reply(res, 409, { ok: false, error: guard.error, details: guard.details })
           if (parsed.write !== true) {
             return reply(res, 200, { ok: true, dryRun: true, results: wanted.map((s) => ({ id: s.id, status: 'planned', sizeMB: s.sizeMB })) })
           }
           const results = wanted.map((s) => deleteSessionDir(ctx, home, s.id))
           const freedMB = +results.reduce((a, b) => a + (b.freedMB ?? 0), 0).toFixed(2)
           appendCompatLog(`invisible purge: freed ${freedMB}MB of ${wanted.length} (${results.filter((r) => r.status === 'deleted').length} deleted)`)
-          return reply(res, 200, { ok: true, results, freedMB })
-        } catch (error) {
+          return reply(res, 200, { ok: true, results, freedMB })        } catch (error) {
           return reply(res, 400, { ok: false, error: String(error?.message ?? error) })
         }
       },
@@ -2744,6 +2746,66 @@ export function readRegistryIds(home = dshHomeDir()) {
   } catch {
     return null
   }
+}
+
+/**
+ * 当前 DSH 会话 id（进程环境变量 DSH_SESSION_ID）。
+ *
+ * ⚠️ 2026-10-16 补：这个函数被 installInvisibleSweeper 与 guardDeletion 调用，
+ * 但**从未定义过**（HEAD 里就是悬空的）——扫除器一旦真正运行就会 ReferenceError。
+ * 扫除器长期处于 disabled，所以这个坑一直没炸；守卫上线后被单测抓到。
+ * @returns 会话 id；环境变量缺失时返回空串（调用方按「不匹配」处理）。
+ */
+export function currentSessionId(env = process.env) {
+  const v = env?.DSH_SESSION_ID
+  return typeof v === 'string' ? v : ''
+}
+
+/**
+ * 删除守卫（2026-10-16 事故后新增，所有真删入口必须过这里）。
+ *
+ * 事故背景：我一次 `/versions/purge` 用 API 删掉 11 个会话，而它们在侧栏里
+ * 是用户**看得见**的。真删除不可逆（其中有 6 个再也找不回来）。
+ * 所以把「用户可见的会话」做成**硬拒绝**——不是提示、不是默认值，是拒绝执行。
+ *
+ * 三条规则：
+ *   ① 登记表里可见（workspace.json 的 sessionIds / archivedSessionIds）→ 拒绝，永不删；
+ *   ② 一次超过 BULK_LIMIT 个 → 必须显式 confirmBulk:true（防脚本/误操作批量误删）；
+ *   ③ 当前会话（DSH_SESSION_ID）→ 拒绝。
+ *
+ * @returns {{ok:true} | {ok:false, error:string, details?:object}}
+ */
+export const BULK_DELETE_LIMIT = 3
+
+export function guardDeletion(home, ids, options = {}) {
+  const list = (Array.isArray(ids) ? ids : []).filter((x) => typeof x === 'string' && x)
+  if (list.length === 0) return { ok: false, error: '没有指定要删除的会话' }
+
+  const me = currentSessionId()
+  const selfHit = list.filter((id) => id === me)
+  if (selfHit.length > 0) return { ok: false, error: '拒绝删除当前正在使用的会话', details: { ids: selfHit } }
+
+  const reg = readRegistryIds(home)
+  if (reg !== null) {
+    const visible = list.filter((id) => reg.visible.has(id) || reg.archived.has(id))
+    if (visible.length > 0) {
+      appendCompatLog(`删除守卫拦下 ${visible.length} 个「可见会话」: ${visible.slice(0, 6).join(' ')}`)
+      return {
+        ok: false,
+        error: `拒绝删除 ${visible.length} 个在侧栏里可见的会话（可见会话永不自动删除；要删请在会话列表里手动删）`,
+        details: { visible: visible.slice(0, 20) },
+      }
+    }
+  }
+
+  if (list.length > BULK_DELETE_LIMIT && options.confirmBulk !== true) {
+    return {
+      ok: false,
+      error: `一次删除 ${list.length} 个会话超过上限 ${BULK_DELETE_LIMIT}，需要显式 confirmBulk:true（防误操作批量误删）`,
+      details: { count: list.length, ids: list.slice(0, 20) },
+    }
+  }
+  return { ok: true }
 }
 
 /** 扫不可见会话：盘上有、登记表里任何列表都没有。 */
@@ -2837,6 +2899,10 @@ export function installVersionsRoute(ctx, config = {}) {
           const parsed = JSON.parse(body || '{}')
           const ids = Array.isArray(parsed?.ids) ? parsed.ids.filter((x) => typeof x === 'string' && x) : []
           if (ids.length === 0) return reply(res, 400, { ok: false, error: 'ids required' })
+          const home0 = dshHomeDir()
+          /* 删除守卫：可见会话硬拒绝、批量需 confirmBulk —— 2026-10-16 我就是在这里一次删了 11 个。 */
+          const guard0 = guardDeletion(home0, ids, parsed)
+          if (guard0.ok !== true) return reply(res, 409, { ok: false, error: guard0.error, details: guard0.details })
           if (parsed.write !== true) {
             return reply(res, 200, {
               ok: true,
