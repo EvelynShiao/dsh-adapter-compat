@@ -320,6 +320,8 @@ window.__ModuleLoader__.load({
        compactionFileMode / compactionFileThresholdChars；
        webin 每次请求都 readConfig() 现读，所以改完即时生效、不用重启。 */
     const EXIT_PREFS = '/dsh-adapter-compat/exit-prefs'
+    /** session-kit 在「会话与提示词」分区里声明的子插槽（见它对 settings.section 的 children 表）。 */
+    const SK_EXTRA = 'dsh-session-kit.settings.extra'
     const PAGER_SELECTOR = '[data-dsh-easyrewrite="version-pager"]'
     const EXIT_MODE_LABELS = {
       never: 'never · 不走网页（压缩请求直接拒绝）',
@@ -783,19 +785,44 @@ window.__ModuleLoader__.load({
         /* 注册失败不影响插件其余部分 */
       }
 
-      /* 2026-10-16（用户要求）：版本家族与不可见会话清理**并入**「会话日志修复」
-         （见 HealSection 里的两个折叠块），不再单开顶级分区；
-         压缩出口分区排到 order 36 —— 正好贴在 session-kit「会话与提示词」(35) 下面。
-         为什么不真嵌套：设置导航是**扁平**的（settings.section 条目按 order 排），
-         插槽 API 没有 parent/子插槽；真嵌套要改 session-kit 的 client.js，
-         而它是上游干净版 —— 不动别人的文件。 */
+      /* 2026-10-16（用户要求「session-kit 也弄吧」）：压缩出口**真正挂进**
+         「会话与提示词」分区内部 —— session-kit 已在它的 settings.section 注册里
+         声明子插槽 `dsh-session-kit.settings.extra`（children 表）并在组件里 renderSlot。
+         slot 机制：注册进未声明的槽位会抛「is not declared」⇒ 走 ctx.slots.inject，
+         它按声明 epoch 触发；声明不出现就永不触发（= session-kit 没装/没开也不报错）。
+         兜底：session-kit 不在时保留独立分区（order 36）；子插槽一旦挂上就撤掉兜底，避免重复。 */
+      let standaloneExitDispose = null
+      let nestedExitActive = false
       try {
-        ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
-          name: 'settings.section',
-          id: `${NS}-exit`,
-          order: 36,
-          label: ZH.exitNav,
-        }, ExitSection)), `${NS}: exit section`)
+        ctx.effect(() => ctx.slots.inject(SK_EXTRA, () => {
+          nestedExitActive = true
+          try {
+            if (typeof standaloneExitDispose === 'function') {
+              standaloneExitDispose()
+              standaloneExitDispose = null
+            }
+          } catch { /* ignore */ }
+          return ctx.slots.register({
+            name: SK_EXTRA,
+            id: `${NS}-exit`,
+            order: 0,
+          }, ExitSection)
+        }), `${NS}: exit section (session-kit sub-slot)`)
+      } catch {
+        /* 注册失败不影响插件其余部分 */
+      }
+      try {
+        ctx.effect(() => ctx.slots.inject('settings.section', () => {
+          if (nestedExitActive) return () => {}
+          const dispose = ctx.slots.register({
+            name: 'settings.section',
+            id: `${NS}-exit-standalone`,
+            order: 36,
+            label: ZH.exitNav,
+          }, ExitSection)
+          standaloneExitDispose = dispose
+          return dispose
+        }), `${NS}: exit section (fallback)`)
       } catch {
         /* 注册失败不影响插件其余部分 */
       }

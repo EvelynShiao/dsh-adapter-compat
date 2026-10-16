@@ -1,6 +1,6 @@
 {
   "name": "dsh-adapter-compat",
-  "version": "9999.9.28",
+  "version": "9999.9.29",
   "description": "DSH LLM adapter 兼容垫片八合一（回填 LlmAdapter 基类方法 / 自动压缩硬闸 / settings null-Config 防崩守卫 / 上下文占用中文化校准 / 会话盘监视+标题投影预热 / 压缩 .txt 出口设置 / 版本分页器开关 / 版本家族保护+磁盘清理）：修复 imageRequestPricing 缺失导致的 /compact 静默失败；从代码层关闭自动压缩（手动 /compact 不受影响）；把 cordis 固化的 null runtime.Config 归一为 undefined，修复模型页打不开、设置保存失败、Agent 预设切换不可用（宿主 describe/write 一崩全崩）；把 contextPressure 的启发式外推按实测倍率校准，修中文会话「显示还剩 10% 却报超 1M 上限」；监视 sessions 目录，dsh-sync 下载落盘后自动重扫列表并全盘补齐会话标题投影，不用再重启；**压缩摘要跟随「当前选中模型」**（修「在 UI 里切了模型、但还没发过消息，/compact 仍打旧模型」——摘要请求的 latest 取自 request/header，而该事件只在请求真正派发时写入；本层把摘要目标钉到 modelSelection 投影的 pending ?? lastUsed）；**压缩 .txt 出口设置**（设置页手动选 never/auto/always + 阈值；值写真源仍写 webin 的 config.json，webin 每请求现读故改完即时生效，只勾分页器开关时不动 webin 配置）；**版本分页器开关**（分叉会话/改过对话后出现的「版本切换」按钮，默认隐藏——只注入 CSS 隐藏 data-dsh-easyrewrite=version-pager，不动 dsh-easyrewrite 的文件）；**版本家族保护 + 磁盘清理**（分叉=复制父会话历史、header 记 parentSession，实测 17 条 21.97MB；真删除默认跳过家族成员，避免切换版本时把另一分支物理切除；设置页列家族体积、可按家族手动清理旧版本）。独立于任何被保护插件——不改它的文件，pnpm install 装回旧版也照样生效；也与配置文件无关，cordis.patch.yml 被覆盖也不失效。",
   "type": "module",
   "main": "index.js",
