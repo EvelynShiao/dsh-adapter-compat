@@ -110,6 +110,9 @@ export const inject = ['llm', 'webServer']
 /** 标记已包装，防止热重载后二次包装。 */
 const WRAPPED = Symbol.for('dsh-adapter-compat.wrapped')
 
+/** thinking 标签过滤器标记（防止重复包装）。 */
+const THINK_FILTER = Symbol.for('dsh-adapter-compat.thinking-tag-filter')
+
 /** 自动压缩硬闸标记：挂在替换后的 compactIfNeeded 上。 */
 export const GATED = Symbol.for('dsh-adapter-compat.compaction-gate')
 
@@ -3096,6 +3099,125 @@ export function installManualRoutes(ctx, config = {}) {
   }
 }
 
+/* ============ 第十三层：正文里的 <thinking> 标签剥离（2026-10-16） ============
+ *
+ * 症状（用户截图实证，session-1895273e / 模型 dsh:deepseek-v4.1-flash）：
+ * **思考链被当正文打印**，正文里出现字面 `<thinking>…</thinking>`。
+ * 实测：该消息正文长度 4896、reasoning 块长度 4896 —— 同一段思考既走了 reasoning
+ * 通道、又被原样写进 content（另有多条「正文除标签外其余长度 = 0」，即整条回复只有思考）。
+ *
+ * 这是上游 provider 的行为（inai.top 的 deepseek-v4.1-flash 把 thinking 塞进 content），
+ * 不是 webin / our-free-model / 本插件产生的；DSH 只按块类型渲染，于是照实显示成正文。
+ *
+ * 修法（垫片层，不动核心包）：包住 `ctx.llm.stream`，只剥掉**正文开头**的
+ * `<thinking>…</thinking>` 段；正文**中间/后面**出现的标签一律保留（那可能是在引用
+ * 别人的输出、或在讨论标签本身）。流式安全：标签可能被切在两个 delta 之间，
+ * 用 pending 缓冲处理。
+ * 关闭：cordis.patch.yml 本插件行 config.stripInlineThinking: false。
+ */
+
+/** 正文开头是否以 `<thinking…>` 起头（允许前导空白；大小写不敏感、允许属性）。 */
+const THINK_OPEN_RE = /^\s*<thinking(\s[^>]*)?>/i
+
+/**
+ * 剥离「正文开头」的 thinking 段（纯函数，便于单测与流式复用）。
+ * @param {string} text - 累计要处理的正文（已含上次 pending）。
+ * @param {boolean} inTag - 进入时是否已在 thinking 段内。
+ * @returns {{text:string, inTag:boolean, changed:boolean, pending?:string}}
+ */
+export function stripLeadingThinking(text, inTag = false) {
+  let out = text
+  let inside = inTag === true
+  let changed = false
+  for (;;) {
+    if (inside) {
+      const close = out.search(/<\/thinking>/i)
+      if (close === -1) {
+        /* 闭合标签可能也被切开了（`…</thin`）：把结尾的半个标签留进 pending，
+           否则下一段补上的 `king>` 永远拼不回来 —— 后面的正文会被永久吞掉
+           （单测抓到过）。 */
+        const partial = /<\/?t?h?i?n?k?i?n?g?$/i.exec(out)
+        return { text: '', inTag: true, changed: true, pending: partial === null ? '' : partial[0] }
+      }
+      out = out.slice(close + '</thinking>'.length)
+      inside = false
+      changed = true
+      continue
+    }
+    const m = THINK_OPEN_RE.exec(out)
+    if (m === null) {
+      /* 开头不是 thinking 标签。若看起来像「半个开标签」（`<thin` 之类），缓冲等下一段。 */
+      const looksPartial = /^\s*<[a-z]*$/i.test(out)
+      if (looksPartial) return { text: '', inTag: false, changed, pending: out }
+      return { text: out, inTag: false, changed }
+    }
+    const close = out.search(/<\/thinking>/i)
+    if (close === -1) return { text: '', inTag: true, changed: true }     // 开标签完整、闭合还没来
+    out = out.slice(close + '</thinking>'.length)
+    changed = true
+  }
+}
+
+/**
+ * 包住 ctx.llm.stream，剥离正文开头的 thinking 段。
+ * @returns {boolean} 是否安装成功
+ */
+export function installThinkingTagFilter(ctx, config = {}) {
+  if (config?.stripInlineThinking === false) {
+    appendCompatLog('thinking tag filter: disabled (config.stripInlineThinking === false)')
+    return false
+  }
+  const llm = ctx?.llm ?? (typeof ctx?.get === 'function' ? ctx.get('llm') : undefined)
+  if (!llm || typeof llm.stream !== 'function') {
+    appendCompatLog('thinking tag filter: llm.stream unavailable')
+    return false
+  }
+  if (llm.stream[THINK_FILTER] === true) return true
+  const original = llm.stream
+  let logged = false
+  const wrapped = function streamWithThinkingFilter(...args) {
+    const inner = original.apply(this, args)
+    if (!inner || typeof inner[Symbol.asyncIterator] !== 'function') return inner
+    return (async function* () {
+      const state = new Map()   // 每个 block index 一份：pending 缓冲 + 是否在 thinking 段内
+      for await (const chunk of inner) {
+        if (chunk === null || typeof chunk !== 'object') { yield chunk; continue }
+        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+          const key = chunk.index ?? 0
+          const st = state.get(key) ?? { pending: '', inTag: false }
+          const r = stripLeadingThinking(st.pending + chunk.text, st.inTag)
+          st.pending = r.pending ?? ''
+          st.inTag = r.inTag
+          state.set(key, st)
+          if (r.changed && !logged) {
+            logged = true
+            appendCompatLog('thinking tag filter: 剥离正文开头的 <thinking> 段（上游把思考写进了 content）')
+          }
+          if (r.text === '') continue
+          yield { ...chunk, text: r.text }
+          continue
+        }
+        if (chunk.type === 'block-end' && chunk.block?.type === 'text' && typeof chunk.block.text === 'string') {
+          const key = chunk.index ?? 0
+          const st = state.get(key) ?? { pending: '', inTag: false }
+          const r = stripLeadingThinking(st.pending + chunk.block.text, st.inTag)
+          state.delete(key)
+          yield { ...chunk, block: { ...chunk.block, text: r.text } }
+          continue
+        }
+        yield chunk
+      }
+    })()
+  }
+  try { Object.defineProperty(wrapped, THINK_FILTER, { value: true }) } catch { /* ignore */ }
+  try { llm.stream = wrapped } catch {
+    appendCompatLog('thinking tag filter: llm.stream 不可写，跳过')
+    return false
+  }
+  appendCompatLog('thinking tag filter: installed')
+  return true
+}
+
 export function apply(ctx, config = {}) {
   // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
   try {
@@ -3158,6 +3280,13 @@ export function apply(ctx, config = {}) {
     installManualRoutes(ctx, config)
   } catch {
     /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.7) 正文里的 <thinking> 标签剥离（上游把思考写进 content；越早装越好）
+  try {
+    installThinkingTagFilter(ctx, config)
+  } catch {
+    /* 过滤器装不上不能拖垮 apply */
   }
 
   /* -3.56) 开机一次性扫（2026-10-13 用户定案）：

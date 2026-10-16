@@ -1,5 +1,30 @@
 # dsh-adapter-compat
 
+### 9999.9.36：正文里的 `<thinking>` 标签剥离（思考链不再被当正文打印）
+
+**症状**（用户截图 + 日志实证，`session-1895273e`，模型 `dsh:deepseek-v4.1-flash`）：
+助手消息的**思考链被当正文打印**，正文里出现字面 `<thinking>…</thinking>` ——
+界面上先有正常的「思考」条目，紧接着同一段内容又原样出现在正文里。
+
+**实证**：该消息正文长度 **4896**、reasoning 块长度 **4896**，同一段思考**既走了
+reasoning 通道、又被写进 `content`**；另有多条「正文除标签外其余长度 = 0」，
+即整条回复只有思考、没有正文。
+
+**归属**：这是**上游 provider 的行为**（inai.top 的 `deepseek-v4.1-flash` 把 thinking
+塞进 content），不是 webin / our-free-model / 本插件产生的。DSH 只按块类型渲染，
+于是照实显示成正文。
+
+**修法（垫片层，不动核心包）**：包住 `ctx.llm.stream`，剥掉**正文开头**的
+`<thinking>…</thinking>` 段：
+
+- 只剥开头那段；正文**中间/后面**出现的标签一律保留（可能是引用别人的输出、或讨论标签本身）；
+- **流式安全**：标签被切在两个 delta 之间用 `pending` 缓冲；闭合标签被切开
+  （`…</thin` + `king>`）也能拼回 —— 单测抓到过「否则后面的正文被永久吞掉」；
+- `block-end` 里的整段文本一并处理（只改 delta 不改 block-end，界面仍会显示旧全文）；
+- 关掉：`cordis.patch.yml` 本插件行 `config.stripInlineThinking: false`。
+
+单测：`node --test test/thinking-strip.test.js`（9 例）。全量 154 通过 / 0 失败。
+
 ### 9999.9.35：扫描与校准频率全部做成开关（含手动触发）
 
 **用户实测的负载**（近 1 小时日志）：`sessions changed` **932 次**、`invisible` 394、
