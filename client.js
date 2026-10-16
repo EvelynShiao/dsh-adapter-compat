@@ -546,7 +546,8 @@ window.__ModuleLoader__.load({
     const INVISIBLE = '/dsh-adapter-compat/invisible'
     const INVISIBLE_PURGE = '/dsh-adapter-compat/invisible/purge'
 
-    function InvisibleSection() {
+    /** 不可见会话子块 —— 嵌在「会话日志修复」分区里（2026-10-16 用户要求：紧致点，别单开顶级分区）。 */
+    function InvisibleBlock() {
       const [data, setData] = useState(null)
       const [note, setNote] = useState('')
       const [busy, setBusy] = useState(false)
@@ -590,20 +591,26 @@ window.__ModuleLoader__.load({
           h('div', { className: 'ac-row-desc' }, ZH.invDesc)),
         h('button', { className: 'ac-btn', onClick: () => void load() }, '刷新'))
 
-      if (!data) {
-        return h('div', { className: 'ac-settings' }, head, h('div', { className: 'ac-row-desc' }, note || '正在扫描…'))
-      }
-      if (data.ok !== true) {
-        return h('div', { className: 'ac-settings' }, head, h('div', { className: 'ac-row-desc' }, data.reason || '扫描不可用'))
-      }
+      const wrap = (...kids) => h('div', {
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '8px',
+          borderTop: '1px solid var(--dsw-alias-border-subtle, #3333)',
+          paddingTop: '10px',
+          marginTop: '4px',
+        },
+      }, head, ...kids)
 
-      const summary = h('div', { className: 'ac-row' },
-        h('div', { className: 'ac-row-desc' },
-          data.sessions.length === 0
-            ? `干净：${data.visibleCount ?? 0} 条可见会话，没有看不见的残留`
-            : `不可见 ${data.sessions.length} 条 · ${data.totalMB} MB（可见 ${data.visibleCount ?? 0} 条）`))
+      if (!data) return wrap(h('div', { className: 'ac-row-desc' }, note || '正在扫描…'))
+      if (data.ok !== true) return wrap(h('div', { className: 'ac-row-desc' }, data.reason || '扫描不可用'))
 
-      const rows = data.sessions.slice(0, 12).map((s) => h('div', { key: s.id, className: 'ac-row-desc', style: { fontFamily: 'monospace' } },
+      const summary = h('div', { className: 'ac-row-desc' },
+        data.sessions.length === 0
+          ? `干净：${data.visibleCount ?? 0} 条可见会话，没有看不见的残留`
+          : `不可见 ${data.sessions.length} 条 · ${data.totalMB} MB（可见 ${data.visibleCount ?? 0} 条）`)
+
+      const rows = data.sessions.slice(0, 8).map((s) => h('div', { key: s.id, className: 'ac-row-desc', style: { fontFamily: 'monospace' } },
         `${s.id.slice(0, 26)}  ${s.sizeMB}MB  ${s.mtime}（${s.ageMinutes} 分钟前）`))
 
       const actionRow = h('div', { className: 'ac-row' },
@@ -616,8 +623,7 @@ window.__ModuleLoader__.load({
               : h('button', { className: 'ac-btn', disabled: busy, onClick: () => setConfirming(true) }, '一键清理不可见会话')),
           confirming ? h('button', { className: 'ac-btn', onClick: () => setConfirming(false) }, '取消') : null))
 
-      return h('div', { className: 'ac-settings' }, head, summary, actionRow, ...rows,
-        h('div', { className: 'ac-row' }, h('div', { className: 'ac-row-desc' }, note || ZH.invNote)))
+      return wrap(summary, actionRow, ...rows, h('div', { className: 'ac-row-desc' }, note || ZH.invNote))
     }
 
     function HealSection() {      const [opts, setOpts] = useState({ bootScan: false, sendScan: false, skipUnchanged: false })
@@ -732,7 +738,8 @@ window.__ModuleLoader__.load({
             checkRow('skipUnchanged', ZH.healSkip, ZH.healSkipDesc),
             buttons,
             reportBlock,
-            fixBlock)
+            fixBlock,
+            h(InvisibleBlock))
         : h('div', { className: 'ac-row-desc' }, '加载选项…')
 
       return h('div', { className: 'ac-settings' }, head, body)
@@ -783,17 +790,8 @@ window.__ModuleLoader__.load({
       } catch {
         /* 注册失败不影响插件其余部分 */
       }
-      /* 2026-10-16：设置页第四个分区「不可见会话清理」（order 40）。 */
-      try {
-        ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
-          name: 'settings.section',
-          id: `${NS}-invisible`,
-          order: 40,
-          label: ZH.invNav,
-        }, InvisibleSection)), `${NS}: invisible section`)
-      } catch {
-        /* 注册失败不影响插件其余部分 */
-      }
+      /* 2026-10-16（用户要求「紧致点」）：不可见会话清理**并入**「会话日志修复」分区，
+         不再单开顶级分区 —— 上面的 HealSection 里渲染 h(InvisibleBlock)。 */
       try {
         fetchJson(EXIT_PREFS).then((r) => {
           if (r.ok && r.data && r.data.value) applyPagerHidden(r.data.value.hideVersionPager !== false)
