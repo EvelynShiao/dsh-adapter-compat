@@ -173,6 +173,48 @@ curl -X POST http://127.0.0.1:<port>/dsh-adapter-compat/repair-session \
 若余额不足或网络不通，压缩仍会失败——区别是它现在会老实按你选的那个打，而且切完模型
 立刻生效，不需要先成功发一条消息。
 
+## 第十层：压缩 .txt 出口设置 + 版本分页器开关（9999.9.24）
+
+用户要求（2026-10-16）：「点了分叉会话或修改过对话后下面总有『版本切换』按钮，
+能不能禁了」+「`.txt 出口设置` 改到 Adapter 插件上」。
+
+### ① 「版本切换」按钮默认隐藏
+
+那个按钮是 **dsh-easyrewrite** 的版本分页器（撤回/编辑重发的版本切换），
+DOM 标记 `data-dsh-easyrewrite="version-pager"`。
+
+本层**不碰 easyrewrite 一个字节**：客户端半身按偏好注入一条 CSS：
+
+```css
+[data-dsh-easyrewrite="version-pager"]{display:none !important}
+```
+
+- 模块加载即生效（不等用户打开设置页），否则分叉会话后仍会先看到按钮；
+- 设置页可切回显示（开关状态存 `~/.dsh/adapter-compat-exit.json`）。
+
+### ② 压缩 .txt 出口设置入口
+
+设置 → 会话与提示词 → **压缩出口与版本分页器**，三样可调：
+
+| 项目 | 说明 |
+|---|---|
+| 压缩 .txt 出口 | `never`（压缩不走网页，直接拒绝）/ `auto`（超阈值才打包 `.txt`）/ `always`（一律打包） |
+| 直接发送阈值 | auto 模式的分界（字符），默认 100000 |
+| 「版本切换」按钮 | 已隐藏 / 显示中 |
+
+**值写真源仍是 webin 的 `~/.dsh/webin/config.json`**（`compactionFileMode` /
+`compactionFileThresholdChars`）——因为出口行为由 webin 执行，本层只当设置面板，
+两套配置不会打架。webin 每次请求都 `readConfig()` 现读，所以**改完即时生效、不用重启**。
+
+要点：
+
+- 只改「隐藏分页器」时**不动 webin 配置**（少写少险，写错就是清空用户设置）；
+- 合并写：webin 配置里的其它键（delay / 账号 / edgeDriver）原样保留；
+- 非法值一律拒绝并返回原因，不静默回退；
+- 原子写（临时文件 + rename），不残留 `.tmp`。
+
+单测：`node --test test/exit-prefs.test.js`（默认值 / 合并写保留其它键 / 只改分页器不碰 webin 配置 / 非法输入拒绝 / 无 `.tmp` 残留）。
+
 ## 安装
 
 电脑（profile 目录 = 你的 DSH profile，如 `~/.dsh/profiles/web`）：

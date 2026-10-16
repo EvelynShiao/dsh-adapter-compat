@@ -56,6 +56,19 @@ window.__ModuleLoader__.load({
       errNotFound: '会话或目标工作区不存在（可能已被删除）',
       errOther: '移动失败',
       orderNav: '侧栏排序',
+      /* 压缩 .txt 出口 + 版本分页器（2026-10-16） */
+      exitNav: '压缩出口与版本分页器',
+      exitDesc: '压缩摘要的 .txt 出口开关，以及「版本切换」按钮的显隐（值写真源仍是 webin 配置，改完即时生效）',
+      pagerLabel: '「版本切换」按钮',
+      pagerDesc: '分叉会话 / 修改过对话后出现在消息下方的版本分页器（dsh-easyrewrite 提供）',
+      pagerHidden: '已隐藏',
+      pagerShown: '显示中',
+      modeLabel: '压缩 .txt 出口',
+      modeDesc: '压缩摘要（/compact）输入太大时，把全文打包成 .txt 附件传给网页端',
+      thresholdLabel: '直接发送阈值（字符）',
+      thresholdDesc: 'auto 模式下低于该值直接发输入框，超过才打包 .txt',
+      exitNote: '改完点保存即生效，不用重启',
+      save: '保存',
       /* 会话日志修复分区文案（2026-10-13） */
       healNav: '会话日志修复',
       healDesc: '清理会话日志里的残缺工具结果（断流/加载失败留下），修复前自动备份',
@@ -287,8 +300,135 @@ window.__ModuleLoader__.load({
       return { ok: res.ok, data }
     }
 
-    function HealSection() {
-      const [opts, setOpts] = useState({ bootScan: false, sendScan: false, skipUnchanged: false })
+    /* ── 压缩 .txt 出口 + 版本分页器开关（9999.9.24）────────────────
+       用户要求：①禁掉「版本切换」按钮（分叉会话 / 修改过对话后出现的分页器）；
+                ②把 .txt 出口设置放本插件（不放 webin 的设置页）。
+       分页器是 dsh-easyrewrite 的 DOM（data-dsh-easyrewrite="version-pager"），
+       这里只注入 CSS 隐藏 —— 不动 easyrewrite 一个字节。
+       .txt 出口的值写真源是 ~/.dsh/webin/config.json 的
+       compactionFileMode / compactionFileThresholdChars；
+       webin 每次请求都 readConfig() 现读，所以改完即时生效、不用重启。 */
+    const EXIT_PREFS = '/dsh-adapter-compat/exit-prefs'
+    const PAGER_SELECTOR = '[data-dsh-easyrewrite="version-pager"]'
+    const EXIT_MODE_LABELS = {
+      never: 'never · 不走网页（压缩请求直接拒绝）',
+      auto: 'auto · 超过阈值才打包 .txt（推荐）',
+      always: 'always · 一律打包 .txt 上传',
+    }
+
+    /** 按偏好显示/隐藏版本分页器（幂等：重复调用只更新同一个 style 节点）。 */
+    function applyPagerHidden(hidden) {
+      try {
+        let el = document.querySelector('style[data-plugin="dsh-adapter-compat-pager"]')
+        if (hidden !== true) {
+          if (el) el.remove()
+          return
+        }
+        if (!el) {
+          el = document.createElement('style')
+          el.dataset.plugin = 'dsh-adapter-compat-pager'
+          document.head.appendChild(el)
+        }
+        el.textContent = PAGER_SELECTOR + '{display:none !important}'
+      } catch {
+        /* 隐藏失败不影响其它功能 */
+      }
+    }
+
+    function ExitSection() {
+      const [prefs, setPrefs] = useState(null)
+      const [note, setNote] = useState('')
+      const [busy, setBusy] = useState(false)
+
+      useEffect(() => {
+        let dead = false
+        fetchJson(EXIT_PREFS).then((r) => {
+          if (dead) return
+          if (r.ok && r.data && r.data.value) {
+            setPrefs(r.data.value)
+            applyPagerHidden(r.data.value.hideVersionPager !== false)
+          } else setNote('读取失败，可重试')
+        }).catch(() => { if (!dead) setNote('读取失败，可重试') })
+        return () => { dead = true }
+      }, [])
+
+      const save = async () => {
+        if (!prefs) return
+        setBusy(true)
+        setNote('')
+        try {
+          const r = await fetchJson(EXIT_PREFS, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              compactionFileMode: prefs.compactionFileMode,
+              compactionFileThresholdChars: prefs.compactionFileThresholdChars,
+              hideVersionPager: prefs.hideVersionPager,
+            }),
+          })
+          if (r.ok && r.data && r.data.ok) {
+            const v = r.data.value || prefs
+            setPrefs(v)
+            applyPagerHidden(v.hideVersionPager !== false)
+            setNote('已保存 · 即时生效')
+          } else setNote('保存失败：' + String(r.data && r.data.error ? r.data.error : '未知原因'))
+        } catch (e) {
+          setNote('保存失败：' + String(e && e.message ? e.message : e))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const head = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.exitNav),
+          h('div', { className: 'ac-row-desc' }, ZH.exitDesc)))
+
+      if (!prefs) {
+        return h('div', { className: 'ac-settings' }, head, h('div', { className: 'ac-row-desc' }, '读取设置…'))
+      }
+
+      const pagerRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.pagerLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.pagerDesc)),
+        h('button', {
+          className: 'ac-btn',
+          onClick: () => setPrefs((p) => ({ ...p, hideVersionPager: p.hideVersionPager !== true })),
+        }, prefs.hideVersionPager !== true ? ZH.pagerShown : ZH.pagerHidden))
+
+      const modeRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.modeLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.modeDesc)),
+        h('select', {
+          className: 'ac-btn',
+          value: prefs.compactionFileMode,
+          onChange: (e) => setPrefs((p) => ({ ...p, compactionFileMode: e.target.value })),
+        }, ...Object.keys(EXIT_MODE_LABELS).map((k) => h('option', { key: k, value: k }, EXIT_MODE_LABELS[k]))))
+
+      const thresholdRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.thresholdLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.thresholdDesc)),
+        h('input', {
+          className: 'ac-btn',
+          type: 'number',
+          min: 1000,
+          step: 1000,
+          style: { width: '140px' },
+          value: String(prefs.compactionFileThresholdChars),
+          onChange: (e) => setPrefs((p) => ({ ...p, compactionFileThresholdChars: Number(e.target.value) })),
+        }))
+
+      const foot = h('div', { className: 'ac-row' },
+        h('div', { className: 'ac-row-desc' }, note || ZH.exitNote),
+        h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? '保存中…' : ZH.save))
+
+      return h('div', { className: 'ac-settings' }, head, pagerRow, modeRow, thresholdRow, foot)
+    }
+
+    function HealSection() {      const [opts, setOpts] = useState({ bootScan: false, sendScan: false, skipUnchanged: false })
       const [loaded, setLoaded] = useState(false)
       const [saving, setSaving] = useState(false)
       const [saved, setSaved] = useState('')
@@ -426,6 +566,27 @@ window.__ModuleLoader__.load({
         }, HealSection)), `${NS}: heal section`)
       } catch {
         /* 注册失败不影响插件其余部分 */
+      }
+
+      /* 2026-10-16：设置 → 会话与提示词 下加「压缩出口与版本分页器」分区。
+         order 38 —— 紧挨 heal（37）。同时模块加载即按偏好隐藏分页器，
+         不等用户打开设置页（否则分叉会话后仍会先看到按钮）。 */
+      try {
+        ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
+          name: 'settings.section',
+          id: `${NS}-exit`,
+          order: 38,
+          label: ZH.exitNav,
+        }, ExitSection)), `${NS}: exit section`)
+      } catch {
+        /* 注册失败不影响插件其余部分 */
+      }
+      try {
+        fetchJson(EXIT_PREFS).then((r) => {
+          if (r.ok && r.data && r.data.value) applyPagerHidden(r.data.value.hideVersionPager !== false)
+        }).catch(() => { /* 读不到就保持默认（不隐藏），不影响其它功能 */ })
+      } catch {
+        /* ignore */
       }
     }
 

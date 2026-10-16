@@ -91,7 +91,7 @@
 
 export const name = 'adapter-compat'
 
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs'
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, watch, writeFileSync } from 'node:fs'
 import { zstdCompressSync, constants as zstdConstants, zstdDecompressSync } from 'node:zlib'
 import { purgeSessionFile, readPendingLedger, writePendingLedger, assertRowsDense } from './purge.js'
 import { redactEventPayload, redactSessionFile } from './purge.js'
@@ -2231,6 +2231,161 @@ export function installRepairRoute(ctx, config = {}) {
   }
 }
 
+/* ============ 第九层：压缩 .txt 出口 + 版本分页器开关（9999.9.24） ============
+ *
+ * 用户要求（2026-10-16）：
+ *   ①「点了分叉会话/修改过对话后下面总有『版本切换』按钮」→ 禁掉。
+ *      该按钮是 dsh-easyrewrite 的版本分页器（DOM 标记 data-dsh-easyrewrite="version-pager"）。
+ *      **不改 easyrewrite 的文件**：由本插件客户端半身注入 CSS 隐藏，开关存本插件。
+ *   ②「.txt 出口设置改到 Adapter 插件上」→ 设置入口放本插件，
+ *      值写真源仍是 ~/.dsh/webin/config.json 的 compactionFileMode /
+ *      compactionFileThresholdChars（webin 每请求 readConfig() 现读，改完即生效，不用重启）。
+ *
+ * 为什么值写真源放 webin 配置而不是本插件配置：出口行为（何时打包 .txt、上传还是直发）
+ * 由 webin 执行；本插件只当「设置面板」，避免两套配置打架。
+ */
+
+/** .txt 出口模式合法值（与 webin DEFAULT_CONFIG 的压缩出口一致）。 */
+export const COMPACT_EXIT_MODES = ['never', 'auto', 'always']
+/** 出口设置默认值：与 webin 出厂默认一致。 */
+export const COMPACT_EXIT_DEFAULTS = { compactionFileMode: 'auto', compactionFileThresholdChars: 100000 }
+/** 版本分页器开关的默认值：true = 隐藏（用户要「禁了」）。 */
+export const EXIT_PREFS_DEFAULTS = { hideVersionPager: true }
+
+/** 本插件出口偏好文件（只存「与 webin 无关」的开关，如隐藏分页器）。 */
+export function exitPrefsPath(home = dshHomeDir()) {
+  return `${home.replace(/[\\/]+$/u, '')}/adapter-compat-exit.json`
+}
+
+/** webin 配置文件路径（与 webin 的 configPath() 同址）。 */
+export function webinConfigPath(home = dshHomeDir()) {
+  return `${home.replace(/[\\/]+$/u, '')}/webin/config.json`
+}
+
+/** 读 JSON 文件，失败/缺失回退默认（绝不抛）。 */
+function readJsonOr(file, fallback) {
+  try {
+    if (!existsSync(file)) return { ...fallback }
+    const doc = JSON.parse(readFileSync(file, 'utf8'))
+    if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) return { ...fallback }
+    return doc
+  } catch {
+    return { ...fallback }
+  }
+}
+
+/** 原子写 JSON（临时文件 + rename；目录自动建）。 */
+function writeJsonAtomic(file, doc) {
+  const dir = file.replace(/[\\/][^\\/]*$/, '')
+  try { mkdirSync(dir, { recursive: true }) } catch { /* 已存在 */ }
+  const tmp = `${file}.tmp-cad-${process.pid}-${Date.now()}`
+  writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8')
+  try { rmSync(file, { force: true }) } catch { /* 目标不存在 */ }
+  renameSync(tmp, file)
+}
+
+/** 读取当前出口设置（webin 配置 + 本插件偏好合并）。 */
+export function readExitPrefs(home = dshHomeDir()) {
+  const webin = readJsonOr(webinConfigPath(home), COMPACT_EXIT_DEFAULTS)
+  const own = readJsonOr(exitPrefsPath(home), EXIT_PREFS_DEFAULTS)
+  const mode = COMPACT_EXIT_MODES.includes(webin.compactionFileMode) ? webin.compactionFileMode : COMPACT_EXIT_DEFAULTS.compactionFileMode
+  const rawThreshold = Number(webin.compactionFileThresholdChars)
+  const threshold = Number.isFinite(rawThreshold) && rawThreshold > 0 ? Math.round(rawThreshold) : COMPACT_EXIT_DEFAULTS.compactionFileThresholdChars
+  return {
+    compactionFileMode: mode,
+    compactionFileThresholdChars: threshold,
+    hideVersionPager: own.hideVersionPager !== false,
+  }
+}
+
+/**
+ * 写出口设置：只改给出的键。
+ * @returns {{ok: boolean, value?: object, error?: string}}
+ */
+export function writeExitPrefs(patch, home = dshHomeDir()) {
+  const errors = []
+  const next = readExitPrefs(home)
+  /* 只有真的动了 webin 侧的两个键，才去写 webin 配置文件 ——
+     用户只勾「隐藏分页器」时，webin 的 config.json 不该被动（少写少险）。 */
+  let touchWebin = false
+  let touchOwn = false
+  if (patch?.compactionFileMode !== undefined) {
+    if (!COMPACT_EXIT_MODES.includes(patch.compactionFileMode)) errors.push(`compactionFileMode 应为 ${COMPACT_EXIT_MODES.join('/')}`)
+    else if (patch.compactionFileMode !== next.compactionFileMode) { next.compactionFileMode = patch.compactionFileMode; touchWebin = true }
+  }
+  if (patch?.compactionFileThresholdChars !== undefined) {
+    const n = Number(patch.compactionFileThresholdChars)
+    if (!Number.isFinite(n) || n <= 0) errors.push('compactionFileThresholdChars 应为正数')
+    else if (Math.round(n) !== next.compactionFileThresholdChars) { next.compactionFileThresholdChars = Math.round(n); touchWebin = true }
+  }
+  if (patch?.hideVersionPager !== undefined) {
+    if (typeof patch.hideVersionPager !== 'boolean') errors.push('hideVersionPager 应为布尔')
+    else if (patch.hideVersionPager !== next.hideVersionPager) { next.hideVersionPager = patch.hideVersionPager; touchOwn = true }
+  }
+  if (errors.length > 0) return { ok: false, error: errors.join('；') }
+
+  try {
+    if (touchWebin) {
+      // webin 侧：合并写，保留它的全部其它键（delay/账号/edgeDriver…）
+      const webinPath = webinConfigPath(home)
+      const webin = readJsonOr(webinPath, {})
+      webin.compactionFileMode = next.compactionFileMode
+      webin.compactionFileThresholdChars = next.compactionFileThresholdChars
+      writeJsonAtomic(webinPath, webin)
+    }
+    if (touchOwn) writeJsonAtomic(exitPrefsPath(home), { hideVersionPager: next.hideVersionPager })
+    if (touchWebin || touchOwn) {
+      appendCompatLog(`exit-prefs saved: mode=${next.compactionFileMode} threshold=${next.compactionFileThresholdChars} hidePager=${next.hideVersionPager}`)
+    }
+    return { ok: true, value: next, changed: { webin: touchWebin, own: touchOwn } }
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) }
+  }
+}
+
+/**
+ * 注册出口设置路由：GET 读取 / POST 保存。
+ * 注册失败不抛（与其它路由同约定）。
+ */
+export function installExitRoute(ctx, config = {}) {
+  if (config?.exitPrefs === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') {
+      appendCompatLog('exit route: webServer unavailable')
+      return false
+    }
+    const reply = (res, status, obj) => {
+      try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+    }
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/exit-prefs',
+      handler: async (req, res) => {
+        if (req.method === 'GET') {
+          try { return reply(res, 200, { ok: true, value: readExitPrefs() }) }
+          catch (e) { return reply(res, 500, { ok: false, error: String(e?.message ?? e) }) }
+        }
+        if (req.method !== 'POST') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        let body = ''
+        try {
+          for await (const chunk of req) { body += chunk; if (body.length > 65536) throw new Error('body too large') }
+          const parsed = JSON.parse(body || '{}')
+          const result = writeExitPrefs(parsed)
+          return reply(res, result.ok ? 200 : 400, result)
+        } catch (error) {
+          return reply(res, 400, { ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    })
+    appendCompatLog('exit-prefs route registered')
+    return true
+  } catch (e) {
+    appendCompatLog('exit route FAILED: ' + String(e?.message ?? e).slice(0, 200))
+    return false
+  }
+}
+
 export function apply(ctx, config = {}) {
   // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
   try {
@@ -2249,6 +2404,13 @@ export function apply(ctx, config = {}) {
   // -3.55) 断号修复：路由（强退丢批兜底，不依赖 llm，排在早退之前）
   try {
     installRepairRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.57) 压缩 .txt 出口 + 版本分页器开关：设置读写路由（不依赖 llm，排在早退之前）
+  try {
+    installExitRoute(ctx, config)
   } catch {
     /* 路由注册失败绝不拖垮 apply */
   }
