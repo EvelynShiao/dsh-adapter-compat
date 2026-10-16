@@ -448,7 +448,8 @@ window.__ModuleLoader__.load({
     const VERSIONS = '/dsh-adapter-compat/versions'
     const VERSIONS_PURGE = '/dsh-adapter-compat/versions/purge'
 
-    function VersionsSection() {
+    /** 版本家族子块 —— 同样嵌在「会话日志修复」里（2026-10-16 用户要求），默认折叠。 */
+    function VersionsBlock() {
       const [data, setData] = useState(null)
       const [note, setNote] = useState('')
       const [busy, setBusy] = useState('')
@@ -488,13 +489,12 @@ window.__ModuleLoader__.load({
       }
 
       const head = h('div', { className: 'ac-row' },
-        h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.verNav),
-          h('div', { className: 'ac-row-desc' }, ZH.verDesc)),
+        h('div', { className: 'ac-row-desc' }, '分叉=复制父会话历史，这里按家族统计体积'),
         h('button', { className: 'ac-btn', onClick: () => void load() }, '刷新'))
 
       if (!data) {
-        return h('div', { className: 'ac-settings' }, head, h('div', { className: 'ac-row-desc' }, note || '正在统计…'))
+        return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } }, head,
+          h('div', { className: 'ac-row-desc' }, note || '正在统计…'))
       }
 
       const summary = h('div', { className: 'ac-row' },
@@ -532,7 +532,8 @@ window.__ModuleLoader__.load({
       const foot = h('div', { className: 'ac-row' },
         h('div', { className: 'ac-row-desc' }, note || ZH.verNote))
 
-      return h('div', { className: 'ac-settings' }, head, summary, protection, ...famRows, foot)
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
+        head, summary, protection, ...famRows, foot)
     }
 
     /* ── 不可见会话（侧栏选不出来的）（9999.9.26）──────────────────
@@ -545,6 +546,28 @@ window.__ModuleLoader__.load({
        （登记了但文件已删）只能停机改文件；这里只处理「文件存在但看不见」。 */
     const INVISIBLE = '/dsh-adapter-compat/invisible'
     const INVISIBLE_PURGE = '/dsh-adapter-compat/invisible/purge'
+
+    /** 折叠块：默认收起，点标题/按钮展开（2026-10-16 用户要求「默认折叠」）。 */
+    function Fold({ title, desc, children, defaultOpen = false }) {
+      const [open, setOpen] = useState(defaultOpen)
+      return h('div', {
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '8px',
+          borderTop: '1px solid var(--dsw-alias-border-subtle, #3333)',
+          paddingTop: '10px',
+          marginTop: '4px',
+        },
+      },
+      h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title', style: { cursor: 'pointer' }, onClick: () => setOpen((v) => !v) },
+            `${open ? '▾' : '▸'} ${title}`),
+          desc ? h('div', { className: 'ac-row-desc' }, desc) : null),
+        h('button', { className: 'ac-btn', onClick: () => setOpen((v) => !v) }, open ? '收起' : '展开')),
+      open ? children : null)
+    }
 
     /** 不可见会话子块 —— 嵌在「会话日志修复」分区里（2026-10-16 用户要求：紧致点，别单开顶级分区）。 */
     function InvisibleBlock() {
@@ -585,22 +608,13 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const head = h('div', { className: 'ac-row' },
-        h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.invNav),
-          h('div', { className: 'ac-row-desc' }, ZH.invDesc)),
-        h('button', { className: 'ac-btn', onClick: () => void load() }, '刷新'))
-
       const wrap = (...kids) => h('div', {
-        style: {
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '8px',
-          borderTop: '1px solid var(--dsw-alias-border-subtle, #3333)',
-          paddingTop: '10px',
-          marginTop: '4px',
-        },
-      }, head, ...kids)
+        style: { display: 'flex', flexDirection: 'column', gap: '8px' },
+      },
+      h('div', { className: 'ac-row' },
+        h('div', { className: 'ac-row-desc' }, '只处理「文件存在但侧栏看不见」的会话'),
+        h('button', { className: 'ac-btn', onClick: () => void load() }, '刷新')),
+      ...kids)
 
       if (!data) return wrap(h('div', { className: 'ac-row-desc' }, note || '正在扫描…'))
       if (data.ok !== true) return wrap(h('div', { className: 'ac-row-desc' }, data.reason || '扫描不可用'))
@@ -739,7 +753,9 @@ window.__ModuleLoader__.load({
             buttons,
             reportBlock,
             fixBlock,
-            h(InvisibleBlock))
+            /* 子块默认折叠（2026-10-16 用户要求）：点标题展开。 */
+            h(Fold, { key: 'inv', title: ZH.invNav, desc: ZH.invDesc }, h(InvisibleBlock)),
+            h(Fold, { key: 'ver', title: ZH.verNav, desc: ZH.verDesc }, h(VersionsBlock)))
         : h('div', { className: 'ac-row-desc' }, '加载选项…')
 
       return h('div', { className: 'ac-settings' }, head, body)
@@ -767,24 +783,17 @@ window.__ModuleLoader__.load({
         /* 注册失败不影响插件其余部分 */
       }
 
-      /* 2026-10-16：设置页第三个分区「版本家族与磁盘占用」。
-         order 39 —— 紧挨 exit（38）。同时模块加载即按偏好隐藏分页器，
-         不等用户打开设置页（否则分叉会话后仍会先看到按钮）。 */
-      try {
-        ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
-          name: 'settings.section',
-          id: `${NS}-versions`,
-          order: 39,
-          label: ZH.verNav,
-        }, VersionsSection)), `${NS}: versions section`)
-      } catch {
-        /* 注册失败不影响插件其余部分 */
-      }
+      /* 2026-10-16（用户要求）：版本家族与不可见会话清理**并入**「会话日志修复」
+         （见 HealSection 里的两个折叠块），不再单开顶级分区；
+         压缩出口分区排到 order 36 —— 正好贴在 session-kit「会话与提示词」(35) 下面。
+         为什么不真嵌套：设置导航是**扁平**的（settings.section 条目按 order 排），
+         插槽 API 没有 parent/子插槽；真嵌套要改 session-kit 的 client.js，
+         而它是上游干净版 —— 不动别人的文件。 */
       try {
         ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section',
           id: `${NS}-exit`,
-          order: 38,
+          order: 36,
           label: ZH.exitNav,
         }, ExitSection)), `${NS}: exit section`)
       } catch {
