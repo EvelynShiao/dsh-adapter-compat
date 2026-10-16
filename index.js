@@ -1163,9 +1163,19 @@ export async function purgeTombstones(ctx, options = {}) {
     ? options.sinceMs
     : (Number.isFinite(ledger.lastScanMs) ? ledger.lastScanMs : Date.now())
   const results = []
+  /* 版本家族保护（2026-10-16）：分叉/版本切换出来的会话默认**不动刀**——
+     切版本会往另一个分支写墓碑，真删会把那个版本的内容物理切除，用户就回不去了。
+     想真删走 /versions/purge（显式传 forceFamilies）。 */
+  const protectFamilies = options.protectFamilies !== false
+  const familyIds = protectFamilies ? versionFamilyIds(home) : new Set()
   for (const entry of listSessionFiles(home)) {
     if (options.only !== undefined && options.only !== entry.id) continue
     if (options.pendingOnly === true && !ledger.pending[entry.id]) continue   // 重试只碰待清项
+    if (protectFamilies && familyIds.has(entry.id)) {
+      /* 只记账、不落刀：这里的 skip 不写 pending（避免每次重试都重扫重试）。 */
+      results.push({ id: entry.id, status: 'family-protected' })
+      continue
+    }
     if (isSessionLive(ctx, entry.id)) {
       /* live 会话不能整轮切除（内存事件数组会与文件错位），改走**就地擦文本**：
          清掉被删轮次里用户自己的消息正文，Timeline 立刻不再显示；seq/事件数不变，
@@ -2386,6 +2396,250 @@ export function installExitRoute(ctx, config = {}) {
   }
 }
 
+/* ============ 第十层：版本家族保护 + 磁盘清理（9999.9.25） ============
+ *
+ * 用户实测（2026-10-16）：
+ *   ①「分叉/版本切换占磁盘吗」→ **占**。DSH 分叉走 dsh-session/fork 的
+ *      buildForkSeed：把父会话的事件前缀**复制**进新会话，header 记
+ *      `parentSession`。实测 102 个会话里 17 个是分叉产物，合计 21.96 MB；
+ *      其中从 session-43c4199d 分叉出来的 session-72185b36 单条 4.63 MB。
+ *   ②「版本切换会触发其他插件的真删除」→ 版本家族里的会话一旦被标墓碑，
+ *      本插件的 true-delete 会真的把内容 excise 掉，旧版本就没了。
+ *
+ * 本层做两件事：
+ *   A. **保护**：purgeTombstones 默认跳过「版本家族成员」（有 parentSession
+ *      或被子会话引用的会话）——只记账不动刀，除非显式 forceFamilies。
+ *   B. **清理**：提供家族清单 + 体积，用户想省空间时手动清（真删，不留副本）。
+ */
+
+/** 会话头读取：只解压第一帧（header 所在帧），不做整文件解压。 */
+export function readSessionHeader(file) {
+  try {
+    const buf = readFileSync(file)
+    if (buf.length < 5 || !(buf[0] === 0x28 && buf[1] === 0xb5 && buf[2] === 0x2f && buf[3] === 0xfd)) return null
+    let out = null
+    let end = Math.min(buf.length, 4096)
+    let step = 4096
+    for (;;) {
+      try { out = zstdDecompressSync(buf.subarray(0, end)); break } catch { /* 未到帧尾 */ }
+      if (end >= buf.length) break
+      end = Math.min(buf.length, end + step)
+      step *= 2
+    }
+    if (out === null) {
+      let lo = 5, hi = buf.length
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2)
+        let ok = false
+        try { zstdDecompressSync(buf.subarray(0, mid)); ok = true } catch { ok = false }
+        if (ok) hi = mid; else lo = mid + 1
+      }
+      try { out = zstdDecompressSync(buf.subarray(0, lo)) } catch { return null }
+    }
+    const line = out.toString('utf8').split('\n').filter(Boolean)[0]
+    if (!line) return null
+    const parsed = JSON.parse(line)
+    /* ⚠️ header 的字段在**顶层**（实测 session-72185b36）：
+       {"type":"session","version":4,"id":…,"cwd":…,"parentSession":…,"isSeeded":true}。
+       不是嵌在 data 里——第一版读 data.parentSession 于是家族扫描全 0。 */
+    const data = parsed?.data ?? {}
+    const parent = typeof parsed?.parentSession === 'string'
+      ? parsed.parentSession
+      : (typeof data.parentSession === 'string' ? data.parentSession : null)
+    return {
+      parent,
+      cwd: typeof parsed?.cwd === 'string' ? parsed.cwd : (typeof data.cwd === 'string' ? data.cwd : ''),
+      createdAt: typeof parsed?.createdAt === 'number' ? parsed.createdAt : (typeof data.createdAt === 'number' ? data.createdAt : 0),
+    }
+  } catch {
+    return null
+  }
+}
+
+/** 会话目录（含工作区层）定位：返回 sid → { dir, file, sizeBytes, mtimeMs }。 */
+function sessionDirs(home = dshHomeDir()) {
+  const out = new Map()
+  const root = `${home}/sessions`
+  let wsDirs = []
+  try { wsDirs = readdirSync(root) } catch { return out }
+  for (const ws of wsDirs) {
+    const wsDir = `${root}/${ws}`
+    let ids = []
+    try { if (!statSync(wsDir).isDirectory()) continue; ids = readdirSync(wsDir) } catch { continue }
+    for (const sid of ids) {
+      const dir = `${wsDir}/${sid}`
+      const file = `${dir}/session.v4.jsonl.zstd`
+      try {
+        if (!existsSync(file)) continue
+        const st = statSync(file)
+        out.set(sid, { dir, file, sizeBytes: st.size, mtimeMs: st.mtimeMs })
+      } catch { /* skip */ }
+    }
+  }
+  return out
+}
+
+/**
+ * 扫描版本家族：返回 { families, members, totalForkMB, scannedAt }。
+ * family = 一个根会话 + 它的全部后代（多层分叉一并算进来）。
+ */
+export function scanVersionFamilies(home = dshHomeDir()) {
+  const dirs = sessionDirs(home)
+  const parentOf = new Map()
+  const headerInfo = new Map()
+  for (const [sid, info] of dirs) {
+    const h = readSessionHeader(info.file)
+    headerInfo.set(sid, h)
+    if (h?.parent) parentOf.set(sid, h.parent)
+  }
+  /* 根：顺着 parent 上溯到最顶层（父可能已删，那就以当前最深可达为根）。 */
+  const rootOf = (sid) => {
+    let cur = sid
+    const seen = new Set([sid])
+    for (;;) {
+      const p = parentOf.get(cur)
+      if (!p || !dirs.has(p) || seen.has(p)) return cur
+      seen.add(p)
+      cur = p
+    }
+  }
+  const families = new Map()
+  for (const sid of dirs.keys()) {
+    const root = rootOf(sid)
+    if (!families.has(root)) families.set(root, [])
+    families.get(root).push(sid)
+  }
+  const list = []
+  /* 分叉体积按「所有有 parent 的会话」统计——父会话可能已被删，
+     那种孤儿分叉仍占盘、也仍要保护，不能因为家族只剩一条就漏掉。 */
+  let totalForkMB = 0
+  for (const sid of parentOf.keys()) {
+    const info = dirs.get(sid)
+    if (info) totalForkMB += info.sizeBytes / 1048576
+  }
+  for (const [root, ids] of families) {
+    const anyFork = ids.some((sid) => parentOf.has(sid))
+    if (ids.length < 2 && !anyFork) continue   // 单会话且非分叉 → 不算家族
+    const members = ids.map((sid) => {
+      const info = dirs.get(sid)
+      const isFork = parentOf.has(sid)
+      return {
+        id: sid,
+        parent: parentOf.get(sid) ?? null,
+        isRoot: sid === root,
+        isFork,
+        orphanFork: isFork && !dirs.has(String(parentOf.get(sid))),
+        sizeMB: +(info.sizeBytes / 1048576).toFixed(2),
+        mtime: new Date(info.mtimeMs).toISOString().slice(0, 16).replace('T', ' '),
+      }
+    }).sort((a, b) => b.sizeMB - a.sizeMB)
+    list.push({ root, members, sizeMB: +members.reduce((a, b) => a + b.sizeMB, 0).toFixed(2) })
+  }
+  list.sort((a, b) => b.sizeMB - a.sizeMB)
+  const totalForkBytes = [...parentOf.keys()].reduce((a, sid) => a + (dirs.get(sid)?.sizeBytes ?? 0), 0)
+  const totalAllBytes = [...dirs.values()].reduce((a, b) => a + b.sizeBytes, 0)
+  return {
+    families: list,
+    familyCount: list.length,
+    forkCount: [...parentOf.keys()].filter((sid) => dirs.has(sid)).length,
+    totalForkMB: +totalForkMB.toFixed(2),
+    totalAllMB: +[...dirs.values()].reduce((a, b) => a + b.sizeBytes, 0) / 1048576,
+    /* 字节级原值：MB 会四舍五入成 0，测试与精确统计用这个。 */
+    totalForkBytes,
+    totalAllBytes,
+    scannedAt: new Date().toISOString(),
+  }
+}
+
+/* 家族索引缓存（30s）：purgeTombstones 每 60s 跑一次，不能每次都全盘读头。 */
+let familyCache = { at: 0, ids: new Set() }
+
+/** 版本家族成员 id 集合（含父、含子）。保护判据用。 */
+export function versionFamilyIds(home = dshHomeDir(), { ttlMs = 30000 } = {}) {
+  if (Date.now() - familyCache.at < ttlMs) return familyCache.ids
+  const ids = new Set()
+  try {
+    const scan = scanVersionFamilies(home)
+    for (const fam of scan.families) for (const m of fam.members) ids.add(m.id)
+  } catch { /* 扫不动就不保护（宁可不拦，也不要卡住清理链） */ }
+  familyCache = { at: Date.now(), ids }
+  return ids
+}
+
+/** 真删一个会话目录（含 projcache），返回释放字节数；live 会话拒删。 */
+export function deleteSessionDir(ctx, home, sid) {
+  const dirs = sessionDirs(home)
+  const info = dirs.get(sid)
+  if (!info) return { id: sid, status: 'not-found', freedMB: 0 }
+  if (isSessionLive(ctx, sid)) return { id: sid, status: 'live-refused', freedMB: 0 }
+  const freed = info.sizeBytes
+  try {
+    rmSync(info.dir, { recursive: true, force: true })
+    try { rmSync(`${home}/storages/session_projcache/sessions/${sid}.json`, { force: true }) } catch { /* ignore */ }
+    familyCache = { at: 0, ids: new Set() }
+    return { id: sid, status: 'deleted', freedMB: +(freed / 1048576).toFixed(2) }
+  } catch (error) {
+    return { id: sid, status: 'failed', error: String(error?.message ?? error), freedMB: 0 }
+  }
+}
+
+/** 版本家族路由：GET 清单 / POST 真删。 */
+export function installVersionsRoute(ctx, config = {}) {
+  if (config?.versionsPanel === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') {
+      appendCompatLog('versions route: webServer unavailable')
+      return false
+    }
+    const reply = (res, status, obj) => {
+      try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+    }
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/versions',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        try { return reply(res, 200, { ok: true, value: scanVersionFamilies() }) }
+        catch (e) { return reply(res, 500, { ok: false, error: String(e?.message ?? e) }) }
+      },
+    })
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/versions/purge',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        let body = ''
+        try {
+          for await (const chunk of req) { body += chunk; if (body.length > 65536) throw new Error('body too large') }
+          const parsed = JSON.parse(body || '{}')
+          const ids = Array.isArray(parsed?.ids) ? parsed.ids.filter((x) => typeof x === 'string' && x) : []
+          if (ids.length === 0) return reply(res, 400, { ok: false, error: 'ids required' })
+          if (parsed.write !== true) {
+            return reply(res, 200, {
+              ok: true,
+              dryRun: true,
+              results: ids.map((id) => ({ id, status: 'planned' })),
+            })
+          }
+          const home = dshHomeDir()
+          const results = ids.map((id) => deleteSessionDir(ctx, home, id))
+          const freedMB = +results.reduce((a, b) => a + (b.freedMB ?? 0), 0).toFixed(2)
+          appendCompatLog(`versions purge: freed ${freedMB}MB ids=${ids.join(' ')}`)
+          return reply(res, 200, { ok: true, results, freedMB })
+        } catch (error) {
+          return reply(res, 400, { ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    })
+    appendCompatLog('versions route registered')
+    return true
+  } catch (e) {
+    appendCompatLog('versions route FAILED: ' + String(e?.message ?? e).slice(0, 200))
+    return false
+  }
+}
+
 export function apply(ctx, config = {}) {
   // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
   try {
@@ -2411,6 +2665,13 @@ export function apply(ctx, config = {}) {
   // -3.57) 压缩 .txt 出口 + 版本分页器开关：设置读写路由（不依赖 llm，排在早退之前）
   try {
     installExitRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.58) 版本家族清单 + 手动清理路由（不依赖 llm）
+  try {
+    installVersionsRoute(ctx, config)
   } catch {
     /* 路由注册失败绝不拖垮 apply */
   }

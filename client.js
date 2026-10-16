@@ -69,6 +69,12 @@ window.__ModuleLoader__.load({
       thresholdDesc: 'auto 模式下低于该值直接发输入框，超过才打包 .txt',
       exitNote: '改完点保存即生效，不用重启',
       save: '保存',
+      /* 版本家族与磁盘占用（2026-10-16） */
+      verNav: '版本家族与磁盘占用',
+      verDesc: '分叉会话会复制父会话的历史，这里列出各版本家族的体积，可按需清理旧版本',
+      verGuard: '旧版本受保护（不自动真删）',
+      verGuardDesc: '切换版本时另一个分支会被标墓碑，本插件的真删除默认跳过这些家族成员，只记账不动刀',
+      verNote: '清理是真删（不留副本），正在运行的会话会被跳过',
       /* 会话日志修复分区文案（2026-10-13） */
       healNav: '会话日志修复',
       healDesc: '清理会话日志里的残缺工具结果（断流/加载失败留下），修复前自动备份',
@@ -428,6 +434,102 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'ac-settings' }, head, pagerRow, modeRow, thresholdRow, foot)
     }
 
+    /* ── 版本家族与磁盘占用（9999.9.25）──────────────────────────
+       分叉 = 把父会话的事件前缀**复制**进新会话（DSH 的 buildForkSeed），
+       header 记 parentSession ⇒ 确实占盘（实测 17 条 / 21.97 MB）。
+       真删除默认**跳过**这些家族成员：切换版本会往另一个分支写墓碑，
+       真删会把那个版本的内容物理切除，旧版本就回不去了。
+       想省空间时在这里手动清（真删，不留副本）。 */
+    const VERSIONS = '/dsh-adapter-compat/versions'
+    const VERSIONS_PURGE = '/dsh-adapter-compat/versions/purge'
+
+    function VersionsSection() {
+      const [data, setData] = useState(null)
+      const [note, setNote] = useState('')
+      const [busy, setBusy] = useState('')
+      const [confirmId, setConfirmId] = useState('')
+
+      const load = useCallback(async () => {
+        try {
+          const r = await fetchJson(VERSIONS)
+          if (r.ok && r.data && r.data.value) setData(r.data.value)
+          else setNote('读取失败')
+        } catch { setNote('读取失败') }
+      }, [])
+
+      useEffect(() => { void load() }, [load])
+
+      const purge = async (ids, label) => {
+        setBusy(label)
+        setNote('')
+        try {
+          const r = await fetchJson(VERSIONS_PURGE, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ ids, write: true }),
+          })
+          if (r.ok && r.data && r.data.ok) {
+            const freed = r.data.freedMB ?? 0
+            const refused = (r.data.results || []).filter((x) => x.status === 'live-refused').length
+            setNote(`已释放 ${freed} MB${refused > 0 ? `（${refused} 条正在运行，跳过）` : ''}`)
+            await load()
+          } else setNote('清理失败：' + String(r.data && r.data.error ? r.data.error : '未知'))
+        } catch (e) {
+          setNote('清理失败：' + String(e && e.message ? e.message : e))
+        } finally {
+          setBusy('')
+          setConfirmId('')
+        }
+      }
+
+      const head = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.verNav),
+          h('div', { className: 'ac-row-desc' }, ZH.verDesc)),
+        h('button', { className: 'ac-btn', onClick: () => void load() }, '刷新'))
+
+      if (!data) {
+        return h('div', { className: 'ac-settings' }, head, h('div', { className: 'ac-row-desc' }, note || '正在统计…'))
+      }
+
+      const summary = h('div', { className: 'ac-row' },
+        h('div', { className: 'ac-row-desc' },
+          `${data.familyCount} 个版本家族 · ${data.forkCount} 条分叉 · 分叉占 ${data.totalForkMB} MB · 全部会话 ${data.totalAllMB.toFixed(1)} MB`))
+
+      const protection = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.verGuard),
+          h('div', { className: 'ac-row-desc' }, ZH.verGuardDesc)))
+
+      const famRows = data.families.slice(0, 12).map((fam) => {
+        const forks = fam.members.filter((m) => m.isFork)
+        const members = fam.members.map((m) => h('div', { key: m.id, className: 'ac-row-desc', style: { fontFamily: 'monospace' } },
+          `${m.id.slice(0, 26)}  ${m.sizeMB}MB  ${m.isRoot ? '根' : '分叉'}${m.orphanFork ? '·孤' : ''}  ${m.mtime}`))
+        const actions = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
+          h('span', { className: 'ac-row-desc' }, `${fam.sizeMB}MB`),
+          confirmId === fam.root
+            ? h('button', { className: 'ac-btn', disabled: busy !== '', onClick: () => void purge(forks.map((m) => m.id), fam.root) }, `确认删除 ${forks.length} 条分叉`)
+            : h('button', {
+                className: 'ac-btn',
+                disabled: busy !== '' || forks.length === 0,
+                onClick: () => setConfirmId(fam.root),
+              }, '清理旧版本'),
+          confirmId === fam.root ? h('button', { className: 'ac-btn', onClick: () => setConfirmId('') }, '取消') : null)
+        return h('div', { key: fam.root, style: { borderTop: '1px solid var(--dsw-alias-border-subtle, #3333)', paddingTop: '6px' } },
+          h('div', { className: 'ac-row' },
+            h('div', null,
+              h('div', { className: 'ac-row-title' }, `家族 ${fam.root.slice(0, 26)}`),
+              h('div', { className: 'ac-row-desc' }, `${fam.members.length} 个版本 · 分叉 ${forks.length} 条`)),
+            actions),
+          ...members)
+      })
+
+      const foot = h('div', { className: 'ac-row' },
+        h('div', { className: 'ac-row-desc' }, note || ZH.verNote))
+
+      return h('div', { className: 'ac-settings' }, head, summary, protection, ...famRows, foot)
+    }
+
     function HealSection() {      const [opts, setOpts] = useState({ bootScan: false, sendScan: false, skipUnchanged: false })
       const [loaded, setLoaded] = useState(false)
       const [saving, setSaving] = useState(false)
@@ -568,9 +670,19 @@ window.__ModuleLoader__.load({
         /* 注册失败不影响插件其余部分 */
       }
 
-      /* 2026-10-16：设置 → 会话与提示词 下加「压缩出口与版本分页器」分区。
-         order 38 —— 紧挨 heal（37）。同时模块加载即按偏好隐藏分页器，
+      /* 2026-10-16：设置页第三个分区「版本家族与磁盘占用」。
+         order 39 —— 紧挨 exit（38）。同时模块加载即按偏好隐藏分页器，
          不等用户打开设置页（否则分叉会话后仍会先看到按钮）。 */
+      try {
+        ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
+          name: 'settings.section',
+          id: `${NS}-versions`,
+          order: 39,
+          label: ZH.verNav,
+        }, VersionsSection)), `${NS}: versions section`)
+      } catch {
+        /* 注册失败不影响插件其余部分 */
+      }
       try {
         ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section',
