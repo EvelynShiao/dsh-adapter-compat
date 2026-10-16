@@ -2353,10 +2353,10 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
   }
 }
 
-/**
- * 注册出口设置路由：GET 读取 / POST 保存。
- * 注册失败不抛（与其它路由同约定）。
- */
+/** 客户端半身是否已经报过到（只记第一行，避免刷日志）。 */
+let clientHalfBootLogged = false
+
+/** 出口设置路由：GET 读取 / POST 保存。注册失败不抛（与其它路由同约定）。 */
 export function installExitRoute(ctx, config = {}) {
   if (config?.exitPrefs === false) return false
   try {
@@ -2373,6 +2373,12 @@ export function installExitRoute(ctx, config = {}) {
       path: '/dsh-adapter-compat/exit-prefs',
       handler: async (req, res) => {
         if (req.method === 'GET') {
+          /* 诊断（2026-10-16）：客户端半身加载新代码时第一件事就是 GET 这个路由。
+             只在首次记一行 —— 用来区分「浏览器跑的是缓存旧版」与「代码没注册」。 */
+          if (!clientHalfBootLogged) {
+            clientHalfBootLogged = true
+            appendCompatLog('client half GET exit-prefs -> 新客户端已加载（含 exit/versions 分区）')
+          }
           try { return reply(res, 200, { ok: true, value: readExitPrefs() }) }
           catch (e) { return reply(res, 500, { ok: false, error: String(e?.message ?? e) }) }
         }
