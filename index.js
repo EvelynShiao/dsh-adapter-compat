@@ -969,6 +969,9 @@ export function installSessionWatch(ctx, options = {}) {
     ? options.pollIntervalMs
     : (Number.isFinite(options.intervalMs) ? options.intervalMs : SESSION_POLL_INTERVAL_MS)
   const debounceMs = Number.isFinite(options.debounceMs) ? options.debounceMs : SESSION_WATCH_DEBOUNCE_MS
+  /* 变化后要做哪些事：默认全做（2026-10-16 前的行为）；设置页可逐项关掉，
+     这正是用户抱怨的「每次会话变化都全盘扫 94 个会话」的三个动作。 */
+  const on = options.toggles ?? readHealOptions(home)
   const state = { last: sessionsFingerprint(home).key, pendingKey: null, busy: false, timer: null, watcher: null }
   let check
   const schedule = (delay) => {
@@ -1001,15 +1004,19 @@ export function installSessionWatch(ctx, options = {}) {
     state.pendingKey = null
     state.last = key
     state.busy = true
-    appendCompatLog(`sessions changed (${key}) -> title warm + rescan`, home)
+    const acts = []
+    if (on.changeRescan !== false) acts.push('warm+rescan')
+    if (on.changePurge !== false) acts.push('purge')
+    if (on.changeHeadGuard !== false) acts.push('head-guard')
+    appendCompatLog(`sessions changed (${key}) -> ${acts.length > 0 ? acts.join(' + ') : '（动作全部关闭，仅记录）'}`, home)
     Promise.resolve()
-      .then(() => rescanAndWarm(ctx, options))
+      .then(() => (on.changeRescan !== false ? rescanAndWarm(ctx, options) : undefined))
       .catch(() => {})
       // 目录变化 → 真删除扫描（line 854 注释本该有的调用点，此前丢失 → pending 永不重试）。
       // purge 幂等，写盘会再触发一轮 watcher，收敛后自然停（多跑一轮空扫）。
-      .then(() => { try { if (typeof compatHooks.purge === 'function') compatHooks.purge() } catch { /* ignore */ } })
+      .then(() => { try { if (on.changePurge !== false && typeof compatHooks.purge === 'function') compatHooks.purge() } catch { /* ignore */ } })
       // 目录变化同样可能是「外面下载/搬运进来一份无头会话」→ 补头守卫跟上
-      .then(() => { try { if (typeof compatHooks.headGuard === 'function') compatHooks.headGuard() } catch { /* ignore */ } })
+      .then(() => { try { if (on.changeHeadGuard !== false && typeof compatHooks.headGuard === 'function') compatHooks.headGuard() } catch { /* ignore */ } })
       .finally(() => {
         state.busy = false
         try {
@@ -1059,9 +1066,14 @@ export function installSessionWatch(ctx, options = {}) {
 /** 装配本层：监视 + 启动补跑（一次性预热不够，故启动后多补几轮）。 */
 export function installTitleWarm(ctx, config = {}) {
   if (config?.[TITLE_WARM_DISABLED_KEY] === false) return undefined
+  const on = readHealOptions()
   const options = {
     repairUntitled: config?.titleWarmRepairUntitled !== false,
     max: Number.isFinite(config?.titleWarmMax) ? config.titleWarmMax : undefined,
+    /* 频率与「变化后动作」都交给用户选项（设置页「扫描与校准频率」）。 */
+    toggles: on,
+    pollIntervalMs: on.watchPollMs,
+    debounceMs: on.watchDebounceMs,
   }
   const watch = installSessionWatch(ctx, options)
   // 启动补跑：12s 全盘补齐；60s 再补一次（覆盖启动后立刻发生的下载）
@@ -1075,9 +1087,28 @@ export function installTitleWarm(ctx, config = {}) {
     if (typeof t.unref === 'function') t.unref()
     timers.push(t)
   }
-  at(12000, () => warmProjectionTitles(ctx, options))
-  at(60000, () => rescanAndWarm(ctx, options))
+  if (on.bootTitleWarm !== false) {
+    at(12000, () => warmProjectionTitles(ctx, options))
+    at(60000, () => rescanAndWarm(ctx, options))
+  } else {
+    appendCompatLog('title warm: 开机预热已关闭（设置页可开）')
+  }
   return { watch, timers }
+}
+
+/**
+ * 立刻跑一次标题预热 + 重扫（设置页「立即重扫」按钮用；不受开机开关影响）。
+ * @returns {Promise<{ok:boolean, error?:string}>}
+ */
+export async function runTitleWarmNow(ctx) {
+  try {
+    await warmProjectionTitles(ctx, { repairUntitled: true })
+    await rescanAndWarm(ctx, { repairUntitled: true })
+    appendCompatLog('title warm: 手动触发完成')
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) }
+  }
 }
 
 /* ============ 第六层：真删除（物理切除墓碑） ===========
@@ -1289,10 +1320,15 @@ export function installTrueDelete(ctx, config = {}) {
      原来只有 5s/30s，已经晚于客户端恢复，于是「重启也清不掉残留」。
      加两轮更早的（1.2s / 2.5s），赶在会话被激活之前把能清的清掉。 */
   const timers = []
-  for (const ms of [1200, 2500, 5000, 30000]) {
-    const t = setTimeout(() => run('boot+' + (ms / 1000) + 's', { sinceMs: 0 }), ms)
-    if (typeof t.unref === 'function') t.unref()
-    timers.push(t)
+  const on = readHealOptions(home)
+  if (on.bootTrueDelete !== false) {
+    for (const ms of [1200, 2500, 5000, 30000]) {
+      const t = setTimeout(() => run('boot+' + (ms / 1000) + 's', { sinceMs: 0 }), ms)
+      if (typeof t.unref === 'function') t.unref()
+      timers.push(t)
+    }
+  } else {
+    appendCompatLog('true-delete: 开机补清已关闭（设置页可开）')
   }
   /* 触发时机收敛：开机两次 + 会话目录变化后一次（见 rescanAndWarm 的钩子）。
      不再常驻轮询——用户明确要求「开机、下载后扫一下就差不多」。 */
@@ -1408,6 +1444,9 @@ export function installHeadGuard(ctx, config = {}) {
   const timers = []
   /* 4s：便宜的缺头预筛全扫。45s：深扫一遍（整读 + verify），连下载/写盘留下的
      「同段两遍 → seq 断口」也治掉——这类伤不在前缀里，预筛看不见。 */
+  /* 开机三窗口可用设置页「扫描与校准频率 → 开机头保护」关闭（2026-10-16 加）。 */
+  const onHead = readHealOptions(home)
+  if (onHead.bootHeadGuard !== false) {
   for (const ms of [4000, 25000]) {
     const t = setTimeout(() => run('boot+' + (ms / 1000) + 's'), ms)
     if (typeof t.unref === 'function') t.unref()
@@ -1417,6 +1456,9 @@ export function installHeadGuard(ctx, config = {}) {
     const t = setTimeout(() => run('boot-deep+45s', { deep: true }), 45000)
     if (typeof t.unref === 'function') t.unref()
     timers.push(t)
+  }
+  } else {
+    appendCompatLog('head-guard: 开机扫描已关闭（设置页可开）')
   }
   compatHooks.headGuard = (ids, deep) => run('hook', { ...(ids === undefined ? {} : { only: ids instanceof Set ? ids : new Set(ids) }), ...(deep === true ? { deep: true } : {}) })
   return { run, timers }
@@ -2023,24 +2065,99 @@ export async function healSessionFile(ctx, sessionId, options = {}) {
    读缓存 2s：sendScan 每次发消息都会读，不能每次 IO。 */
 const HEAL_OPTIONS_FILE = 'adapter-compat-heal.json'
 const HEAL_STATE_FILE = 'adapter-compat-heal-state.json'
-const HEAL_DEFAULTS = { bootScan: false, sendScan: false, skipUnchanged: false }
+/**
+ * 用户选项（默认值 = 2026-10-16 之前的既有行为，改这里就是改出厂）。
+ *
+ * 布尔：
+ *   bootScan / sendScan / skipUnchanged —— 会话日志修复三项（2026-10-13 定案）
+ *   changeRescan  目录变化后自动「标题预热 + 重扫列表」（含 dsh-sync 落盘）
+ *   changePurge   目录变化后跟一次真删除扫描
+ *   changeHeadGuard 目录变化后跟一次头保护扫描
+ *   bootTitleWarm 开机自动预热标题（12s 补一轮、60s 再补一轮）
+ *   bootHeadGuard 开机自动头保护（4s/25s 预筛 + 45s 深扫）
+ *   bootTrueDelete 开机真删除补清（1.2s/2.5s/5s/30s 四个黄金窗）
+ *   pressureCalibration contextPressure 显示校准
+ * 数值：
+ *   watchDebounceMs 会话盘变化后的稳定防抖（越小越灵敏、越费 IO）
+ *   watchPollMs     兜底轮询间隔（fs.watch 漏事件时用它发现变化）
+ *   pressureCalibrationIntervalMs 校准重试间隔（0 = 只在启动那几轮跑一次）
+ *
+ * ⚠️ 这些值在**安装器启动时读一次** ⇒ 改完要重启 DSH 才生效（UI 上已注明）。
+ */
+const HEAL_DEFAULTS = {
+  bootScan: false,
+  sendScan: false,
+  skipUnchanged: false,
+  changeRescan: true,
+  changePurge: true,
+  changeHeadGuard: true,
+  bootTitleWarm: true,
+  bootHeadGuard: true,
+  bootTrueDelete: true,
+  pressureCalibration: true,
+  watchDebounceMs: 1500,
+  watchPollMs: 60000,
+  pressureCalibrationIntervalMs: 0,
+}
+/** 数值选项的上下限（越界回退默认并记 problem）。 */
+const HEAL_NUMBER_LIMITS = {
+  watchDebounceMs: { min: 200, max: 600000 },
+  watchPollMs: { min: 5000, max: 3600000 },
+  pressureCalibrationIntervalMs: { min: 0, max: 3600000 },
+}
 let healOptionsCache = { at: 0, value: null }
+
+/** 归一化一份用户选项（布尔只认布尔、数值夹到区间内，非法一律回默认）。 */
+function normalizeHealOptions(raw) {
+  return applyHealPatch({ ...HEAL_DEFAULTS }, raw)
+}
+
+/**
+ * 把 patch 应用到 base 上（**patch 语义**：只改给出的键，其它保留）。
+ *
+ * 为什么要 patch 而不是整表替换：设置页之外若有别处（或未来的脚本）只写一个字段，
+ * 整表替换会把用户其它设置悄悄重置成默认（单测抓到过）。非法值回退 **base 的值**
+ * 而不是出厂默认，语义才是「这一项没改成功」。
+ */
+function applyHealPatch(base, raw) {
+  const value = { ...base }
+  if (!raw || typeof raw !== 'object') return value
+  for (const k of Object.keys(HEAL_DEFAULTS)) {
+    if (!(k in raw)) continue
+    const def = HEAL_DEFAULTS[k]
+    const v = raw[k]
+    if (typeof def === 'boolean') {
+      if (typeof v === 'boolean') value[k] = v
+      continue
+    }
+    if (typeof def === 'number') {
+      const n = typeof v === 'number' ? v : Number(v)
+      if (!Number.isFinite(n)) continue
+      const lim = HEAL_NUMBER_LIMITS[k]
+      value[k] = lim === undefined ? n : Math.min(lim.max, Math.max(lim.min, Math.round(n)))
+    }
+  }
+  return value
+}
 
 export function readHealOptions(home = dshHomeDir()) {
   const now = Date.now()
   if (healOptionsCache.value && now - healOptionsCache.at < 2000) return healOptionsCache.value
   let value = { ...HEAL_DEFAULTS }
   try {
-    const raw = JSON.parse(readFileSync(home + '/' + HEAL_OPTIONS_FILE, 'utf8'))
-    if (raw && typeof raw === 'object') for (const k of Object.keys(HEAL_DEFAULTS)) if (typeof raw[k] === 'boolean') value[k] = raw[k]
-  } catch { /* 无文件 = 默认全关 */ }
+    value = normalizeHealOptions(JSON.parse(readFileSync(home + '/' + HEAL_OPTIONS_FILE, 'utf8')))
+  } catch { /* 无文件 = 出厂默认 */ }
   healOptionsCache = { at: now, value }
   return value
 }
 
 export function writeHealOptions(next, home = dshHomeDir()) {
-  const value = { ...HEAL_DEFAULTS }
-  if (next && typeof next === 'object') for (const k of Object.keys(HEAL_DEFAULTS)) if (typeof next[k] === 'boolean') value[k] = next[k]
+  /* patch 语义：以「当前生效值」为底再应用本次改动，只写到盘上的那几个键会变。 */
+  const current = (() => {
+    try { return applyHealPatch({ ...HEAL_DEFAULTS }, JSON.parse(readFileSync(home + '/' + HEAL_OPTIONS_FILE, 'utf8'))) }
+    catch { return { ...HEAL_DEFAULTS } }
+  })()
+  const value = applyHealPatch(current, next)
   writeFileSync(home + '/' + HEAL_OPTIONS_FILE, JSON.stringify(value, null, 1), 'utf8')
   healOptionsCache = { at: Date.now(), value }
   return value
@@ -2929,6 +3046,56 @@ export function installVersionsRoute(ctx, config = {}) {
 }
 
 
+/**
+ * 手动触发路由（2026-10-16 用户要求「也要允许手动启动校准」）：
+ *   POST /dsh-adapter-compat/calibrate-now  —— 立刻跑一次 contextPressure 校准
+ *   POST /dsh-adapter-compat/warm-now       —— 立刻跑一次标题预热 + 重扫
+ * 两条都不受「开机/变化」开关影响：开关关着也能手动跑。
+ */
+export function installManualRoutes(ctx, config = {}) {
+  if (config?.manualRoutes === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') return false
+    const reply = (res, status, obj) => {
+      try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+    }
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/calibrate-now',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        try {
+          if (typeof compatHooks.calibrate !== 'function') return reply(res, 503, { ok: false, error: '校准未安装（插件未加载完或已关闭）' })
+          compatHooks.calibrate(true)
+          appendCompatLog('calibrate-now: 手动触发')
+          return reply(res, 200, { ok: true })
+        } catch (error) {
+          return reply(res, 500, { ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    })
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/warm-now',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        try {
+          const r = await runTitleWarmNow(ctx)
+          return reply(res, r.ok ? 200 : 500, r)
+        } catch (error) {
+          return reply(res, 500, { ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    })
+    appendCompatLog('manual routes registered (calibrate-now / warm-now)')
+    return true
+  } catch (e) {
+    appendCompatLog('manual routes FAILED: ' + String(e?.message ?? e).slice(0, 200))
+    return false
+  }
+}
+
 export function apply(ctx, config = {}) {
   // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
   try {
@@ -2984,6 +3151,13 @@ export function apply(ctx, config = {}) {
     installInvisibleSweeper(ctx, config)
   } catch {
     /* 扫除器起不来不拖垮 apply */
+  }
+
+  // -3.61) 手动触发路由（立即校准 / 立即重扫；不受开机与变化开关影响）
+  try {
+    installManualRoutes(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
   }
 
   /* -3.56) 开机一次性扫（2026-10-13 用户定案）：
@@ -3094,10 +3268,23 @@ export function apply(ctx, config = {}) {
       /* 无投影面时静默：这是显示校准，不是硬功能 */
     }
   }
-  installPressureCalibration()
-  for (const ms of [1000, 3000, 8000]) {
-    const t = setTimeout(() => installPressureCalibration(ms === 8000), ms)
-    if (typeof t.unref === 'function') t.unref()
+  const onCal = readHealOptions()
+  /* 「立即校准」的手动入口：不管开关怎样都能随时跑一次（设置页按钮用）。 */
+  compatHooks.calibrate = (final = true) => installPressureCalibration(final)
+  if (onCal.pressureCalibration !== false) {
+    installPressureCalibration()
+    for (const ms of [1000, 3000, 8000]) {
+      const t = setTimeout(() => installPressureCalibration(ms === 8000), ms)
+      if (typeof t.unref === 'function') t.unref()
+    }
+    /* 定期重试（用户可配；0 = 只在启动那几轮跑一次，即 2026-10-16 之前的行为）。 */
+    if (Number.isFinite(onCal.pressureCalibrationIntervalMs) && onCal.pressureCalibrationIntervalMs > 0) {
+      const iv = setInterval(() => installPressureCalibration(true), onCal.pressureCalibrationIntervalMs)
+      if (typeof iv.unref === 'function') iv.unref()
+      appendCompatLog(`contextPressure calibration: 定期重试已开启（每 ${Math.round(onCal.pressureCalibrationIntervalMs / 1000)}s）`)
+    }
+  } else {
+    appendCompatLog('contextPressure calibration: 自动校准已关闭（仍可用设置页「立即校准」手动跑）')
   }
 
   const llm = ctx.llm

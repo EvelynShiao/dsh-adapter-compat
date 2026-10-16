@@ -69,6 +69,36 @@ window.__ModuleLoader__.load({
       thresholdDesc: 'auto 模式下低于该值直接发输入框，超过才打包 .txt',
       exitNote: '改完点保存即生效，不用重启',
       save: '保存',
+      /* 扫描与校准频率（2026-10-16 用户要求：频率/自动扫描/校准都要能控，且要能手跑） */
+      cadNav: '扫描与校准频率',
+      cadDesc: '控制「什么时候扫」和「扫多勤」——默认值就是插件长期以来的行为',
+      cadChangeTitle: '会话盘变化后（含 dsh-sync 同步落盘）自动做什么：',
+      cadRescan: '标题预热 + 重扫列表',
+      cadRescanDesc: '变化稳定后补标题投影并刷新会话列表；关掉则只在开机时做',
+      cadPurge: '真删除扫描',
+      cadPurgeDesc: '变化后跟一次墓碑清理（幂等）；不需要可关掉，省全盘扫',
+      cadHead: '头保护扫描',
+      cadHeadDesc: '变化后检查「无头会话」；同步进来的文件最容易缺头',
+      cadDebounce: '变化后台稳定时间',
+      cadDebounceDesc: '越小越灵敏、越费 IO；文件还在写时不会触发（等指纹稳定）',
+      cadPoll: '兜底轮询间隔',
+      cadPollDesc: 'fs.watch 漏事件时的保底检查（正常情况用不到）',
+      cadBootTitle: '开机时自动做：',
+      cadBootWarm: '开机预热标题（12s / 60s 各一轮）',
+      cadBootWarmDesc: '让侧栏标题在启动后尽快正常显示',
+      cadBootHead: '开机头保护（4s / 25s 预筛 + 45s 深扫）',
+      cadBootHeadDesc: '深扫会整读+校验，最费 IO；关掉可明显减轻启动期负载',
+      cadBootTrueDelete: '开机真删除补清（1.2s / 2.5s / 5s / 30s 四个窗口）',
+      cadBootTrueDeleteDesc: '赶在会话被激活成 live 之前清墓碑；关掉则只靠变化后扫描',
+      cadCalTitle: '上下文占用校准（contextPressure）：',
+      cadCal: '自动校准',
+      cadCalDesc: '修正「显示还剩 10% 却报超 1M」那类偏差；关掉不影响对话，只是显示值可能偏',
+      cadCalInterval: '定期重试间隔',
+      cadCalIntervalDesc: '0 = 只在启动那几轮跑一次（长期以来的行为）',
+      cadManualNote: '手动触发（不受上面开关影响）：',
+      cadManualCal: '立即校准',
+      cadManualWarm: '立即重扫标题',
+      cadRestartHint: '⚠️ 开关与频率在插件启动时读一次，改完请重启 DSH 生效；两个手动按钮随时可用。',
       /* 版本家族与磁盘占用（2026-10-16） */
       verNav: '版本家族与磁盘占用',
       verDesc: '分叉会话会复制父会话的历史，这里列出各版本家族的体积，可按需清理旧版本',
@@ -646,6 +676,8 @@ window.__ModuleLoader__.load({
     }
 
     function HealSection() {      const [opts, setOpts] = useState({ bootScan: false, sendScan: false, skipUnchanged: false })
+      const [manualBusy, setManualBusy] = useState('')
+      const [manualNote, setManualNote] = useState('')
       const [loaded, setLoaded] = useState(false)
       const [saving, setSaving] = useState(false)
       const [saved, setSaved] = useState('')
@@ -708,6 +740,44 @@ window.__ModuleLoader__.load({
           h('span', null, ...kids))
       }
 
+      /** 数值选项行（scale=1000 时界面按秒显示）。 */
+      const numRow = (key, title, desc, { min, max, step = 1, scale = 1, unit = '' } = {}) => h('div', { className: 'ac-check', style: { alignItems: 'flex-start' } },
+        h('span', null,
+          h('div', { className: 'ac-row-title', style: { display: 'inline' } }, title),
+          h('div', { className: 'ac-row-desc' }, desc),
+          h('span', { style: { display: 'inline-flex', gap: '6px', alignItems: 'center', marginTop: '4px' } },
+            h('input', {
+              className: 'ac-btn',
+              type: 'number',
+              style: { width: '120px' },
+              min, max, step,
+              value: String(Math.round(Number(opts[key] ?? 0) / scale)),
+              onChange: (e) => {
+                const n = Number(e.target.value)
+                if (!Number.isFinite(n)) return
+                setOpts((o) => ({ ...o, [key]: Math.round(n * scale) }))
+              },
+            }),
+            unit ? h('span', { className: 'ac-row-desc' }, unit) : null)))
+
+      /** 手动触发按钮（不受上面开关影响 —— 用户要求「也要允许手动启动校准」）。 */
+      const manualBtn = (route, label, key) => h('button', {
+        className: 'ac-btn',
+        disabled: manualBusy === key,
+        onClick: async () => {
+          setManualBusy(key)
+          setManualNote('')
+          try {
+            const r = await fetchJson(route, { method: 'POST' })
+            setManualNote(r.ok && r.data && r.data.ok ? `${label}：完成` : `${label}失败：${String(r.data && r.data.error ? r.data.error : '未知')}`)
+          } catch (e) {
+            setManualNote(`${label}失败：${String(e && e.message ? e.message : e)}`)
+          } finally {
+            setManualBusy('')
+          }
+        },
+      }, manualBusy === key ? '执行中…' : label)
+
       const head = h('div', { className: 'ac-row' },
         h('div', null,
           h('div', { className: 'ac-row-title' }, ZH.healNav),
@@ -760,6 +830,27 @@ window.__ModuleLoader__.load({
               buttons,
               reportBlock,
               fixBlock),
+            /* 2026-10-16 用户要求：扫描频率/自动扫描/校准频率都做成开关，手动校准也要有。 */
+            h(Fold, { key: 'cadence', title: ZH.cadNav, desc: ZH.cadDesc },
+              h('div', { className: 'ac-row-desc' }, ZH.cadChangeTitle),
+              checkRow('changeRescan', ZH.cadRescan, ZH.cadRescanDesc),
+              checkRow('changePurge', ZH.cadPurge, ZH.cadPurgeDesc),
+              checkRow('changeHeadGuard', ZH.cadHead, ZH.cadHeadDesc),
+              numRow('watchDebounceMs', ZH.cadDebounce, ZH.cadDebounceDesc, { min: 0.2, max: 600, unit: '秒', scale: 1000 }),
+              numRow('watchPollMs', ZH.cadPoll, ZH.cadPollDesc, { min: 5, max: 3600, unit: '秒', scale: 1000 }),
+              h('div', { className: 'ac-row-desc', style: { marginTop: '6px' } }, ZH.cadBootTitle),
+              checkRow('bootTitleWarm', ZH.cadBootWarm, ZH.cadBootWarmDesc),
+              checkRow('bootHeadGuard', ZH.cadBootHead, ZH.cadBootHeadDesc),
+              checkRow('bootTrueDelete', ZH.cadBootTrueDelete, ZH.cadBootTrueDeleteDesc),
+              h('div', { className: 'ac-row-desc', style: { marginTop: '6px' } }, ZH.cadCalTitle),
+              checkRow('pressureCalibration', ZH.cadCal, ZH.cadCalDesc),
+              numRow('pressureCalibrationIntervalMs', ZH.cadCalInterval, ZH.cadCalIntervalDesc, { min: 0, max: 3600, unit: '秒（0 = 只在启动跑一次）', scale: 1000 }),
+              h('div', { className: 'ac-row' },
+                h('div', { className: 'ac-row-desc' }, ZH.cadManualNote),
+                h('div', { style: { display: 'flex', gap: '8px' } },
+                  manualBtn('/dsh-adapter-compat/calibrate-now', ZH.cadManualCal, 'cal'),
+                  manualBtn('/dsh-adapter-compat/warm-now', ZH.cadManualWarm, 'warm'))),
+              h('div', { className: 'ac-row-desc' }, manualNote || ZH.cadRestartHint)),
             h(Fold, { key: 'inv', title: ZH.invNav, desc: ZH.invDesc }, h(InvisibleBlock)),
             h(Fold, { key: 'ver', title: ZH.verNav, desc: ZH.verDesc }, h(VersionsBlock)))
         : h('div', { className: 'ac-row-desc' }, '加载选项…')
