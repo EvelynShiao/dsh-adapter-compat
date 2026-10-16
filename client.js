@@ -82,6 +82,8 @@ window.__ModuleLoader__.load({
       invNote: '删除是真删不留副本；正在运行的会话会被跳过',
       /* 会话日志修复分区文案（2026-10-13） */
       healNav: '会话日志修复',
+      healMain: '清理与体检',
+      healMainDesc: '三个开关、保存选项、全面体检与修复结果（默认收起）',
       healDesc: '清理会话日志里的残缺工具结果（断流/加载失败留下），修复前自动备份',
       healBoot: '开机自动扫',
       healBootDesc: '启动 15 秒后一次性扫描并修复（不加定时器，不常驻）',
@@ -393,13 +395,13 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const head = h('div', { className: 'ac-row' },
-        h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.exitNav),
-          h('div', { className: 'ac-row-desc' }, ZH.exitDesc)))
+      /* 折叠项（2026-10-16 用户要求「每个大项加折叠、默认折叠」）：
+         外层 Fold 提供标题与展开按钮，内容才是真正的控件。
+         好处：在「会话与提示词」里它一定以**一行可见标题**出现，不会被误认为「没做进来」。 */
+      const wrap = (kids) => h(Fold, { title: ZH.exitNav, desc: ZH.exitDesc }, ...kids)
 
       if (!prefs) {
-        return h('div', { className: 'ac-settings' }, head, h('div', { className: 'ac-row-desc' }, '读取设置…'))
+        return wrap([h('div', { className: 'ac-row-desc' }, '读取设置…')])
       }
 
       const pagerRow = h('div', { className: 'ac-row' },
@@ -439,7 +441,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'ac-row-desc' }, note || ZH.exitNote),
         h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? '保存中…' : ZH.save))
 
-      return h('div', { className: 'ac-settings' }, head, pagerRow, modeRow, thresholdRow, foot)
+      return wrap([pagerRow, modeRow, thresholdRow, foot])
     }
 
     /* ── 版本家族与磁盘占用（9999.9.25）──────────────────────────
@@ -750,13 +752,14 @@ window.__ModuleLoader__.load({
 
       const body = loaded
         ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
-            checkRow('bootScan', ZH.healBoot, ZH.healBootDesc),
-            checkRow('sendScan', ZH.healSend, ZH.healSendDesc, opts.sendScan ? null : ZH.healSendWarn),
-            checkRow('skipUnchanged', ZH.healSkip, ZH.healSkipDesc),
-            buttons,
-            reportBlock,
-            fixBlock,
-            /* 子块默认折叠（2026-10-16 用户要求）：点标题展开。 */
+            /* 2026-10-16 用户要求：本分区里**每个大项**都折叠、默认收起（点标题或右侧按钮展开）。 */
+            h(Fold, { key: 'main', title: ZH.healMain, desc: ZH.healMainDesc },
+              checkRow('bootScan', ZH.healBoot, ZH.healBootDesc),
+              checkRow('sendScan', ZH.healSend, ZH.healSendDesc, opts.sendScan ? null : ZH.healSendWarn),
+              checkRow('skipUnchanged', ZH.healSkip, ZH.healSkipDesc),
+              buttons,
+              reportBlock,
+              fixBlock),
             h(Fold, { key: 'inv', title: ZH.invNav, desc: ZH.invDesc }, h(InvisibleBlock)),
             h(Fold, { key: 'ver', title: ZH.verNav, desc: ZH.verDesc }, h(VersionsBlock)))
         : h('div', { className: 'ac-row-desc' }, '加载选项…')
