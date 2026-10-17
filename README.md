@@ -1,5 +1,65 @@
 # dsh-adapter-compat
 
+### 9999.9.39：失效附件覆盖到 inbox 投递记录
+
+9999.9.38 修完表面消息后，实测还剩 4 处失效图**只在 `agent/inbox/spliced` 的
+`data.inserted[].content[]` 里**（`afa6ba0b#3822`、`6aaf3c22#2369`/`#3348`、`ca6dd1c1#2816`）。
+
+它们不直接进请求（请求走 `user/message` 投影），但宿主一旦按 splice 重放 inbox
+就会把坏引用重新搬回表面。`healDeadAttachments` 现在覆盖宿主所有承载内容块的位置：
+
+| 事件 | 位置 |
+|---|---|
+| `user/message`、`system/message` | `data.content` |
+| `tool/result`、`assistant/message` | `data.message.content` |
+| `agent/inbox/spliced` | `data.inserted[].content` |
+| `session/title-llm-request` | `data.messages[].content` |
+
+只换 content 里的块类型，**不动 inserted 的长度/顺序/id/source**
+（inbox 链校验 `checkInboxSplices` 看的是 seq 链与 id）；没有失效块的事件
+原对象透传，不产生写盘 diff。
+
+单测：`test/dead-attachments-inbox.test.js`（4 例）。全量 207 通过 / 0 失败。
+
+### 9999.9.38：失效附件（图/文件）占位符真的生效了
+
+**症状**（用户报告）：设计上「用占位符替代失效文件/图片」，但
+`Primary Request and Intent The` 会话里的图片没被替换，发给 DeepSeek 官方 API 直接被拒收；
+插件的「会话日志修复」扫描却显示**所有对话正常**。
+
+**根因三条，缺一条都修不好**：
+
+1. **判据只查结构，不查字节**。`isBrokenAttachmentBlock` 只验
+   `block.attachment.attachmentId` 是否存在；实测 `session-afa6ba0b` 的截图
+   `attachmentId=sha256:0f7034b2…` 结构完好，但 `attachments/v1/objects/0f/` 下
+   **那个对象已经不在盘上**。官方路由 `prepareImages` → `readImageRequest` → ENOENT →
+   `ATTACHMENT_NOT_FOUND`，**整轮请求失败**（不是模型看不到图，是发都发不出去）。
+   另实测 `session-6aaf3c22`（2 颗）、`session-ca6dd1c1`（1 颗）同样缺失。
+2. **出口守卫默认根本没跑**。`sendScan` 默认 `false`（2026-10-13 用户定案），
+   而失效附件修复当时被塞在同一个开关里 → 默认整条链路不执行。
+3. **潜伏 bug：正常的 tool-call 会被当成残缺丢掉**。`repairToolCallBlock` 在
+   「无需修复」时也返回 `null`，调用方把 `null` 当「必须丢弃」→ 一旦 `sendScan` 打开，
+   整轮所有 `tool_use` 全被丢掉，第 ⑤ 步再把结果全合成占位，等于把工具历史抹平。
+
+**修法**：
+
+- 新增 `attachments.js`：`attachmentAvailability()` 判据 = 结构 **且** 字节
+  （优先走宿主 `imageHostPath` / `fileHostPath`；服务拿不到时按
+  `dsh-attachment-local` 布局 `<home>/attachments/v1/{objects,files}/<xx>/<sha>` 兜底）。
+- `guardRequestMessages` 拆成「第零遍：失效附件 → `[NaN] [image unavailable]` 占位」
+  （**恒跑**，不受 `sendScan` 控制）+ 原有结构修（仍受开关控制）。
+  tool 结果的图片块同样处理（`tool/result` 里的图也会让官方路由拒收）。
+- 盘上一次性修复：`healDeadAttachments()`，接进 `POST heal-tools`（`deadAttachments` 明细）
+  与 `GET heal-scan`（`withDeadAttachments` / `totalDeadAttachments`）——
+  **扫描不再假阴性**：以前「所有对话正常」是因为这一项压根没查。
+- `repairToolCallBlock` 无改动时返回**原块**，`null` 只表示「无法修复、必须丢弃」。
+
+**实测**（只读扫描真实 76 个会话）：flagged=3 会话 / 4 颗失效图片，
+`afa6ba0b#3826`、`6aaf3c22#2373`、`6aaf3c22#3352`、`ca6dd1c1#2820`，reason 全是 `missing`。
+
+单测：`test/attachment-placeholder.test.js`（8 例）+ `test/dead-attachments.test.js`（6 例）。
+全量 201 通过 / 0 失败。
+
 ### 9999.9.36：正文里的 `<thinking>` 标签剥离（思考链不再被当正文打印）
 
 **症状**（用户截图 + 日志实证，`session-1895273e`，模型 `dsh:deepseek-v4.1-flash`）：

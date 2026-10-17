@@ -12,6 +12,7 @@
  * 默认开启（结构摘要很小）；config.wireTap === false 关闭。
  */
 import { appendFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs'
+import { attachmentAvailability, placeholderForBlock } from './attachments.js'
 
 export const WIRE_TAP_FILE = 'llm-wire.jsonl'
 const MAX_BYTES = 8 * 1024 * 1024
@@ -197,7 +198,10 @@ export function isBrokenAttachmentBlock(block) {
  *   arguments 缺失/空/非法 JSON → '{}'（结构合法；调用本已执行过，参数只是回显）
  *   name 缺失 → unknown_tool（保 id 配对，名字无法凭空造）
  *   id 缺失 → 返回 null = 无法修复，调用方丢弃该块（无 id 无法与 tool_result 配对）
- * @returns {object|null} 修复后的新块；null = 建议丢弃
+ *   完全正常 → 原样返回同一个对象（**不能返回 null**：调用方把 null 当「必须丢弃」，
+ *   2026-10-17 修 —— 旧实现无改动的正常调用也返回 null，于是「发送前扫」一开就会把
+ *   整轮所有 tool_use 全丢掉，接着 ⑤ 又把结果全合成占位，等于把工具历史抹平）
+ * @returns {object|null} 修复后的块（或原块）；null = 建议丢弃
  */
 export function repairToolCallBlock(block) {
   if (typeof block.id !== 'string' || block.id.length === 0) return null
@@ -206,7 +210,7 @@ export function repairToolCallBlock(block) {
   if (typeof nb.arguments !== 'string' || nb.arguments.length === 0) { nb.arguments = '{}'; changed = true }
   else { try { JSON.parse(nb.arguments) } catch { nb.arguments = '{}'; changed = true } }
   if (typeof nb.name !== 'string' || nb.name.length === 0) { nb.name = UNKNOWN_TOOL_NAME; changed = true }
-  return changed ? nb : null
+  return changed ? nb : block
 }
 
 /**
@@ -241,23 +245,68 @@ export function reorderAssistantContent(content) {
  *   ③ assistant tool-call 无 id      → 丢块（无 id 无法配对，留着必拒）
  *   ④ tool 结果找不到对应 tool_use（孤儿）→ 丢条（留着拒整轮，丢只丢一条）
  *   ⑤ tool_use 没有对应结果（断流断在工具执行中）→ 合成 [内容已清除] 占位结果
- *   ⑥ image/file 块 attachment 残缺（加载失败）→ 丢块保会话
+ *   ⑥ image/file 块失效 → 占位符替换（见下）
  * 外加重排：assistant 里 tool-call 之后不许再有 text。
  *
- * 两遍处理：第一遍修 assistant 内容（此时才知道最终哪些 id 被宣告），
+ * ⑥ 的判据（2026-10-17 补）：结构残缺（attachment/attachmentId 缺失）**以及**
+ * 字节失效（附件对象在盘上没了 / 读不出来）。只查结构是不够的 —— 实测
+ * session-afa6ba0b 的截图 attachmentId=sha256:0f7034b2… 结构完好，但
+ * attachments/v1/objects 里那个对象已经不在了：官方 DeepSeek 路由
+ * `readImageRequest` → ENOENT → ATTACHMENT_NOT_FOUND，整轮发不出去。
+ * 现在这类块被**替换成占位文本**（`WIRE_PLACEHOLDER` + 类型标记，见 placeholderForBlock；
+ * 不再静默丢块：丢了用户消息可能变空，且界面上看不出发生过什么）。
+ *
+ * 两遍处理：第一遍修 assistant/user/tool 内容（此时才知道最终哪些 id 被宣告），
  * 第二遍按修后 id 集合判孤儿/补缺失结果 —— 顺序不能反。
  *
  * 全部只改「这一份要发出去的 request」，历史零改动。
  *
+ * @param {object} options - 待发请求
+ * @param {{attachments?:object, home?:string, placeholder?:string, structural?:boolean}} [deps]
+ *   `attachments` = 宿主附件服务；`home` = DSH 主目录（服务拿不到时按本地附件库布局兜底）
+ *   `structural` = 是否做结构修（默认 true；false 时只做失效附件占位）
  * @returns {{request:object,...counters}|null} null = 无需修补
  */
-export function guardRequestMessages(options) {
+export function guardRequestMessages(options, deps = {}) {
   const messages = options?.messages
   if (!Array.isArray(messages)) return null
-  const counters = { repaired: 0, reordered: 0, fixedCalls: 0, droppedCalls: 0, droppedOrphans: 0, droppedBlobs: 0, synthesized: 0 }
+  const attachments = deps?.attachments
+  const home = typeof deps?.home === 'string' && deps.home !== '' ? deps.home : undefined
+  const placeholder = typeof deps?.placeholder === 'string' ? deps.placeholder : WIRE_PLACEHOLDER
+  /* droppedBlobs 是旧计数器（那时是丢块），现在恒为 0，保留字段只为不破坏既有读日志的地方；
+     真正的计数在 placeholderBlobs。 */
+  const counters = { repaired: 0, reordered: 0, fixedCalls: 0, droppedCalls: 0, droppedOrphans: 0, droppedBlobs: 0, placeholderBlobs: 0, synthesized: 0 }
 
-  // ── 第一遍：重建 assistant/user 的内容 ──
-  const rebuilt = messages.map((message) => {
+  /* 一个 image/file 块是否不可用：结构残缺 或 字节失效。 */
+  const unusable = (block) => {
+    if (block?.type !== 'image' && block?.type !== 'file') return false
+    if (isBrokenAttachmentBlock(block)) return true
+    return attachmentAvailability({ attachments, home, block }).ok === false
+  }
+  /* 不可用 → 占位文本块；可用 → 原块。 */
+  const settleBlock = (block) => {
+    if (!unusable(block)) return block
+    counters.placeholderBlobs += 1
+    return placeholderForBlock(block, placeholder)
+  }
+
+  // ── 第零遍：失效附件 → 占位（无条件执行）──
+  /* 与结构修分开的理由：结构修受「发送前扫」开关控制（默认关，用户 2026-10-13 定案），
+     而失效附件不是「省成本」的问题 —— 官方路由读不到对象会整轮拒收，所以这一遍恒跑。
+     成本：只在消息里真的出现 image/file 块时才 stat 一次，其余消息零开销。 */
+  const settled = messages.map((message) => {
+    if (!message || typeof message !== 'object' || !Array.isArray(message.content)) return message
+    const content = message.content.map(settleBlock)
+    return content.some((b, i) => b !== message.content[i]) ? { ...message, content } : message
+  })
+
+  if (deps?.structural === false) {
+    if (counters.placeholderBlobs === 0) return null
+    return { request: { ...options, messages: settled }, ...counters }
+  }
+
+  // ── 第一遍：重建 assistant/tool-call 的内容 ──
+  const rebuilt = settled.map((message) => {
     if (!message || typeof message !== 'object') return message
     if (message.role === 'assistant' && Array.isArray(message.content)) {
       const kept = []
@@ -269,7 +318,6 @@ export function guardRequestMessages(options) {
           kept.push(fixed)
           continue
         }
-        if (isBrokenAttachmentBlock(b)) { counters.droppedBlobs += 1; continue }
         kept.push(b)
       }
       const reordered = reorderAssistantContent(kept)
@@ -279,10 +327,6 @@ export function guardRequestMessages(options) {
         return { ...message, content: finalBlocks }
       }
       return message
-    }
-    if (message.role === 'user' && Array.isArray(message.content)) {
-      const kept = message.content.filter((b) => { if (isBrokenAttachmentBlock(b)) { counters.droppedBlobs += 1; return false } return true })
-      if (kept.length !== message.content.length) return { ...message, content: kept }
     }
     return message
   })
@@ -463,9 +507,18 @@ export function installWireGuard(ctx, deps = {}) {
   const log = typeof deps?.log === 'function' ? deps.log : () => {}
   const budgetConfig = deps?.config ?? {}
   /* 发送前扫开关（2026-10-13 用户定案）：设置页「会话日志修复」的 sendScan 复选框。
-     关掉后步骤①的结构修（空 tool 结果占位 / tool-call 重排 / 孤儿丢弃 / 残图丢块）
-     整体跳过 —— 内存零成本的操作也省掉，但 DeepSeek 可能重新拒收残缺载荷。 */
+     关掉后**结构修**（空 tool 结果占位 / tool-call 重排 / 孤儿丢弃 / 缺结果合成）整体跳过；
+     失效附件占位不受此开关控制（那类块会让官方路由整轮拒收，见 guardRequestMessages）。 */
   const getOptions = typeof deps?.getOptions === 'function' ? deps.getOptions : null
+  /* 附件服务：安装时机（apply）可能还没就绪（cordis 服务懒加载的经典坑），
+     所以每次请求现取一次，而不是安装时抓一次。拿不到 = 只做结构校验。 */
+  const attachmentsOf = () => {
+    try {
+      if (deps?.attachments) return deps.attachments
+      if (typeof ctx?.get === 'function') return ctx.get('attachments')
+      return ctx?.attachments
+    } catch { return undefined }
+  }
   const llm = ctx?.llm ?? ctx
   if (!llm || typeof llm.streamWithRegistration !== 'function') return 0
   let patched = 0
@@ -478,16 +531,16 @@ export function installWireGuard(ctx, deps = {}) {
       /* 配置字段（provider/model/reasoningEffort/temperature/maxTokens/stop）有没有被我们改过 */
       let configChanged = false
       try {
-        /* ① 结构修：空 tool 结果补占位符 + tool-call 之后的 text 重排到前面
-           只动 messages —— callConfigEquals 不比较 messages，所以不需要同步 prepared。
-           受「发送前扫」开关控制（默认关；关掉 = 内存零成本的兜底也省，代价是 DeepSeek
-           可能重新拒收残缺载荷）。 */
-        if (getOptions?.()?.sendScan !== false) {
-          const guarded = guardRequestMessages(next)
-          if (guarded) {
-            log({ t: new Date().toISOString(), event: 'wire-guard', via: 'streamWithRegistration', repaired: guarded.repaired, reordered: guarded.reordered, provider: next?.provider, model: next?.model })
-            next = guarded.request
-          }
+        /* ① 出口修：失效附件 → 占位（**恒跑**，见 guardRequestMessages 第零遍）
+           + 结构修（空 tool 结果补占位 / tool-call 重排 / 孤儿丢弃 / 缺结果合成）。
+           结构修受「发送前扫」开关控制（默认关）；失效附件不归它管 —— 官方路由
+           读不到附件对象是整轮拒收，不是省成本的事。
+           只动 messages —— callConfigEquals 不比较 messages，所以不需要同步 prepared。 */
+        const structural = getOptions?.()?.sendScan !== false
+        const guarded = guardRequestMessages(next, { attachments: attachmentsOf(), home: deps?.home ?? homeDir(), structural })
+        if (guarded) {
+          log({ t: new Date().toISOString(), event: 'wire-guard', via: 'streamWithRegistration', structural, repaired: guarded.repaired, reordered: guarded.reordered, placeholderBlobs: guarded.placeholderBlobs, provider: next?.provider, model: next?.model })
+          next = guarded.request
         }
       } catch { /* 修补失败不阻断请求 */ }
       try {
@@ -542,10 +595,10 @@ export function installWireTap(ctx, config = {}, deps = {}) {
   /* 出口修 v2 先装（真正生效的那条路）。llm 服务此刻可能还没就绪：记一行，再定时重试。 */
   let guardPatched = 0
   if (guard) {
-    try { guardPatched = installWireGuard(ctx, { log: append, config, getOptions: deps.getOptions }) } catch { guardPatched = 0 }
+    try { guardPatched = installWireGuard(ctx, { log: append, config, getOptions: deps.getOptions, home }) } catch { guardPatched = 0 }
     append({ t: new Date().toISOString(), event: 'wire-guard-installed', targets: guardPatched })
     for (const ms of [1000, 3000, 8000]) {
-      const t = setTimeout(() => { try { if (guardPatched === 0) guardPatched = installWireGuard(ctx, { log: append, config, getOptions: deps.getOptions }) } catch { /* ignore */ } }, ms)
+      const t = setTimeout(() => { try { if (guardPatched === 0) guardPatched = installWireGuard(ctx, { log: append, config, getOptions: deps.getOptions, home }) } catch { /* ignore */ } }, ms)
       if (typeof t.unref === 'function') t.unref()
     }
   }
@@ -555,7 +608,7 @@ export function installWireTap(ctx, config = {}, deps = {}) {
         try {
           if (guard) {
             /* 兜底：llm 服务若一直没拿到，用瀑布的 this（LlmRuntime 实例）现场补装一次 */
-            if (guardPatched === 0) { try { guardPatched = installWireGuard(this, { log: append, config, getOptions: deps.getOptions }) } catch { /* ignore */ } }
+            if (guardPatched === 0) { try { guardPatched = installWireGuard(this, { log: append, config, getOptions: deps.getOptions, home }) } catch { /* ignore */ } }
             const n = repairWireRequest(options)
             if (n > 0) append({ t: new Date().toISOString(), event: 'wire-guard', via: 'in-place', repaired: n, provider: options?.provider, model: options?.model })
             const left = countBlankToolMessages(options)

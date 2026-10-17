@@ -114,7 +114,7 @@ window.__ModuleLoader__.load({
       healNav: '会话日志修复',
       healMain: '清理与体检',
       healMainDesc: '三个开关、保存选项、全面体检与修复结果（默认收起）',
-      healDesc: '清理会话日志里的残缺工具结果（断流/加载失败留下），修复前自动备份',
+      healDesc: '清理会话日志里的残缺工具结果与失效附件（断流/加载失败/附件对象丢失留下），修复前自动备份',
       healBoot: '开机自动扫',
       healBootDesc: '启动 15 秒后一次性扫描并修复（不加定时器，不常驻）',
       healSend: '发送前扫',
@@ -798,6 +798,14 @@ window.__ModuleLoader__.load({
         if (report.withBlanks > 0) {
           kids.push(h('div', null, h('b', null, `${report.withBlanks} 个会话共 ${report.totalBlanks} 条空工具结果`)))
           kids.push(h('div', null, '（断流/附件加载失败留下的残缺；发送前扫会兜底，也可点下面按钮根治到盘上）'))
+        }
+        /* 失效附件（9999.9.38）：以前完全不查，所以「所有对话正常」是假阴性 ——
+           结构完好、字节已不在磁盘上的图片块会让官方 DeepSeek 整轮拒收。 */
+        if (report.totalDeadAttachments > 0) {
+          kids.push(h('div', null, h('b', null, `${report.withDeadAttachments} 个会话共 ${report.totalDeadAttachments} 个失效附件（图片/文件已不在磁盘上）`)))
+          kids.push(h('div', null, '（发给 DeepSeek 官方 API 会整轮拒收；出口守卫会替换成占位，也可点下面按钮根治到盘上）'))
+        }
+        if (report.withBlanks > 0 || report.totalDeadAttachments > 0) {
           kids.push(h('div', { style: { marginTop: '6px' } },
             h('button', { className: 'ac-btn ac-btn-primary', disabled: fixing, onClick: fix },
               fixing ? ZH.healRepairing : ZH.healRepair)))

@@ -99,6 +99,7 @@ import { redactEventPayload, redactSessionFile } from './purge.js'
 import { readSession, writeSession, verify as verifySessionEvents } from './true-delete.js'
 import { guardSessionFile, probeProtectedHead } from './head-guard.js'
 import { installWireTap, healBlankToolResults } from './wire-tap.js'
+import { healDeadAttachments } from './attachments.js'
 import { slimSession } from './slim.js'
 import { repairEvents, scanFile, describeGap } from './repair.js'
 import { installOrderRoute } from './order.js'
@@ -853,6 +854,12 @@ function serviceOf(ctx, name) {
   } catch {
     return undefined
   }
+}
+
+/** 附件服务（失效附件判定用）。拿不到 = 退回「按磁盘布局推断」，见 attachments.js。 */
+function attachmentsService(ctx) {
+  const svc = serviceOf(ctx, 'attachments')
+  return svc && typeof svc === 'object' ? svc : undefined
 }
 
 /** 读一份持久化会话的完整事件（复刻宿主的 handle 风格读取）。 */
@@ -2038,14 +2045,22 @@ export async function healSessionFile(ctx, sessionId, options = {}) {
       { code: 'INPUT_DENSE_FAILED', problems: dense.problems })
   }
   const plan = healBlankToolResults(scan.events)
+  /* 失效附件（2026-10-17）：结构完好但字节不在盘上的 image/file 引用 → 占位。
+     和空 tool 结果一起修，理由相同：盘上的坏引用会在下一次压缩/分叉/换路由时
+     重新变成整轮拒收（官方 DeepSeek 走 readImageRequest → ENOENT）。 */
+  const attPlan = healDeadAttachments(plan.events, { attachments: attachmentsService(ctx), home })
+  const healedEvents = attPlan.events
+  const alreadyHealthy = plan.alreadyHealthy && attPlan.alreadyHealthy
   const base = {
     ok: true, write, id: sessionId,
-    alreadyHealthy: plan.alreadyHealthy,
-    wouldHeal: plan.healed.length,
+    alreadyHealthy,
+    wouldHeal: plan.healed.length + attPlan.healed.length,
     healed: plan.healed.slice(0, 20),
+    deadAttachments: attPlan.healed.slice(0, 20),
+    wouldHealAttachments: attPlan.healed.length,
     warnings: scan.warnings,
   }
-  if (plan.alreadyHealthy) return { ...base }
+  if (alreadyHealthy) return { ...base }
   if (!write) return base
 
   const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR + '-heal'
@@ -2057,7 +2072,7 @@ export async function healSessionFile(ctx, sessionId, options = {}) {
   } catch { backupPath = null }
   if (!backupPath) throw Object.assign(new Error('backup failed; refusing to write'), { code: 'BACKUP_FAILED' })
 
-  writeSession(located.file, scan.header, plan.events)
+  writeSession(located.file, scan.header, healedEvents)
   const back = readSession(located.file)
   const dense2 = assertRowsDense(back.events)
   const v2 = verifySessionEvents(back.header, back.events)
@@ -2073,8 +2088,8 @@ export async function healSessionFile(ctx, sessionId, options = {}) {
     const fp = fileFingerprint(located.file)
     if (fp) { const st = readHealState(home); st[sessionId] = fp; writeHealState(st, home) }
   } catch { /* ignore */ }
-  appendCompatLog(`heal ${sessionId.slice(0, 18)}: blank tool results=${plan.healed.length}`)
-  return { ...base, healedCount: plan.healed.length, backup: true }
+  appendCompatLog(`heal ${sessionId.slice(0, 18)}: blank tool results=${plan.healed.length} dead attachments=${attPlan.healed.length}`)
+  return { ...base, healedCount: plan.healed.length, healedAttachments: attPlan.healed.length, backup: true }
 }
 
 /* ── 会话日志修复：用户选项与指纹（2026-10-13 用户定案）──────────────────
@@ -2223,11 +2238,11 @@ function fileFingerprint(file) {
   try { const st = statSync(file); return { size: st.size, mtimeMs: Math.floor(st.mtimeMs) } } catch { return null }
 }
 
-/** 只读巡检：统计每个会话的空 tool 结果数（不修）。供 heal-scan 面板显示。 */
+/** 只读巡检：统计每个会话的空 tool 结果数 + 失效附件数（不修）。供 heal-scan 面板显示。 */
 export function healScanAll(home = dshHomeDir(), options = {}) {
   const skipUnchanged = options.skipUnchanged === true
   const state = skipUnchanged ? readHealState(home) : {}
-  const out = { ok: true, scanned: 0, withBlanks: 0, totalBlanks: 0, skippedUnchanged: 0, sessions: [], unreadable: [] }
+  const out = { ok: true, scanned: 0, withBlanks: 0, totalBlanks: 0, withDeadAttachments: 0, totalDeadAttachments: 0, skippedUnchanged: 0, sessions: [], unreadable: [] }
   for (const entry of listSessionFiles(home)) {
     out.scanned += 1
     try {
@@ -2239,11 +2254,26 @@ export function healScanAll(home = dshHomeDir(), options = {}) {
       const scan = scanFile(entry.file)
       if (scan.error) { out.unreadable.push({ id: entry.id, error: scan.error }); continue }
       const plan = healBlankToolResults(scan.events)
+      /* 失效附件（2026-10-17）：只读检查，不动文件。这一项以前完全没有，
+         所以「所有对话正常」是假阴性 —— 结构完好、字节没了的图片块没人看得见。 */
+      const attPlan = healDeadAttachments(scan.events, { attachments: options.attachments, home })
+      const row = { id: entry.id }
+      let hit = false
       if (plan.healed.length > 0) {
         out.withBlanks += 1
         out.totalBlanks += plan.healed.length
-        out.sessions.push({ id: entry.id, blanks: plan.healed.length, sample: plan.healed.slice(0, 3) })
+        row.blanks = plan.healed.length
+        row.sample = plan.healed.slice(0, 3)
+        hit = true
       }
+      if (attPlan.healed.length > 0) {
+        out.withDeadAttachments += 1
+        out.totalDeadAttachments += attPlan.healed.length
+        row.deadAttachments = attPlan.healed.length
+        row.deadSample = attPlan.healed.slice(0, 5)
+        hit = true
+      }
+      if (hit) out.sessions.push(row)
     } catch (error) {
       out.unreadable.push({ id: entry.id, error: String(error?.message ?? error) })
     }
@@ -2364,8 +2394,8 @@ export function installRepairRoute(ctx, config = {}) {
           try {
             const url = new URL(req.url, 'http://127.0.0.1')
             const skipUnchanged = url.searchParams.get('skipUnchanged') === '1' || readHealOptions().skipUnchanged === true
-            const report = healScanAll(undefined, { skipUnchanged })
-            appendCompatLog(`heal-scan: scanned=${report.scanned} withBlanks=${report.withBlanks} totalBlanks=${report.totalBlanks} unchanged=${report.skippedUnchanged}`)
+            const report = healScanAll(undefined, { skipUnchanged, attachments: attachmentsService(ctx) })
+            appendCompatLog(`heal-scan: scanned=${report.scanned} withBlanks=${report.withBlanks} totalBlanks=${report.totalBlanks} withDeadAttachments=${report.withDeadAttachments} totalDeadAttachments=${report.totalDeadAttachments} unchanged=${report.skippedUnchanged}`)
             return reply(200, { ok: true, report })
           } catch (e) { return reply(500, { ok: false, error: String(e?.message ?? e) }) }
         },
