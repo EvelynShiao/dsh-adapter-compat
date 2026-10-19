@@ -2495,6 +2495,13 @@ export function readExitPrefs(home = dshHomeDir()) {
     compactionFileMode: mode,
     compactionFileThresholdChars: threshold,
     hideVersionPager: own.hideVersionPager !== false,
+    /* 知识库自然语言协议全局开关（2026-10-19）：真源同放 webin config.json
+       （webin 每请求现读），默认开。 */
+    kbProtocol: webin.kbProtocol !== false,
+    /* 自然语言工具调用（通用，2026-10-19）：默认关（保守）。 */
+    nlToolProtocol: webin.nlToolProtocol === true,
+    /* 标题 LDW 前缀（2026-10-19）：默认开。 */
+    titlePrefix: webin.titlePrefix !== false,
   }
 }
 
@@ -2522,6 +2529,18 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
     if (typeof patch.hideVersionPager !== 'boolean') errors.push('hideVersionPager 应为布尔')
     else if (patch.hideVersionPager !== next.hideVersionPager) { next.hideVersionPager = patch.hideVersionPager; touchOwn = true }
   }
+  if (patch?.kbProtocol !== undefined) {
+    if (typeof patch.kbProtocol !== 'boolean') errors.push('kbProtocol 应为布尔')
+    else if (patch.kbProtocol !== next.kbProtocol) { next.kbProtocol = patch.kbProtocol; touchWebin = true }
+  }
+  if (patch?.nlToolProtocol !== undefined) {
+    if (typeof patch.nlToolProtocol !== 'boolean') errors.push('nlToolProtocol 应为布尔')
+    else if (patch.nlToolProtocol !== next.nlToolProtocol) { next.nlToolProtocol = patch.nlToolProtocol; touchWebin = true }
+  }
+  if (patch?.titlePrefix !== undefined) {
+    if (typeof patch.titlePrefix !== 'boolean') errors.push('titlePrefix 应为布尔')
+    else if (patch.titlePrefix !== next.titlePrefix) { next.titlePrefix = patch.titlePrefix; touchWebin = true }
+  }
   if (errors.length > 0) return { ok: false, error: errors.join('；') }
 
   try {
@@ -2531,11 +2550,14 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
       const webin = readJsonOr(webinPath, {})
       webin.compactionFileMode = next.compactionFileMode
       webin.compactionFileThresholdChars = next.compactionFileThresholdChars
+      webin.kbProtocol = next.kbProtocol
+      webin.nlToolProtocol = next.nlToolProtocol
+      webin.titlePrefix = next.titlePrefix
       writeJsonAtomic(webinPath, webin)
     }
     if (touchOwn) writeJsonAtomic(exitPrefsPath(home), { hideVersionPager: next.hideVersionPager })
     if (touchWebin || touchOwn) {
-      appendCompatLog(`exit-prefs saved: mode=${next.compactionFileMode} threshold=${next.compactionFileThresholdChars} hidePager=${next.hideVersionPager}`)
+      appendCompatLog(`exit-prefs saved: mode=${next.compactionFileMode} threshold=${next.compactionFileThresholdChars} hidePager=${next.hideVersionPager} kbProtocol=${next.kbProtocol} nlTool=${next.nlToolProtocol} titlePrefix=${next.titlePrefix}`)
     }
     return { ok: true, value: next, changed: { webin: touchWebin, own: touchOwn } }
   } catch (error) {

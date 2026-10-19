@@ -57,8 +57,14 @@ window.__ModuleLoader__.load({
       errOther: '移动失败',
       orderNav: '侧栏排序',
       /* 压缩 .txt 出口 + 版本分页器（2026-10-16） */
-      exitNav: '压缩出口与版本分页器',
-      exitDesc: '压缩摘要的 .txt 出口开关，以及「版本切换」按钮的显隐（值写真源仍是 webin 配置，改完即时生效）',
+      exitNav: '压缩出口 / 自然语言协议 / 版本分页器',
+      exitDesc: '压缩摘要的 .txt 出口开关、知识库/通用自然语言协议全局开关、标题前缀，以及「版本切换」按钮的显隐（值写真源仍是 webin 配置，改完即时生效）',
+      kbLabel: '知识库自然语言协议',
+      kbDesc: '开：模型说「我要调动第一层/第二层知识库，搜索xx」会被翻译成真正的检索调用（lite-chat-kb 预设配套，网页端不露代码块，降低风控特征）；关：这句话按普通文字处理',
+      nlToolLabel: '自然语言工具调用（通用）',
+      nlToolDesc: '开：模型说「我要用工具 <工具名>，参数 {...}」也会翻译成真正调用——动态映射（从本轮工具目录现查名字，工具增减无需改代码）；默认关（保守）',
+      titlePrefixLabel: '标题 LDW 前缀',
+      titlePrefixDesc: '开：走 LDW 网页端时机器生成的会话标题带「LDW 」前缀（前缀识别清理靠它）；关：原样',
       pagerLabel: '「版本切换」按钮',
       pagerDesc: '分叉会话 / 修改过对话后出现在消息下方的版本分页器（dsh-easyrewrite 提供）',
       pagerHidden: '已隐藏',
@@ -467,11 +473,38 @@ window.__ModuleLoader__.load({
           onChange: (e) => setPrefs((p) => ({ ...p, compactionFileThresholdChars: Number(e.target.value) })),
         }))
 
+      const kbRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.kbLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.kbDesc)),
+        h('button', {
+          className: 'ac-btn',
+          onClick: () => setPrefs((p) => ({ ...p, kbProtocol: p.kbProtocol !== false ? false : true })),
+        }, prefs.kbProtocol !== false ? '开启' : '关闭'))
+
+      const nlRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.nlToolLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.nlToolDesc)),
+        h('button', {
+          className: 'ac-btn',
+          onClick: () => setPrefs((p) => ({ ...p, nlToolProtocol: p.nlToolProtocol === true ? false : true })),
+        }, prefs.nlToolProtocol === true ? '开启' : '关闭'))
+
+      const titleRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.titlePrefixLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.titlePrefixDesc)),
+        h('button', {
+          className: 'ac-btn',
+          onClick: () => setPrefs((p) => ({ ...p, titlePrefix: p.titlePrefix !== false ? false : true })),
+        }, prefs.titlePrefix !== false ? '开启' : '关闭'))
+
       const foot = h('div', { className: 'ac-row' },
         h('div', { className: 'ac-row-desc' }, note || ZH.exitNote),
         h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? '保存中…' : ZH.save))
 
-      return wrap([pagerRow, modeRow, thresholdRow, foot])
+      return wrap([pagerRow, modeRow, thresholdRow, kbRow, nlRow, titleRow, foot])
     }
 
     /* ── 版本家族与磁盘占用（9999.9.25）──────────────────────────
