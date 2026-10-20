@@ -585,6 +585,166 @@ function insertCandidates(gap, events) {
   return buildExtendedCandidates(gap, events)
 }
 
+/* ============ 结构字段自愈（healStructure） ============
+ * 背景（2026-10-20 实证 session-beae66b3 / session-4ce9464e）：
+ * 「真删除」擦除时若用**白名单**只留定位标量（turn/step/retryId/attemptId/reason），
+ * 会把宿主校验必需的字段一起吃掉：帧完好、JSON 合法，但一加载就抛
+ *   - llm/retry 缺 provider/mode/policyKey/retry/delayMs/failure
+ *     → "retry must be a non-negative safe integer"
+ *   - llm/retry-started 缺 retry → 同上
+ *   - developer/message 的 content 被清空（tool-addition 块没了）但 headerSeq 还在
+ *     → "format v4 developer/message must omit headerSeq without tool additions"
+ * 这类损坏没有 seq 断号（行一条没少），补行修不了，只能把**结构字段补回去**。
+ *
+ * 原则：只补缺、绝不覆盖已有值；推不出来的（如缺 retryId）只报告不动手；
+ * 调用方必须 verify 全绿才允许落盘。
+ */
+const RETRY_FALLBACK_POLICY_KEY = '["normal",5,["EMPTY_RESPONSE","RATE_LIMIT","SERVER","TIMEOUT","TRANSPORT"],500,10000,0.1]'
+/** 占位正文：与 slim.js / purge.js 的 [内容已清除] 同一惯例。 */
+const HEAL_PLACEHOLDER = '[内容已清除]'
+const isSeq = (v) => Number.isSafeInteger(v) && v >= 0
+
+/** 从 attempt 的 stream 里取 finish 失败信息（llm/retry.failure 的唯一可靠来源）。 */
+function finishFailureOf(stream) {
+  if (!Array.isArray(stream)) return null
+  for (let i = stream.length - 1; i >= 0; i -= 1) {
+    const chunk = stream[i]?.chunk
+    if (chunk?.type !== 'finish') continue
+    const f = chunk.reason?.failure
+    if (f && typeof f.message === 'string' && f.message && typeof f.code === 'string' && f.code) {
+      return { message: f.message, code: f.code }
+    }
+  }
+  return null
+}
+
+/**
+ * 补回被白名单式擦除吃掉的**结构必需字段**（不改正文、不改 seq、不增删行）。
+ * @param {object} header - 会话头（只读）
+ * @param {object[]} events - 事件数组（不就地修改）
+ * @returns {{events:object[], healed:object[], problems:string[]}}
+ */
+export function healStructure(header, events) {
+  const healed = []
+  const problems = []
+  if (!Array.isArray(events)) return { events, healed, problems }
+  const out = []
+  let provider = null
+  const retries = []
+  let lastFailure = null
+
+  for (let i = 0; i < events.length; i += 1) {
+    const ev = events[i]
+    const d = ev?.data
+    if (!ev || typeof ev !== 'object' || !d || typeof d !== 'object') { out.push(ev); continue }
+    let data = null
+    const notes = []
+    const take = () => { if (data === null) data = { ...d } }
+
+    if (ev.type === 'request/header') {
+      const p = d.header?.config?.provider
+      if (typeof p === 'string' && p) provider = p
+    }
+
+    if (ev.type === 'assistant/attempt') {
+      const f = finishFailureOf(d.stream)
+      if (f) lastFailure = f
+      if (!Array.isArray(d.stream)) { take(); data.stream = []; notes.push('stream 补空数组') }
+    }
+
+    if (ev.type === 'llm/retry') {
+      take()
+      if (typeof data.retryId !== 'string' || !data.retryId) {
+        problems.push(`llm/retry@${ev.seq} 缺 retryId，无法推断所属策略链（不补）`)
+      } else {
+        if (typeof data.provider !== 'string' || !data.provider) {
+          if (provider) { data.provider = provider; notes.push('provider 取自最近的 request/header') }
+          else problems.push(`llm/retry@${ev.seq} 缺 provider 且前面没有 request/header`)
+        }
+        if (data.mode !== 'normal' && data.mode !== 'always') { data.mode = 'normal'; notes.push('mode 补 normal') }
+        let policySeed = null
+        if (typeof data.policyKey !== 'string' || !data.policyKey) {
+          /* 优先取同 turn/step/provider 的上一次重试（同一策略链），退而同会话任意一条，
+             再退默认串。policyKey 只要求非空且链内一致，不影响正文语义。 */
+          const sameChain = [...retries].reverse().find((r) => typeof r.policyKey === 'string' && r.policyKey
+            && r.turn === data.turn && r.step === data.step && r.provider === data.provider)
+          const anyRetry = [...retries].reverse().find((r) => typeof r.policyKey === 'string' && r.policyKey)
+          policySeed = sameChain ?? anyRetry ?? null
+          data.policyKey = policySeed ? policySeed.policyKey : RETRY_FALLBACK_POLICY_KEY
+          notes.push(policySeed ? 'policyKey 取自同一策略链' : 'policyKey 用默认策略串')
+        }
+        const prior = [...retries].reverse().find((r) => ['turn', 'step', 'provider', 'policyKey'].every((k) => r[k] === data[k]))
+        if (!isSeq(data.retry) || data.retry === 0) {
+          data.retry = prior === undefined ? 1 : prior.retry + 1
+          notes.push(`retry 补 ${data.retry}（链内序号）`)
+        }
+        if (data.mode === 'normal') {
+          const floor = Math.max(data.retry, 1)
+          /* 已有合法 maxRetries 就绝不覆盖（只补缺）；只在缺失/非法/小于 retry 时才补。 */
+          if (!isSeq(data.maxRetries) || data.maxRetries < floor) {
+            /* 继承顺序：同链上一条 → policyKey 的来源那条（同一策略的原始参数）→ 至少 retry。 */
+            const inherited = [prior?.maxRetries, policySeed?.maxRetries].find((v) => isSeq(v) && v >= floor)
+            const next = inherited ?? Math.max(floor, 5)
+            data.maxRetries = next
+            notes.push(`maxRetries 补 ${next}`)
+          }
+        } else if (data.maxRetries !== undefined) {
+          delete data.maxRetries
+          notes.push('always 模式去掉 maxRetries')
+        }
+        if (typeof data.delayMs !== 'number' || !Number.isFinite(data.delayMs) || data.delayMs < 0 || data.delayMs > 2147483647) {
+          const inherited = prior?.delayMs
+          data.delayMs = typeof inherited === 'number' && Number.isFinite(inherited) && inherited >= 0 ? inherited : 0
+          notes.push(`delayMs 补 ${data.delayMs}`)
+        }
+        const f = data.failure
+        if (!f || typeof f !== 'object' || typeof f.message !== 'string' || !f.message || typeof f.code !== 'string' || !f.code) {
+          data.failure = lastFailure ?? { message: HEAL_PLACEHOLDER, code: 'SERVER' }
+          notes.push(lastFailure ? 'failure 取自上一条 attempt 的 finish 错误' : 'failure 用占位')
+        }
+        retries.push(data)
+      }
+    }
+
+    if (ev.type === 'llm/retry-started') {
+      take()
+      if (typeof data.retryId !== 'string' || !data.retryId) {
+        problems.push(`llm/retry-started@${ev.seq} 缺 retryId（不补）`)
+      } else if (!isSeq(data.retry) || data.retry === 0) {
+        const scheduled = [...retries].reverse().find((r) => r.retryId === data.retryId && r.turn === data.turn && r.step === data.step)
+          ?? [...retries].reverse().find((r) => r.retryId === data.retryId)
+        if (scheduled) { data.retry = scheduled.retry; notes.push(`retry 取自配对的 llm/retry = ${scheduled.retry}`) }
+        else problems.push(`llm/retry-started@${ev.seq} 找不到可配对的 llm/retry（不补）`)
+      }
+    }
+
+    if (ev.type === 'developer/message') {
+      const blocks = d.message?.content
+      const hasAdd = Array.isArray(blocks) && blocks.some((b) => b && b.type === 'tool-addition')
+      if (!hasAdd && Object.hasOwn(d, 'headerSeq')) {
+        take()
+        delete data.headerSeq
+        notes.push('无 tool-addition，删掉 headerSeq')
+      } else if (hasAdd && !isSeq(d.headerSeq)) {
+        let found
+        for (let k = i - 1; k >= 0; k -= 1) {
+          if (events[k]?.type === 'request/header' && isSeq(events[k].seq)) { found = events[k].seq; break }
+        }
+        if (found !== undefined) { take(); data.headerSeq = found; notes.push(`headerSeq 补 ${found}（最近更早的 request/header）`) }
+        else problems.push(`developer/message@${ev.seq} 有 tool-addition 但缺 headerSeq，且前面没有 request/header`)
+      }
+    }
+
+    if (data !== null) {
+      out.push({ ...ev, data })
+      if (notes.length > 0) healed.push({ seq: ev.seq, type: ev.type, notes })
+    } else {
+      out.push(ev)
+    }
+  }
+  return { events: out, healed, problems }
+}
+
 /**
  * 对整个会话做断号修复（纯函数，不碰文件）。
  * @param {object} header - 会话头

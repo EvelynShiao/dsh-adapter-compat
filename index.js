@@ -101,7 +101,7 @@ import { guardSessionFile, probeProtectedHead } from './head-guard.js'
 import { installWireTap, healBlankToolResults } from './wire-tap.js'
 import { healDeadAttachments } from './attachments.js'
 import { slimSession } from './slim.js'
-import { repairEvents, scanFile, describeGap } from './repair.js'
+import { repairEvents, scanFile, describeGap, healStructure } from './repair.js'
 import { installOrderRoute } from './order.js'
 import {
   installEgressNormalizer as installEgressNormalizerImpl,
@@ -1925,7 +1925,10 @@ export async function repairSessionFile(ctx, sessionId, options = {}) {
   }
   const scan = scanFile(located.file)
   if (scan.error) throw Object.assign(new Error('session unreadable: ' + scan.error), { code: 'READ_FAILED' })
-  const plan = repairEvents(scan.header, scan.events)
+  /* 两步走：① 结构字段自愈（白名单式擦除吃掉的必填标量 / 失效的 headerSeq）
+     ② seq 断号补行。第二步在第一步的结果上做，两者共用同一条 verify 门。 */
+  const heal = healStructure(scan.header, scan.events)
+  const plan = repairEvents(scan.header, heal.events)
   const base = {
     ok: plan.ok,
     write,
@@ -1935,13 +1938,25 @@ export async function repairSessionFile(ctx, sessionId, options = {}) {
     warnings: scan.warnings,
     unsupported: plan.unsupported,
     wouldInsert: plan.inserted.length,
+    healed: heal.healed,
+    wouldHeal: heal.healed.length,
+    healProblems: heal.problems,
     verifyProblems: plan.problems,
   }
-  if (plan.alreadyHealthy) return { ...base, ok: true, alreadyHealthy: true, wouldInsert: 0 }
+  if (plan.alreadyHealthy && heal.healed.length === 0) return { ...base, ok: true, alreadyHealthy: true, wouldInsert: 0 }
   if (!plan.ok) {
     throw Object.assign(new Error('repair plan rejected: ' + (plan.problems[0] ?? 'unsupported gap shape')), { code: 'PLAN_REJECTED', plan: base })
   }
-  if (!write) return base
+  const finalEvents = plan.fixed ?? heal.events
+  /* 落盘前先验：补出来的结构字段必须真的让宿主校验全绿，否则宁可不修。 */
+  const v0 = verifySessionEvents(scan.header, finalEvents)
+  if (!v0.ok) {
+    throw Object.assign(new Error('healed log still fails verify: ' + (v0.problems[0] ?? 'unknown')), {
+      code: 'PLAN_REJECTED',
+      plan: { ...base, ok: false, verifyProblems: (v0.problems ?? []).slice(0, 8) },
+    })
+  }
+  if (!write) return { ...base, ok: true }
 
   // 备份失败就拒写：修复是可选项，不值得冒没备份的险
   const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR + '-repair'
@@ -1953,19 +1968,19 @@ export async function repairSessionFile(ctx, sessionId, options = {}) {
   } catch { backupPath = null }
   if (!backupPath) throw Object.assign(new Error('backup failed; refusing to write'), { code: 'BACKUP_FAILED' })
 
-  writeSession(located.file, scan.header, plan.fixed)
+  writeSession(located.file, scan.header, finalEvents)
   const back = readSession(located.file)
   const v2 = verifySessionEvents(back.header, back.events)
   if (!v2.ok) {
     try { copyFileSync(backupPath, located.file) } catch { /* 尽力回滚 */ }
     throw Object.assign(new Error('post-write verify failed; rolled back'), { code: 'VERIFY_FAILED', problems: v2.problems })
   }
-  const result = { ...base, ok: true, inserted: plan.inserted.length, backup: true }
+  const result = { ...base, ok: true, inserted: plan.inserted.length, healedCount: heal.healed.length, backup: true }
   // 内容变了 → 投影要冷重建
   try { rmSync(home + '/storages/session_projcache/sessions/' + sessionId + '.json', { force: true }) } catch { /* ignore */ }
   try { const sessions = serviceOf(ctx, 'sessions'); if (typeof sessions?.refresh === 'function') await sessions.refresh() } catch { /* ignore */ }
   try { result.bytes = statSync(located.file).size } catch { /* ignore */ }
-  appendCompatLog(`repair ${sessionId.slice(0, 18)}: gaps=${plan.gaps.length} inserted=${plan.inserted.length}`)
+  appendCompatLog(`repair ${sessionId.slice(0, 18)}: gaps=${plan.gaps.length} inserted=${plan.inserted.length} healed=${heal.healed.length}`)
   return result
 }
 
@@ -1981,8 +1996,10 @@ export function repairScanAll(home = dshHomeDir()) {
     try {
       const scan = scanFile(entry.file)
       if (scan.error) { out.unreadable.push({ id: entry.id, error: scan.error }); out.ok = false; continue }
+      /* 结构字段自愈的巡检（无 seq 断号但字段被吃掉的会话，加载同样会失败）。 */
+      const heal = healStructure(scan.header, scan.events)
       if (scan.gaps.length > 0) {
-        const plan = repairEvents(scan.header, scan.events)
+        const plan = repairEvents(scan.header, heal.events)
         out.bad.push({
           id: entry.id,
           gaps: scan.gaps.map(describeGap),
@@ -1990,6 +2007,21 @@ export function repairScanAll(home = dshHomeDir()) {
           warnings: scan.warnings,
           repairable: plan.ok,
           unsupported: plan.unsupported,
+          healed: heal.healed,
+          healProblems: heal.problems,
+        })
+        out.ok = false
+      } else if (heal.healed.length > 0 || heal.problems.length > 0) {
+        const v = verifySessionEvents(scan.header, heal.events)
+        out.bad.push({
+          id: entry.id,
+          gaps: [],
+          warnings: scan.warnings,
+          repairable: v.ok,
+          unsupported: [],
+          healed: heal.healed,
+          healProblems: heal.problems,
+          verifyProblems: (v.problems ?? []).slice(0, 8),
         })
         out.ok = false
       } else {
