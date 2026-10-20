@@ -412,10 +412,16 @@ window.__ModuleLoader__.load({
           const r = await fetchJson(EXIT_PREFS, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
+            /** ⚠️ 全量发（2026-10-20 修「保存弹回」bug：此前只发 3 个键，
+             *  kbProtocol/nlToolProtocol/titlePrefix 没进 body ⇒ 后端收不到 ⇒
+             *  下次 GET 又读回旧值——用户看到「一点保存就弹回去」。 */
             body: JSON.stringify({
               compactionFileMode: prefs.compactionFileMode,
               compactionFileThresholdChars: prefs.compactionFileThresholdChars,
               hideVersionPager: prefs.hideVersionPager,
+              kbProtocol: prefs.kbProtocol !== false,
+              nlToolProtocol: prefs.nlToolProtocol === true,
+              titlePrefix: prefs.titlePrefix !== false,
             }),
           })
           if (r.ok && r.data && r.data.ok) {
