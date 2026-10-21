@@ -31,8 +31,11 @@
 /** 出口规范化器标记（防止重复包装）。 */
 export const EGRESS_NORMALIZER = Symbol.for('dsh-adapter-compat.egress-normalizer')
 
+/** 自然语言调用翻译（2026-10-21 重建——全局 egress 层，API 车道同样生效）。 */
+import { translateUtterance } from './nl-utterance.js'
+
 /** 统计（自检接口展示；>0 说明真的在干活）。 */
-export const egressStats = { thinkingStripped: 0, xmlToolCalls: 0, markersDropped: 0, skippedByScope: 0 }
+export const egressStats = { thinkingStripped: 0, xmlToolCalls: 0, markersDropped: 0, skippedByScope: 0, nlUtterances: 0 }
 
 /** 内置「网页端」路由判定前缀：webin 的路由名形如 `webin-<平台>`（见 webin 的 routeFor()）。 */
 export const BUILTIN_WEB_ROUTE_PREFIX = 'webin'
@@ -365,7 +368,26 @@ export function finalizeEgressText(fullText, opts = {}) {
   const parsed = parseXmlToolCalls(text)
   if (parsed.clean !== text) { text = parsed.clean; parts.push('xml-markers') }
   const convert = opts.xmlTools === 'convert' && opts.allowConvert === true && parsed.calls.length > 0
-  return { text, calls: convert ? parsed.calls : [], parts }
+  let calls = convert ? parsed.calls : []
+  /**
+  * 自然语言调用（全局版，2026-10-21 重建——第六批版本灾后丢失）：
+  * KB 协议 > 通用工具协议 > 不翻。命中时正文置空（人话不重复显示），
+  * 产出 tool-call 块由流包装层发射（reason 同步改 tool-calls）。
+  * 与 .txt 出口不冲突：NL 在【回复端】翻译，.txt 在【发送端】打包——不同端。
+  */
+  if (calls.length === 0 && opts.nlUtterance?.enabled === true) {
+    const hit = translateUtterance(text, opts.tools ?? [], {
+      kb: opts.nlUtterance.kb !== false,
+      nl: opts.nlUtterance.nl === true,
+    })
+    if (hit !== null) {
+      calls = [hit]
+      text = ''
+      parts.push('nl-utterance')
+      egressStats.nlUtterances += 1
+    }
+  }
+  return { text, calls, parts }
 }
 
 /**
@@ -377,6 +399,9 @@ export function normalizeEgressOptions(raw = {}) {
   return {
     thinking: raw?.egressThinking !== false,
     xmlTools: raw?.egressXmlTools === 'convert' ? 'convert' : (raw?.egressXmlTools === 'off' ? 'off' : 'strip'),
+    /* NL 协议全局开关（真源 webin config 的 kbProtocol/nlToolProtocol——同排钮控制两道）。 */
+    kbProtocol: raw?.kbProtocol !== false,
+    nlToolProtocol: raw?.nlToolProtocol === true,
   }
 }
 
@@ -439,6 +464,13 @@ function normalizeEgressStream(inner, options, opts, log) {
     let maxIndex = -1
     let converted = 0
     let logged = false
+    /**
+    * NL 协议选项（2026-10-21 重建）：压缩请求/空工具目录不翻——
+    * 与 .txt 出口互不干扰（NL 翻译在回复端，.txt 在发送端）。
+    */
+    const nlUtteranceOpts = options?.purpose === 'compaction' || toolNames.size === 0
+      ? { enabled: false }
+      : { enabled: true, kb: opts.kbProtocol !== false, nl: opts.nlToolProtocol === true }
     for await (const chunk of inner) {
       if (chunk === null || typeof chunk !== 'object') { yield chunk; continue }
       if (typeof chunk.index === 'number' && chunk.index > maxIndex) maxIndex = chunk.index
@@ -460,11 +492,14 @@ function normalizeEgressStream(inner, options, opts, log) {
       if (chunk.type === 'block-end' && chunk.block?.type === 'text' && typeof chunk.block.text === 'string') {
         const key = chunk.index ?? 0
         states.delete(key)
-        const f = finalizeEgressText(chunk.block.text, { ...opts, xmlTools: stripMarkers ? opts.xmlTools : 'off', allowConvert })
+        const f = finalizeEgressText(chunk.block.text, { ...opts, xmlTools: stripMarkers ? opts.xmlTools : 'off', allowConvert, tools: options?.tools ?? [], nlUtterance: nlUtteranceOpts })
         yield { ...chunk, block: { ...chunk.block, text: f.text } }
         if (f.parts.includes('thinking')) egressStats.thinkingStripped += 1
         if (f.parts.includes('xml-markers')) egressStats.markersDropped += 1
-        const usable = allowConvert ? f.calls.filter((c) => toolNames.has(c.name)) : []
+        /** NL 命中与 XML convert 共用「产调用 + reason→tool-calls」出口。 */
+        const usable = allowConvert
+          ? f.calls.filter((c) => toolNames.has(c.name))
+          : f.calls.filter((c) => toolNames.has(c.name) && f.parts.includes('nl-utterance'))
         for (const call of usable) {
           const idx = ++maxIndex
           const id = `call_egress_${idx}_${Math.random().toString(36).slice(2, 10)}`
