@@ -59,6 +59,12 @@ window.__ModuleLoader__.load({
       /* 压缩 .txt 出口 + 版本分页器（2026-10-16） */
       exitNav: '压缩出口 / 自然语言协议 / 版本分页器',
       exitDesc: '压缩摘要的 .txt 出口开关、知识库/通用自然语言协议全局开关、标题前缀，以及「版本切换」按钮的显隐（值写真源仍是 webin 配置，改完即时生效）',
+      directThresholdLabel: '.txt 直接发送阈值（全局）',
+      directThresholdDesc: 'API 通道不装附件（HTTP JSON 直传），此值仅作显示与未来兼容；LDW 侧用它判定大输入走 .txt',
+      txtChunkLabel: '附件分段阈值（全局）',
+      txtChunkDesc: '单段 .txt 上限字节；LDW 侧据此把大附件切 partN-ofM 逐段上传。API 通道不适用但保持可见（用户定案：全局入口一律完整呈现）',
+      chatOnlyLabel: '纯聊天模式（全局）',
+      chatOnlyDesc: '全局侧的纯聊天开关（与 LDW 的 lite-chat 预设对应）；API 通道由预设本身控制工具面，此处开关为统一入口展示',
       kbLabel: '知识库自然语言协议',
       kbDesc: '开：模型说「我要调动第一层/第二层知识库，搜索xx」会被翻译成真正的检索调用（lite-chat-kb 预设配套，网页端不露代码块，降低风控特征）；关：这句话按普通文字处理',
       nlToolLabel: '自然语言工具调用（通用）',
@@ -422,6 +428,11 @@ window.__ModuleLoader__.load({
               kbProtocol: prefs.kbProtocol !== false,
               nlToolProtocol: prefs.nlToolProtocol === true,
               titlePrefix: prefs.titlePrefix !== false,
+              /** 全局 .txt 三件套（2026-10-21 用户定案「都要弄上」）：
+               *  directSendThresholdChars/txtChunkBytes/chatOnly 写 webin config 同源。 */
+              directSendThresholdChars: Math.max(0, Number(prefs.directSendThresholdChars) || 0),
+              txtChunkBytes: Math.max(0, Number(prefs.txtChunkBytes) || 0),
+              chatOnly: prefs.chatOnly === true,
             }),
           })
           if (r.ok && r.data && r.data.ok) {
@@ -488,6 +499,38 @@ window.__ModuleLoader__.load({
           onClick: () => setPrefs((p) => ({ ...p, kbProtocol: p.kbProtocol !== false ? false : true })),
         }, prefs.kbProtocol !== false ? '开启' : '关闭'))
 
+      /** 全局 .txt 三件套（2026-10-21 用户定案「不管实际用不用都要弄上」）——
+       *  directSendThresholdChars / txtChunkBytes / chatOnly（纯聊天）。
+       *  全局侧写 webin config 同源（LDW 优先生效，除非 LDW 侧点跟随全局）。 */
+      const directThresholdRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.directThresholdLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.directThresholdDesc)),
+        h('input', {
+          className: 'ac-btn',
+          type: 'number', min: 0, step: 1000, style: { width: '140px' },
+          value: String(prefs.directSendThresholdChars ?? 6000),
+          onChange: (e) => setPrefs((p) => ({ ...p, directSendThresholdChars: Math.max(0, Number(e.target.value.replace(/\D/g, '')) || 0) })),
+        }))
+      const txtChunkRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.txtChunkLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.txtChunkDesc)),
+        h('input', {
+          className: 'ac-btn',
+          type: 'number', min: 0, step: 10240, style: { width: '140px' },
+          value: String(prefs.txtChunkBytes ?? 409600),
+          onChange: (e) => setPrefs((p) => ({ ...p, txtChunkBytes: Math.max(0, Number(e.target.value.replace(/\D/g, '')) || 0) })),
+        }))
+      const chatOnlyRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.chatOnlyLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.chatOnlyDesc)),
+        h('button', {
+          className: 'ac-btn',
+          onClick: () => setPrefs((p) => ({ ...p, chatOnly: p.chatOnly !== true })),
+        }, prefs.chatOnly === true ? '开启' : '关闭'))
+
       const nlRow = h('div', { className: 'ac-row' },
         h('div', null,
           h('div', { className: 'ac-row-title' }, ZH.nlToolLabel),
@@ -510,7 +553,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'ac-row-desc' }, note || ZH.exitNote),
         h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? '保存中…' : ZH.save))
 
-      return wrap([pagerRow, modeRow, thresholdRow, kbRow, nlRow, titleRow, foot])
+      return wrap([pagerRow, modeRow, thresholdRow, directThresholdRow, txtChunkRow, chatOnlyRow, kbRow, nlRow, titleRow, foot])
     }
 
     /* ── 版本家族与磁盘占用（9999.9.25）──────────────────────────

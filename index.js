@@ -2534,6 +2534,12 @@ export function readExitPrefs(home = dshHomeDir()) {
     nlToolProtocol: webin.nlToolProtocol === true,
     /* 标题 LDW 前缀（2026-10-19）：默认开。 */
     titlePrefix: webin.titlePrefix !== false,
+    /* 全局 .txt 三件套（2026-10-21 用户定案「都要弄上」）：同源 webin config。
+     *  API 通道不实际用附件（HTTP JSON 直传），但全局入口一律完整呈现；
+     *  LDW 侧优先生效，除非 LDW 覆盖键留空（跟随全局）。 */
+    directSendThresholdChars: Number(webin.directSendThresholdChars) > 0 ? Math.round(Number(webin.directSendThresholdChars)) : 6000,
+    txtChunkBytes: Number(webin.txtChunkBytes) > 0 ? Math.round(Number(webin.txtChunkBytes)) : 409600,
+    chatOnly: webin.chatOnly === true,
   }
 }
 
@@ -2573,6 +2579,21 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
     if (typeof patch.titlePrefix !== 'boolean') errors.push('titlePrefix 应为布尔')
     else if (patch.titlePrefix !== next.titlePrefix) { next.titlePrefix = patch.titlePrefix; touchWebin = true }
   }
+  /* 全局 .txt 三件套（2026-10-21）：直接透传 webin config（数字宽松校验）。 */
+  if (patch?.directSendThresholdChars !== undefined) {
+    const n = Number(patch.directSendThresholdChars)
+    if (!Number.isFinite(n) || n < 0) errors.push('directSendThresholdChars 应为非负数')
+    else if (Math.round(n) !== next.directSendThresholdChars) { next.directSendThresholdChars = Math.round(n); touchWebin = true }
+  }
+  if (patch?.txtChunkBytes !== undefined) {
+    const n = Number(patch.txtChunkBytes)
+    if (!Number.isFinite(n) || n < 0) errors.push('txtChunkBytes 应为非负数')
+    else if (Math.round(n) !== next.txtChunkBytes) { next.txtChunkBytes = Math.round(n); touchWebin = true }
+  }
+  if (patch?.chatOnly !== undefined) {
+    if (typeof patch.chatOnly !== 'boolean') errors.push('chatOnly 应为布尔')
+    else if (patch.chatOnly !== next.chatOnly) { next.chatOnly = patch.chatOnly; touchWebin = true }
+  }
   if (errors.length > 0) return { ok: false, error: errors.join('；') }
 
   try {
@@ -2585,6 +2606,9 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
       webin.kbProtocol = next.kbProtocol
       webin.nlToolProtocol = next.nlToolProtocol
       webin.titlePrefix = next.titlePrefix
+      webin.directSendThresholdChars = next.directSendThresholdChars
+      webin.txtChunkBytes = next.txtChunkBytes
+      webin.chatOnly = next.chatOnly
       writeJsonAtomic(webinPath, webin)
     }
     if (touchOwn) writeJsonAtomic(exitPrefsPath(home), { hideVersionPager: next.hideVersionPager })
