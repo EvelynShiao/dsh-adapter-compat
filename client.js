@@ -656,8 +656,10 @@ window.__ModuleLoader__.load({
 
       const famRows = data.families.slice(0, 12).map((fam) => {
         const forks = fam.members.filter((m) => m.isFork)
+        /* 2026-10-23 用户要求：成员行显示标题（后端已补 m.title：projcache →
+           session/title → 首条用户消息前 24 字兜底），认得出是谁。 */
         const members = fam.members.map((m) => h('div', { key: m.id, className: 'ac-row-desc', style: { fontFamily: 'monospace' } },
-          `${m.id.slice(0, 26)}  ${m.sizeMB}MB  ${m.isRoot ? '根' : '分叉'}${m.orphanFork ? '·孤' : ''}  ${m.mtime}`))
+          `${m.title ? `「${m.title}」` : ''}${m.id.slice(0, 26)}  ${m.sizeMB}MB  ${m.isRoot ? '根' : '分叉'}${m.orphanFork ? '·孤' : ''}  ${m.mtime}`))
         const actions = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
           h('span', { className: 'ac-row-desc' }, `${fam.sizeMB}MB`),
           confirmId === fam.root
@@ -671,7 +673,7 @@ window.__ModuleLoader__.load({
         return h('div', { key: fam.root, style: { borderTop: '1px solid var(--dsw-alias-border-subtle, #3333)', paddingTop: '6px' } },
           h('div', { className: 'ac-row' },
             h('div', null,
-              h('div', { className: 'ac-row-title' }, `家族 ${fam.root.slice(0, 26)}`),
+              h('div', { className: 'ac-row-title' }, fam.title ? `「${fam.title}」家族` : `家族 ${fam.root.slice(0, 26)}`),
               h('div', { className: 'ac-row-desc' }, `${fam.members.length} 个版本 · 分叉 ${forks.length} 条`)),
             actions),
           ...members)
