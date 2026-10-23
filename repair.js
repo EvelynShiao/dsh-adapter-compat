@@ -867,6 +867,211 @@ export function scanFile(file) {
   }
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 工具孤儿修复（2026-10-23 新增，session-f3bc4fd2 实证伤型）
+ *
+ * 伤型：真删除/擦除类工具把 assistant/message 的 content 数组清空（89 条全空），
+ *       但 **stream 字段完好**。宿主 restore 校验要求：
+ *         ① 每个 tool/call 都有前置「宣告」（assistant/message 里的 tool-call 块）；
+ *         ② 每条 assistant/message 的 content 与其嵌入流重放结果一致
+ *            （assertCurrentAssistantStreams）。
+ *       content 被清空 ⇒ 108 个 tool/call 变孤儿 ⇒ 会话打不开，
+ *       报错 "tool/call X has no advertised tool lifecycle"。
+ *
+ * 修法（无损，零编造）：content === BlockAssembler(stream).blocks()。
+ *       每条空 content 的 assistant/message，把 content 用**宿主自己的流重放语义**
+ *       从幸存的 stream 里重组回来——重组出的块天然满足 ①② 两条校验。
+ *       stream 与 content 都空的（真·无输出）不在修复范围，如实报告。
+ *       有 content 的健康行一律不碰。
+ *
+ * 流重放规格照抄宿主 worker.cjs 的 expandAssistantStream：
+ *   record.type === 'chunk'          → 原样 chunk
+ *   record.type === 'text-chunks'     → text-delta ×texts
+ *   record.type === 'reasoning-chunks'→ reasoning-delta ×texts
+ *   record.type === 'tool-call-chunks'→ tool-call-delta ×args（首片带 id/name）
+ *   BlockAssembler 的块组装语义（block-start / *-delta / finish / usage）与
+ *   dsh-llm 的 BlockAssembler 相同——这里内联移植，不 import 宿主（保持插件零宿主依赖）。
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/** 流记录 → 扁平 chunk 序列（宿主 expandAssistantStream 同款语义，去掉 time 校验的宽容版）。
+ *  非法记录返回 null（由调用方决定跳过哪条 assistant 消息，绝不半组装）。 */
+function expandStreamRecords(stream) {
+  const chunks = []
+  for (const record of stream) {
+    if (!record || typeof record !== 'object') return null
+    if (record.type === 'chunk') {
+      if (record.chunk === undefined) return null
+      chunks.push(record.chunk)
+      continue
+    }
+    if (record.type === 'text-chunks' || record.type === 'reasoning-chunks') {
+      if (!Array.isArray(record.texts) || record.texts.length === 0) return null
+      for (let i = 0; i < record.texts.length; i += 1) {
+        chunks.push({ type: record.type === 'text-chunks' ? 'text-delta' : 'reasoning-delta', index: record.index, text: record.texts[i] })
+      }
+      continue
+    }
+    if (record.type === 'tool-call-chunks') {
+      if (typeof record.id !== 'string' || !Array.isArray(record.args) || record.args.length === 0) return null
+      for (let i = 0; i < record.args.length; i += 1) {
+        const delta = { type: 'tool-call-delta', index: record.index, id: record.id, argumentsDelta: record.args[i] }
+        if (i === 0 && Object.hasOwn(record, 'name')) delta.name = record.name
+        chunks.push(delta)
+      }
+      continue
+    }
+    return null /* 未知记录类型：整条放弃（宁可不修，不修错） */
+  }
+  return chunks
+}
+
+/** BlockAssembler 的最小内联移植：只保留「chunks → content 块」的组装路径。
+ *  支持 block-start / *-delta / block-end / finish / usage。
+ *  实测（session-f3bc4fd2 seq 342）：DSH 的流里每个块都以 block-end 收尾，
+ *  **block-end 自带完整成品块**（text/id/name/arguments 全在）——重组优先用成品，
+ *  没有 block-end 的（中断流）才退回 delta 累加。与 dsh-llm 行为一致。 */
+function assembleBlocks(chunks) {
+  const blocks = []
+  const byIndex = new Map() /* index → 累加器（delta 路径用） */
+  const endedIndex = new Map() /* index → 成品块（block-end 路径用） */
+  for (const chunk of chunks) {
+    if (!chunk || typeof chunk !== 'object') return null
+    if (chunk.type === 'block-start') {
+      byIndex.set(chunk.index, { type: chunk.blockType, index: chunk.index, text: '', tool: null })
+      continue
+    }
+    if (chunk.type === 'block-end') {
+      endedIndex.set(chunk.index, chunk.block)
+      byIndex.delete(chunk.index)
+      continue
+    }
+    if (chunk.type === 'finish' || chunk.type === 'usage') continue
+    let open = byIndex.get(chunk.index)
+    if (open === undefined) {
+      if (endedIndex.has(chunk.index)) continue /* 块已收尾，迟到的 delta 丢弃（宿主同款宽容） */
+      return null /* 没开过块的 delta：放弃 */
+    }
+    if (chunk.type === 'text-delta') {
+      if (open.type !== 'text') return null
+      open.text += String(chunk.text ?? '')
+      continue
+    }
+    if (chunk.type === 'reasoning-delta') {
+      if (open.type !== 'reasoning') return null
+      open.text += String(chunk.text ?? '')
+      continue
+    }
+    if (chunk.type === 'tool-call-delta') {
+      if (open.type !== 'tool-call') return null
+      if (open.tool === null) open.tool = { id: chunk.id, name: chunk.name, arguments: '' }
+      else if (chunk.id !== undefined && chunk.id !== open.tool.id) return null
+      open.tool.arguments += String(chunk.argumentsDelta ?? '')
+      continue
+    }
+    return null /* 未知 chunk 类型 */
+  }
+  /* 输出顺序按流里出现的块 index 排序：先收尾的成品，后没收尾的累加器。 */
+  const allIndexes = [...new Set([...endedIndex.keys(), ...byIndex.keys()])]
+  for (const idx of allIndexes) {
+    if (endedIndex.has(idx)) {
+      blocks.push(endedIndex.get(idx))
+    } else {
+      blocks.push(finishBlock(byIndex.get(idx)))
+    }
+  }
+  return blocks.length > 0 ? blocks : (allIndexes.length > 0 ? [] : null)
+}
+
+/** 组装收尾：按块类型产出与宿主一致的结构。 */
+function finishBlock(open) {
+  if (open.type === 'text' || open.type === 'reasoning') {
+    return { type: open.type, text: open.text }
+  }
+  if (open.type === 'tool-call') {
+    if (open.tool === null) return { type: 'tool-call', id: '', name: undefined, arguments: '' }
+    const block = { type: 'tool-call', id: open.tool.id }
+    if (open.tool.name !== undefined) block.name = open.tool.name
+    block.arguments = open.tool.arguments
+    return block
+  }
+  return { type: open.type }
+}
+
+/**
+ * 工具孤儿扫描：数出「无宣告 tool-call 块」的 tool/call（只读，纯函数）。
+ * @returns {{orphans:number, callIds:string[], emptyAssistant:number, sample:string[]}}
+ */
+export function scanToolOrphans(events) {
+  const advertised = new Set()
+  let emptyAssistant = 0
+  for (const ev of events) {
+    if (ev?.type !== 'assistant/message') continue
+    const content = ev.data?.message?.content
+    if (Array.isArray(content)) {
+      if (content.length === 0) emptyAssistant += 1
+      for (const b of content) if (b?.type === 'tool-call' && typeof b.id === 'string') advertised.add(b.id)
+    }
+  }
+  const callIds = []
+  for (const ev of events) {
+    if (ev?.type !== 'tool/call') continue
+    const id = ev.data?.callId
+    if (typeof id === 'string' && !advertised.has(id)) callIds.push(id)
+  }
+  return {
+    orphans: callIds.length,
+    callIds: callIds.slice(0, 500),
+    emptyAssistant,
+    sample: callIds.slice(0, 10),
+  }
+}
+
+/**
+ * 工具孤儿修复（纯函数，不碰文件）：把空 content 的 assistant/message
+ * 用幸存 stream 重组回 content。零编造——重组不出来就如实报告，不动手。
+ * @param {object[]} events
+ * @returns {{events:object[]|null, healed:{seq:number,blocks:number}[], unrepairable:{seq:number,why:string}[]}}
+ *          events 为 null 表示一条都修不了（调用方直接放弃）。
+ */
+export function healToolOrphans(events) {
+  const healed = []
+  const unrepairable = []
+  const out = []
+  let anyFixed = false
+  for (const ev of events) {
+    if (ev?.type !== 'assistant/message' || !ev.data?.message) { out.push(ev); continue }
+    const message = ev.data.message
+    if (Array.isArray(message.content) && message.content.length > 0) { out.push(ev); continue }
+    const stream = ev.data.stream
+    if (!Array.isArray(stream) || stream.length === 0) {
+      unrepairable.push({ seq: ev.seq, why: 'content 与 stream 双空（真·无输出的占位行，无法恢复）' })
+      out.push(ev)
+      continue
+    }
+    const chunks = expandStreamRecords(stream)
+    if (chunks === null) {
+      unrepairable.push({ seq: ev.seq, why: 'stream 记录形状非法，重放不了（宁可不修，不修错）' })
+      out.push(ev)
+      continue
+    }
+    const blocks = assembleBlocks(chunks)
+    if (!Array.isArray(blocks) || blocks.length === 0) {
+      unrepairable.push({ seq: ev.seq, why: 'stream 重放没有产出块' })
+      out.push(ev)
+      continue
+    }
+    const toolCalls = blocks.filter((b) => b?.type === 'tool-call' && typeof b.id === 'string' && b.id)
+    if (toolCalls.length === 0) {
+      unrepairable.push({ seq: ev.seq, why: '重放出的块里没有 tool-call（本条不涉及工具宣告，只重组正文）' })
+      /* 正文块也一并恢复——content 为空但 stream 有正文的，同样打不开宿主校验 */
+    }
+    out.push({ ...ev, data: { ...ev.data, message: { ...message, content: blocks } } })
+    healed.push({ seq: ev.seq, blocks: blocks.length })
+    anyFixed = true
+  }
+  return { events: anyFixed ? out : null, healed, unrepairable }
+}
+
 /** 调试导出：内部函数不外露成公共 API，但排障脚本需要单步看规划器。 */
 export const __repairDebug = {
   replayGapState,
@@ -879,4 +1084,6 @@ export const __repairDebug = {
   toolNameBefore,
   MAX_FABRICATE,
   MIN_EXTENDED_GAP,
+  expandStreamRecords,
+  assembleBlocks,
 }

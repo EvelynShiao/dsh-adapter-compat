@@ -122,6 +122,37 @@ window.__ModuleLoader__.load({
       invDesc: '左边侧栏选不出来的会话（盘上有文件、宿主登记表里没有）——按「只要看得见的」规则属于残留',
       invSweepNote: '自动扫除（开机 + 每 10 分钟）需要用户显式开启；当前默认关，避免误删刚分叉还没登记的会话',
       invNote: '删除是真删不留副本；正在运行的会话会被跳过',
+      /* 同上分区补的（2026-10-22 用户要求：列表显示标题；保险要能显式强制跳过） */
+      invCleanTitle: '只处理「文件存在但侧栏看不见」的会话',
+      invRefresh: '刷新',
+      invScanning: '正在扫描…',
+      invReadFailed: '读取失败',
+      invScanUnavailable: '扫描不可用',
+      invClean: '一键清理不可见会话',
+      invCleanForce: '强制清理不可见会话',
+      invConfirm: '确认删除 {count} 条',
+      invConfirmForce: '确认强制删除 {count} 条',
+      invCancel: '取消',
+      invNoTitle: '（无标题）',
+      invFamilyTag: '家族',
+      invPathLabel: '目录',
+      invFamilyNote: '其中 {count} 条是版本家族成员：默认不动刀（切版本还要用到），勾下面的强制清理才会一起删',
+      invAnomalyOn: '⚠️ 登记表疑似异常：这份清单是按「盘上文件」判的，删之前请自己再确认一遍',
+      invForceLabel: '我已确认，强制清理（含家族成员 / 跳过保险）',
+      invForceDesc: '勾上才会：① 连版本家族成员一起清；② 登记表疑似异常时也放行清单与清理。真删不可逆，勾了还要再点一次「确认」。',
+      invForceOn: '强制模式',
+      invSkippedTitle: '因为有保险所以没删（{count} 条）：',
+      invReasonFamily: '版本家族成员（切版本还要用到）',
+      invReasonAnomaly: '登记表疑似异常',
+      invReasonBulk: '超过一次删除上限（批量保险）',
+      invReasonVisible: '在侧栏里可见（硬红线，永不删）',
+      invReasonSelf: '就是当前正在用的这条会话',
+      invReasonLive: '会话正在运行中',
+      invReasonNotFound: '文件已不在盘上',
+      invReasonFailed: '删除出错',
+      invFreed: '已删除 {count} 条，释放 {mb} MB',
+      invPurgeFailed: '清理失败',
+      invUnknown: '未知',
       /* 会话日志修复分区文案（2026-10-13） */
       healNav: '会话日志修复',
       healMain: '清理与体检',
@@ -686,63 +717,164 @@ window.__ModuleLoader__.load({
       open ? children : null)
     }
 
-    /** 不可见会话子块 —— 嵌在「会话日志修复」分区里（2026-10-16 用户要求：紧致点，别单开顶级分区）。 */
+    /** 不可见会话子块 —— 嵌在「会话日志修复」分区里（2026-10-16 用户要求：紧致点，别单开顶级分区）。
+     *  2026-10-22 用户要求：①列表要显示标题（原来一排光秃秃的 id）；②「保险不准全部清除」要能
+     *  显式跳过。默认三道保险（家族保护 / 登记表异常拒绝 / 批量上限）一条不撤；勾了
+     *  「我已确认，强制清理」并再次确认后放行，且**被保险挡下的条目连同原因一起显示**，不静默跳过。 */
     function InvisibleBlock() {
       const [data, setData] = useState(null)
       const [note, setNote] = useState('')
       const [busy, setBusy] = useState(false)
       const [confirming, setConfirming] = useState(false)
+      const [force, setForce] = useState(false)
+      const [skipped, setSkipped] = useState([])
+      const [blocked, setBlocked] = useState([])
 
       const load = useCallback(async () => {
         try {
-          const r = await fetchJson(INVISIBLE)
+          /* force=1：登记表疑似异常时后端也肯把清单给出来（只给看，删还得再点一次确认）。 */
+          const r = await fetchJson(INVISIBLE + (force ? '?force=1' : ''))
           if (r.ok && r.data && r.data.value) setData(r.data.value)
-          else setNote('读取失败')
-        } catch { setNote('读取失败') }
-      }, [])
+          else setNote(ZH.invReadFailed)
+        } catch { setNote(ZH.invReadFailed) }
+      }, [force])
 
       useEffect(() => { void load() }, [load])
 
       const purge = async () => {
         setBusy(true)
         setNote('')
+        setSkipped([])
+        setBlocked([])
         try {
           const r = await fetchJson(INVISIBLE_PURGE, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ write: true }),
+            /* 两个参数都显式发，别指望后端猜：
+               force  = 用户勾了「强制清理」并二次确认 → 后端放行「家族保护」与「登记表异常拒绝」；
+               confirmBulk = 连带把 guardDeletion 的批量上限（一次 ≤3 条）一并放行。 */
+            body: JSON.stringify({ write: true, force, confirmBulk: force }),
           })
           if (r.ok && r.data && r.data.ok) {
-            const refused = (r.data.results || []).filter((x) => x.status === 'live-refused').length
-            setNote(`已释放 ${r.data.freedMB ?? 0} MB${refused > 0 ? `（${refused} 条运行中跳过）` : ''}`)
+            setSkipped(Array.isArray(r.data.skipped) ? r.data.skipped : [])
+            const base = ZH.invFreed.replace('{count}', String(r.data.deletedCount ?? 0)).replace('{mb}', String(r.data.freedMB ?? 0))
+            /* 后端补的说明（如「全部被保险跳过：勾选强制才会删」）附在后面，别丢。 */
+            setNote(r.data.note ? `${base} · ${String(r.data.note)}` : base)
             await load()
-          } else setNote('清理失败：' + String(r.data && r.data.error ? r.data.error : '未知'))
+          } else {
+            /* 保险拦下：把结构化原因摆出来 —— 「是保险挡的，不是坏了」。 */
+            if (Array.isArray(r.data && r.data.blocked)) setBlocked(r.data.blocked)
+            setNote(ZH.invPurgeFailed + '：' + String(r.data && r.data.error ? r.data.error : ZH.invUnknown))
+          }
         } catch (e) {
-          setNote('清理失败：' + String(e && e.message ? e.message : e))
+          setNote(ZH.invPurgeFailed + '：' + String(e && e.message ? e.message : e))
         } finally {
           setBusy(false)
           setConfirming(false)
         }
       }
 
+      /** 保险原因 → 人话（前后端共用同一套 reason 字符串）。 */
+      const reasonText = (reason) => ({
+        'family-protected': ZH.invReasonFamily,
+        'registry-anomaly': ZH.invReasonAnomaly,
+        'bulk-limit': ZH.invReasonBulk,
+        'visible-refused': ZH.invReasonVisible,
+        'self-session': ZH.invReasonSelf,
+        'live-refused': ZH.invReasonLive,
+        'not-found': ZH.invReasonNotFound,
+        failed: ZH.invReasonFailed,
+      })[reason] ?? String(reason)
+
       const wrap = (...kids) => h('div', {
         style: { display: 'flex', flexDirection: 'column', gap: '8px' },
       },
       h('div', { className: 'ac-row' },
-        h('div', { className: 'ac-row-desc' }, '只处理「文件存在但侧栏看不见」的会话'),
-        h('button', { className: 'ac-btn', onClick: () => void load() }, '刷新')),
+        h('div', { className: 'ac-row-desc' }, ZH.invCleanTitle),
+        h('button', { className: 'ac-btn', onClick: () => void load() }, ZH.invRefresh)),
       ...kids)
 
-      if (!data) return wrap(h('div', { className: 'ac-row-desc' }, note || '正在扫描…'))
-      if (data.ok !== true) return wrap(h('div', { className: 'ac-row-desc' }, data.reason || '扫描不可用'))
+      /* 强制开关：默认不勾；勾了会重新拉一次清单（登记表异常时也看得见）。 */
+      const forceRow = h('div', { className: 'ac-row' },
+        h('label', { className: 'ac-check', style: { minWidth: 0, flex: 1 } },
+          h('input', {
+            type: 'checkbox',
+            checked: force,
+            onChange: () => { setConfirming(false); setForce((v) => !v) },
+          }),
+          h('span', null,
+            h('div', { className: 'ac-row-title', style: { display: 'inline' } }, ZH.invForceLabel),
+            h('div', { className: 'ac-row-desc' }, ZH.invForceDesc))),
+        force ? h('span', { className: 'ac-hint-warn' }, ZH.invForceOn) : null)
+
+      /* 被保险挡下的原因清单（skipped = 动手时逐条挡的；blocked = 整批拒绝时挡的）。 */
+      let reasonBlock = null
+      if (skipped.length > 0) {
+        reasonBlock = h('div', { className: 'ac-report' },
+          h('div', null, h('b', null, ZH.invSkippedTitle.replace('{count}', String(skipped.length)))),
+          ...skipped.slice(0, 30).map((x, i) => h('div', { key: String(x.id ?? i) + i },
+            `${x.title ? x.title : (x.id ? String(x.id).slice(0, 8) : '')}` +
+            `${x.sizeMB ? ' · ' + x.sizeMB + 'MB' : ''} —— ${(x.reasons || []).map(reasonText).join('、')}${x.note ? '：' + x.note : ''}`)))
+      }
+      let blockedBlock = null
+      if (blocked.length > 0) {
+        blockedBlock = h('div', { className: 'ac-report' },
+          ...blocked.map((b, i) => h('div', { key: String(b.reason) + i, style: { marginBottom: '4px' } },
+            h('div', null,
+              h('b', null, `${reasonText(b.reason)} × ${b.count ?? 0}`),
+              b.limit ? `（一次最多 ${b.limit} 条）` : ''),
+            b.ids && b.ids.length
+              ? h('div', { style: { fontFamily: 'monospace' } }, b.ids.slice(0, 8).map((x) => String(x).slice(0, 8)).join(' ') + (b.ids.length > 8 ? ' …' : ''))
+              : null)))
+      }
+
+      if (!data) return wrap(h('div', { className: 'ac-row-desc' }, note || ZH.invScanning))
+      if (data.ok !== true) {
+        /* 保险拦下（登记表疑似异常）：讲清「为什么没删 / 共多少条 / 怎么强行清」，不再只丢一句错。 */
+        const ids = Array.isArray(data.anomalyIds) ? data.anomalyIds : []
+        return wrap(
+          h('div', { className: 'ac-hint-warn' }, data.reason || ZH.invScanUnavailable),
+          h('div', { className: 'ac-report' },
+            h('div', null, h('b', null, ZH.invSkippedTitle.replace('{count}', String(data.anomalyCount ?? ids.length)))),
+            h('div', null, reasonText('registry-anomaly')),
+            ids.length
+              ? h('div', { style: { fontFamily: 'monospace' } }, ids.slice(0, 8).map((x) => String(x).slice(0, 8)).join(' ') + (ids.length > 8 ? ' …' : ''))
+              : null),
+          forceRow,
+          blockedBlock,
+          h('div', { className: 'ac-row-desc' }, note || ZH.invNote))
+      }
+
+      const familyCount = data.familyCount ?? 0
+      /* 按钮上的数字 = 这一次真正会删几条（不勾强制时家族成员自动跳过，数字要诚实）。 */
+      const targetCount = force ? data.sessions.length : Math.max(0, data.sessions.length - familyCount)
 
       const summary = h('div', { className: 'ac-row-desc' },
         data.sessions.length === 0
           ? `干净：${data.visibleCount ?? 0} 条可见会话，没有看不见的残留`
           : `不可见 ${data.sessions.length} 条 · ${data.totalMB} MB（可见 ${data.visibleCount ?? 0} 条）`)
 
-      const rows = data.sessions.slice(0, 8).map((s) => h('div', { key: s.id, className: 'ac-row-desc', style: { fontFamily: 'monospace' } },
-        `${s.id.slice(0, 26)}  ${s.sizeMB}MB  ${s.mtime}（${s.ageMinutes} 分钟前）`))
+      const rows = data.sessions.slice(0, 50).map((s) => h('div', { key: s.id, className: 'ac-session' },
+        h('div', { style: { minWidth: 0, flex: 1 } },
+          h('div', { className: 'ac-session-name' }, (s.title || ZH.invNoTitle) + (s.family ? ` · ${ZH.invFamilyTag}` : '')),
+          h('div', { className: 'ac-session-hint', style: { fontFamily: 'monospace' } },
+            `${String(s.id).slice(0, 26)}  ${s.sizeMB}MB  ${s.mtime}（${s.ageMinutes} 分钟前）`),
+          s.workspaceKey
+            ? h('div', { className: 'ac-session-hint', style: { fontFamily: 'monospace' } },
+                `${ZH.invPathLabel}：${String(s.workspaceKey).slice(0, 60)}`)
+            : null)))
+
+      const more = data.sessions.length > rows.length
+        ? h('div', { className: 'ac-row-desc' }, `（还有 ${data.sessions.length - rows.length} 条没列出，清理是一起清的）`)
+        : null
+
+      const familyNote = familyCount > 0
+        ? h('div', { className: 'ac-hint-warn' }, ZH.invFamilyNote.replace('{count}', String(familyCount)))
+        : null
+
+      const anomalyNote = data.registryAnomaly === true
+        ? h('div', { className: 'ac-hint-warn' }, ZH.invAnomalyOn)
+        : null
 
       const actionRow = h('div', { className: 'ac-row' },
         h('div', { className: 'ac-row-desc' }, ZH.invSweepNote),
@@ -750,11 +882,14 @@ window.__ModuleLoader__.load({
           data.sessions.length === 0
             ? null
             : (confirming
-              ? h('button', { className: 'ac-btn', disabled: busy, onClick: () => void purge() }, `确认删除 ${data.sessions.length} 条`)
-              : h('button', { className: 'ac-btn', disabled: busy, onClick: () => setConfirming(true) }, '一键清理不可见会话')),
-          confirming ? h('button', { className: 'ac-btn', onClick: () => setConfirming(false) }, '取消') : null))
+              ? h('button', { className: 'ac-btn', disabled: busy, onClick: () => void purge() },
+                  (force ? ZH.invConfirmForce : ZH.invConfirm).replace('{count}', String(targetCount)))
+              : h('button', { className: 'ac-btn', disabled: busy || (targetCount === 0 && data.sessions.length > 0), onClick: () => setConfirming(true) },
+                  force ? ZH.invCleanForce : ZH.invClean)),
+          confirming ? h('button', { className: 'ac-btn', onClick: () => setConfirming(false) }, ZH.invCancel) : null))
 
-      return wrap(summary, actionRow, ...rows, h('div', { className: 'ac-row-desc' }, note || ZH.invNote))
+      return wrap(summary, anomalyNote, familyNote, forceRow, actionRow, ...rows, more, blockedBlock, reasonBlock,
+        h('div', { className: 'ac-row-desc' }, note || ZH.invNote))
     }
 
     function HealSection() {      const [opts, setOpts] = useState({ bootScan: false, sendScan: false, skipUnchanged: false })

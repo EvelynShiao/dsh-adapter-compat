@@ -91,7 +91,7 @@
 
 export const name = 'adapter-compat'
 
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, watch, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, watch, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { zstdCompressSync, constants as zstdConstants, zstdDecompressSync } from 'node:zlib'
 import { purgeSessionFile, readPendingLedger, writePendingLedger, assertRowsDense } from './purge.js'
@@ -101,7 +101,7 @@ import { guardSessionFile, probeProtectedHead } from './head-guard.js'
 import { installWireTap, healBlankToolResults } from './wire-tap.js'
 import { healDeadAttachments } from './attachments.js'
 import { slimSession } from './slim.js'
-import { repairEvents, scanFile, describeGap, healStructure } from './repair.js'
+import { repairEvents, scanFile, describeGap, healStructure, healToolOrphans, scanToolOrphans } from './repair.js'
 import { installOrderRoute } from './order.js'
 import {
   installEgressNormalizer as installEgressNormalizerImpl,
@@ -1925,9 +1925,14 @@ export async function repairSessionFile(ctx, sessionId, options = {}) {
   }
   const scan = scanFile(located.file)
   if (scan.error) throw Object.assign(new Error('session unreadable: ' + scan.error), { code: 'READ_FAILED' })
-  /* 两步走：① 结构字段自愈（白名单式擦除吃掉的必填标量 / 失效的 headerSeq）
-     ② seq 断号补行。第二步在第一步的结果上做，两者共用同一条 verify 门。 */
-  const heal = healStructure(scan.header, scan.events)
+  /* 三步走：① 工具孤儿修复（空 content 从幸存 stream 重组，2026-10-23 新增，
+     session-f3bc4fd2 实证伤型：真删除把 content 清空、stream 幸存 → 108 个 tool/call
+     变「无宣告孤儿」→ 宿主拒载）
+     ② 结构字段自愈（白名单式擦除吃掉的必填标量 / 失效的 headerSeq）
+     ③ seq 断号补行。后一步在前一步的结果上做，三者共用同一条 verify 门。 */
+  const orphanFix = healToolOrphans(scan.events)
+  const eventsAfterOrphans = orphanFix.events ?? scan.events
+  const heal = healStructure(scan.header, eventsAfterOrphans)
   const plan = repairEvents(scan.header, heal.events)
   const base = {
     ok: plan.ok,
@@ -1938,15 +1943,20 @@ export async function repairSessionFile(ctx, sessionId, options = {}) {
     warnings: scan.warnings,
     unsupported: plan.unsupported,
     wouldInsert: plan.inserted.length,
+    orphanHealed: orphanFix.healed,
+    orphanUnrepairable: orphanFix.unrepairable,
     healed: heal.healed,
     wouldHeal: heal.healed.length,
     healProblems: heal.problems,
     verifyProblems: plan.problems,
   }
-  if (plan.alreadyHealthy && heal.healed.length === 0) return { ...base, ok: true, alreadyHealthy: true, wouldInsert: 0 }
+  /* 「只有孤儿伤、没有断号伤」：plan.ok 会是 alreadyHealthy=true，gaps 空——这条路径合法。 */
+  const orphanHealthy = orphanFix.healed.length === 0
+  if (plan.alreadyHealthy && heal.healed.length === 0 && orphanHealthy) return { ...base, ok: true, alreadyHealthy: true, wouldInsert: 0 }
   if (!plan.ok) {
     throw Object.assign(new Error('repair plan rejected: ' + (plan.problems[0] ?? 'unsupported gap shape')), { code: 'PLAN_REJECTED', plan: base })
   }
+  /* 孤儿修复路径：plan.fixed 为 undefined（没有断号要补）——用 heal.events（含重组结果）。 */
   const finalEvents = plan.fixed ?? heal.events
   /* 落盘前先验：补出来的结构字段必须真的让宿主校验全绿，否则宁可不修。 */
   const v0 = verifySessionEvents(scan.header, finalEvents)
@@ -1996,10 +2006,13 @@ export function repairScanAll(home = dshHomeDir()) {
     try {
       const scan = scanFile(entry.file)
       if (scan.error) { out.unreadable.push({ id: entry.id, error: scan.error }); out.ok = false; continue }
-      /* 结构字段自愈的巡检（无 seq 断号但字段被吃掉的会话，加载同样会失败）。 */
-      const heal = healStructure(scan.header, scan.events)
+      /* 工具孤儿巡检（2026-10-23 新增）：无 seq 断号、无结构伤，但 content 被清空
+         → tool/call 全变孤儿 → 宿主拒载。这种伤 verify 报「没有对应的 tool 生命周期」。 */
+      const orphanScan = scanToolOrphans(scan.events)
+      const structHeal = healStructure(scan.header, scan.events)
+      const orphanFix = healToolOrphans(scan.events)
       if (scan.gaps.length > 0) {
-        const plan = repairEvents(scan.header, heal.events)
+        const plan = repairEvents(scan.header, structHeal.events)
         out.bad.push({
           id: entry.id,
           gaps: scan.gaps.map(describeGap),
@@ -2007,21 +2020,36 @@ export function repairScanAll(home = dshHomeDir()) {
           warnings: scan.warnings,
           repairable: plan.ok,
           unsupported: plan.unsupported,
-          healed: heal.healed,
-          healProblems: heal.problems,
+          healed: structHeal.healed,
+          healProblems: structHeal.problems,
+          orphan: orphanScan.orphans > 0 ? { count: orphanScan.orphans, emptyAssistant: orphanScan.emptyAssistant, repairable: orphanFix.events !== null } : null,
         })
         out.ok = false
-      } else if (heal.healed.length > 0 || heal.problems.length > 0) {
-        const v = verifySessionEvents(scan.header, heal.events)
+      } else if (structHeal.healed.length > 0 || structHeal.problems.length > 0) {
+        const v = verifySessionEvents(scan.header, structHeal.events)
         out.bad.push({
           id: entry.id,
           gaps: [],
           warnings: scan.warnings,
           repairable: v.ok,
           unsupported: [],
-          healed: heal.healed,
-          healProblems: heal.problems,
+          healed: structHeal.healed,
+          healProblems: structHeal.problems,
           verifyProblems: (v.problems ?? []).slice(0, 8),
+          orphan: orphanScan.orphans > 0 ? { count: orphanScan.orphans, emptyAssistant: orphanScan.emptyAssistant, repairable: orphanFix.events !== null } : null,
+        })
+        out.ok = false
+      } else if (orphanScan.orphans > 0) {
+        /* 只有孤儿伤：单列一类（orphanRepairable 标明重组能不能救）。 */
+        out.bad.push({
+          id: entry.id,
+          gaps: [],
+          warnings: scan.warnings,
+          repairable: orphanFix.events !== null,
+          unsupported: [],
+          healed: [],
+          healProblems: [],
+          orphan: { count: orphanScan.orphans, emptyAssistant: orphanScan.emptyAssistant, repairable: orphanFix.events !== null, unrepairable: orphanFix.unrepairable.slice(0, 5) },
         })
         out.ok = false
       } else {
@@ -2803,11 +2831,14 @@ export function scanVersionFamilies(home = dshHomeDir()) {
         isRoot: sid === root,
         isFork,
         orphanFork: isFork && !dirs.has(String(parentOf.get(sid))),
+        /* 2026-10-22 用户要求：家族列表要认得出谁是谁。标题走 sessionTitleLite
+           （projcache → 日志 session/title，读不到回退首条用户消息前 24 字）。 */
+        title: sessionTitleLite(home, sid, info) ?? firstUserTextLite(info?.file) ?? null,
         sizeMB: +(info.sizeBytes / 1048576).toFixed(2),
         mtime: new Date(info.mtimeMs).toISOString().slice(0, 16).replace('T', ' '),
       }
     }).sort((a, b) => b.sizeMB - a.sizeMB)
-    list.push({ root, members, sizeMB: +members.reduce((a, b) => a + b.sizeMB, 0).toFixed(2) })
+    list.push({ root, title: sessionTitleLite(home, root, dirs.get(root)) ?? null, members, sizeMB: +members.reduce((a, b) => a + b.sizeMB, 0).toFixed(2) })
   }
   list.sort((a, b) => b.sizeMB - a.sizeMB)
   const totalForkBytes = [...parentOf.keys()].reduce((a, sid) => a + (dirs.get(sid)?.sizeBytes ?? 0), 0)
@@ -2840,43 +2871,251 @@ export function versionFamilyIds(home = dshHomeDir(), { ttlMs = 30000 } = {}) {
   return ids
 }
 
-export function scanInvisibleSessions(home = dshHomeDir()) {
+/* ── 不可见会话标题（2026-10-22 用户要求「列表要显示标题」）──────────────
+   scanInvisibleSessions 以前只回 id/体积/时间，面板上一排光秃秃的 id，认不出谁是谁。
+   标题按「便宜优先」两处来源依次试：
+     ① 宿主投影缓存 projcache（纯 JSON 读，最便宜）；
+     ② 会话日志——session/title 事件紧跟第一轮对话，实测都落在前 5 帧以内。
+        小文件（≤2MB）直接复用 true-delete 的 readSession 整读（现成工具，最准）；
+        大文件只 open 读头 1MB、逐帧解压到找到标题为止，**绝不整读**——
+        不可见会话里可能有 GB 级巨型日志，整读会把面板拖死。
+   都拿不到 → null，前端回退显示 id 前 8 位（不报错）。结果按 (mtimeMs,sizeBytes)
+   记忆化：面板反复刷新不会重复解压，文件变了才重读。 */
+const TITLE_FULL_READ_MAX = 2 << 20
+const TITLE_HEAD_BYTES = 1 << 20
+const TITLE_PLAIN_BUDGET = 4 << 20
+const TITLE_FRAME_BUDGET = 300
+const titleCache = new Map()
+
+/** 会话日志里的标题：小文件整读（复用 readSession），大文件只啃头部。 */
+function titleFromLog(file) {
+  try {
+    if (statSync(file).size <= TITLE_FULL_READ_MAX) {
+      const { events } = readSession(file)
+      for (let i = events.length - 1; i >= 0; i--) {
+        const ev = events[i]
+        if (ev?.type === 'session/title' && typeof ev.data?.title === 'string' && ev.data.title.trim()) {
+          return ev.data.title.trim().slice(0, 120)
+        }
+      }
+      return null
+    }
+  } catch {
+    /* 坏文件/旧格式：再走下面那道「只读头部」的兜底 */
+  }
+  return titleFromLogHead(file)
+}
+
+/** projcache 里的标题（同 slimListSessions 的读法：record.rows.title = {ver, seq, val}）。 */
+function projectionTitleOf(home, id) {
+  try {
+    const pc = JSON.parse(readFileSync(home + '/storages/session_projcache/sessions/' + id + '.json', 'utf8'))
+    const t = pc?.record?.rows?.title
+    if (typeof t === 'string' && t) return t
+    if (t && typeof t === 'object' && typeof t.val === 'string' && t.val) return t.val
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** 从会话日志头部找标题：只读前 1MB，逐帧解压，找到 session/title 就停。
+ *  @returns {string|null} */
+function titleFromLogHead(file) {
+  if (!file) return null
+  let fd = null
+  try {
+    const size = statSync(file).size
+    fd = openSync(file, 'r')
+    const buf = Buffer.alloc(Math.min(TITLE_HEAD_BYTES, size))
+    const read = readSync(fd, buf, 0, buf.length, 0)
+    const head = buf.subarray(0, read)
+    const cuts = scanFramesZstd(head)
+    if (cuts.length < 2) return null
+    let plainBytes = 0
+    for (let k = 0; k + 2 < cuts.length; k++) {
+      if (k >= TITLE_FRAME_BUDGET || plainBytes > TITLE_PLAIN_BUDGET) break
+      let plain = ''
+      try { plain = zstdDecompressSync(head.subarray(cuts[k], cuts[k + 1])).toString('utf8') } catch { continue }
+      plainBytes += plain.length
+      if (!plain.includes('session/title')) continue
+      const lines = plain.split('\n')
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (!lines[i] || !lines[i].includes('session/title')) continue
+        try {
+          const ev = JSON.parse(lines[i])
+          if (ev?.type === 'session/title' && typeof ev.data?.title === 'string' && ev.data.title.trim()) {
+            return ev.data.title.trim().slice(0, 120)
+          }
+        } catch { /* 半行（帧尾截断）：继续往上找 */ }
+      }
+    }
+    return null
+  } catch {
+    return null
+  } finally {
+    try { if (fd !== null) closeSync(fd) } catch { /* ignore */ }
+  }
+}
+
+/** 标题读取（projcache → 日志头），带记忆化。读不到返回 null。 */
+export function sessionTitleLite(home, id, info) {
+  const stamp = `${info?.mtimeMs ?? 0}:${info?.sizeBytes ?? 0}`
+  const hit = titleCache.get(id)
+  if (hit && hit.stamp === stamp) return hit.title
+  let title = projectionTitleOf(home, id)
+  if (!title) title = titleFromLog(info?.file)
+  const text = typeof title === 'string' && title.trim() ? title.trim() : null
+  if (titleCache.size > 4096) titleCache.clear()
+  titleCache.set(id, { stamp, title: text })
+  return text
+}
+
+/* 首条用户消息兜底（2026-10-22 用户要求「至少取会话前几个字让我知道有什么」）：
+   projcache 与 session/title 都没有的会话（分叉刚出生还没对话、旧文件被清过），
+   取日志里第一条人类 user/message 的前 24 个字。只啃头部 1MB，绝不整读大文件。 */
+const FIRST_USER_MAX_CHARS = 24
+function firstUserTextLite(file) {
+  if (!file) return null
+  try {
+    if (statSync(file).size <= TITLE_FULL_READ_MAX) {
+      const { events } = readSession(file)
+      for (const ev of events) {
+        if (ev?.type !== 'user/message') continue
+        if (ev.data?.source?.kind !== 'user') continue
+        const text = (ev.data?.content ?? [])
+          .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+          .map((b) => b.text)
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+        if (text) return text.slice(0, FIRST_USER_MAX_CHARS) + (text.length > FIRST_USER_MAX_CHARS ? '…' : '')
+      }
+      return null
+    }
+  } catch { /* 坏文件/读不了 → 再走头部兜底 */ }
+  return firstUserTextFromHead(file)
+}
+
+/** 大文件版：只啃头部 1MB，找第一条 source.kind=user 的 user/message。 */
+function firstUserTextFromHead(file) {
+  let fd = null
+  try {
+    const size = statSync(file).size
+    fd = openSync(file, 'r')
+    const buf = Buffer.alloc(Math.min(TITLE_HEAD_BYTES, size))
+    const read = readSync(fd, buf, 0, buf.length, 0)
+    const head = buf.subarray(0, read)
+    const cuts = scanFramesZstd(head)
+    let plainBytes = 0
+    for (let k = 0; k + 2 < cuts.length; k++) {
+      if (k >= TITLE_FRAME_BUDGET || plainBytes > TITLE_PLAIN_BUDGET) break
+      let plain = ''
+      try { plain = zstdDecompressSync(head.subarray(cuts[k], cuts[k + 1])).toString('utf8') } catch { continue }
+      plainBytes += plain.length
+      if (!plain.includes('"user/message"')) continue
+      for (const line of plain.split('\n')) {
+        if (!line.includes('"user/message"')) continue
+        try {
+          const ev = JSON.parse(line)
+          if (ev?.type !== 'user/message' || ev.data?.source?.kind !== 'user') continue
+          const text = (ev.data?.content ?? [])
+            .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+            .map((b) => b.text)
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+          if (text) return text.slice(0, FIRST_USER_MAX_CHARS) + (text.length > FIRST_USER_MAX_CHARS ? '…' : '')
+        } catch { /* 半行：继续 */ }
+      }
+    }
+    return null
+  } catch {
+    return null
+  } finally {
+    try { if (fd !== null) closeSync(fd) } catch { /* ignore */ }
+  }
+}
+
+/**
+ * 扫描不可见会话（盘上有文件、宿主登记表里任何列表都没有）。
+ * @param {string} home
+ * @param {{force?:boolean, withFamily?:boolean}} [options]
+ *   force：放行「登记表疑似异常」这道保险（清单照样给，但整批标 registryAnomaly，由调用方
+ *          在响应里显式回报——用户勾了强制才允许走到这一步）。
+ *   withFamily：逐条标注「版本家族成员」（要全盘读头，30s 缓存；只有面板要看时才付这份钱）。
+ */
+export function scanInvisibleSessions(home = dshHomeDir(), options = {}) {
   const reg = readRegistryIds(home)
   if (reg === null) {
     return { ok: false, reason: 'workspace.json 读不到或结构异常 —— 放弃扫描（避免误删可见会话）', sessions: [], totalMB: 0, visibleCount: 0 }
   }
   const dirs = sessionDirs(home)
+  const familyIds = options.withFamily === true ? versionFamilyIds(home) : null
   const out = []
   let totalBytes = 0
+  let familyCount = 0
   for (const [sid, info] of dirs) {
     if (reg.visible.has(sid) || reg.archived.has(sid) || reg.workspaceIds.has(sid)) continue
     totalBytes += info.sizeBytes
+    const family = familyIds !== null && familyIds.has(sid)
+    if (family) familyCount += 1
+    /* 会话目录结构是 sessions/<工作区编码目录>/<sessionId>/：取「倒数第二段」当所属工作区。 */
+    const cut = info.dir.lastIndexOf('/')
+    const segments = info.dir.split('/')
     out.push({
       id: sid,
+      title: sessionTitleLite(home, sid, info),
       sizeMB: +(info.sizeBytes / 1048576).toFixed(2),
+      sizeBytes: info.sizeBytes,
       mtimeMs: info.mtimeMs,
       mtime: new Date(info.mtimeMs).toISOString().slice(0, 16).replace('T', ' '),
       ageMinutes: Math.round((Date.now() - info.mtimeMs) / 60000),
+      dir: info.dir,
+      workspaceDir: cut > 0 ? info.dir.slice(0, cut) : '',
+      workspaceKey: segments.length >= 2 ? segments[segments.length - 2] : '',
+      /* 家族成员 = 默认不动刀（见 purge 路由）；前端据此显示「受影响 + 原因」。 */
+      family,
+      reasons: family ? ['family-protected'] : [],
     })
   }
   out.sort((a, b) => b.sizeMB - a.sizeMB)
   /* 安全闸：可见数为 0 而盘上却有会话 —— 只可能是登记表被重置/损坏。
-     这时「一切皆残留」的判断不可信，拒绝清理（否则一次就把所有会话扫光）。 */
+     这时「一切皆残留」的判断不可信，拒绝清理（否则一次就把所有会话扫光）。
+     force 例外：仍然只出清单、不自动删；删必须由用户再点一次（见 purge 路由）。 */
   if (reg.visible.size === 0 && out.length > 0) {
+    if (options.force !== true) {
+      return {
+        ok: false,
+        reason: `登记表里一条可见会话都没有，但盘上有 ${out.length} 条 —— 疑似登记表异常，拒绝清理（确认登记表真出事、就是要清：勾选「强制清理」）`,
+        registryAnomaly: true,
+        anomalyCount: out.length,
+        anomalyIds: out.map((s) => s.id),
+        sessions: [],
+        totalMB: 0,
+        visibleCount: 0,
+      }
+    }
     return {
-      ok: false,
-      reason: `登记表里一条可见会话都没有，但盘上有 ${out.length} 条 —— 疑似登记表异常，拒绝清理`,
-      sessions: [],
-      totalMB: 0,
+      ok: true,
+      registryAnomaly: true,
+      reason: `登记表里一条可见会话都没有，但盘上有 ${out.length} 条 —— 疑似登记表异常（已按你的强制勾选放行，这批清单的可信度自负）`,
+      sessions: out,
+      totalMB: +(totalBytes / 1048576).toFixed(2),
+      totalBytes,
       visibleCount: 0,
+      familyCount,
+      scannedAt: new Date().toISOString(),
     }
   }
   return {
     ok: true,
+    registryAnomaly: false,
     sessions: out,
     totalMB: +(totalBytes / 1048576).toFixed(2),
     totalBytes,
     visibleCount: reg.visible.size,
+    familyCount,
     scannedAt: new Date().toISOString(),
   }
 }
@@ -2899,8 +3138,14 @@ export function installInvisibleRoute(ctx, config = {}) {
       path: '/dsh-adapter-compat/invisible',
       handler: async (req, res) => {
         if (req.method !== 'GET') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
-        try { return reply(res, 200, { ok: true, value: scanInvisibleSessions() }) }
-        catch (e) { return reply(res, 500, { ok: false, error: String(e?.message ?? e) }) }
+        try {
+          /* force=1：连「登记表疑似异常」这道保险也放行——只为把清单给出来（真要删还得 POST 里再带 force）。
+             family=0：不算「版本家族成员」标注（省一次全盘读头，30s 缓存）。默认算，面板要显示谁受保护。 */
+          const url = new URL(req.url, 'http://127.0.0.1')
+          const force = url.searchParams.get('force') === '1'
+          const withFamily = url.searchParams.get('family') !== '0'
+          return reply(res, 200, { ok: true, value: scanInvisibleSessions(dshHomeDir(), { force, withFamily }) })
+        } catch (e) { return reply(res, 500, { ok: false, error: String(e?.message ?? e) }) }
       },
     })
     web.register({
@@ -2912,23 +3157,101 @@ export function installInvisibleRoute(ctx, config = {}) {
         try {
           for await (const chunk of req) { body += chunk; if (body.length > 65536) throw new Error('body too large') }
           const parsed = JSON.parse(body || '{}')
+          /* force:true = 用户在面板上勾了「我已确认，强制清理」并再次确认过。
+             它放行的是两道**保险**，不是红线：
+               · 版本家族保护（默认只记账不动刀）→ 放行；
+               · 登记表疑似异常的整批拒绝 → 放行（清单仍带 registryAnomaly 标记回报）；
+               · 批量确认（guardDeletion 的 confirmBulk）→ 由 force 代签。
+             仍然硬拒绝：登记表里可见/归档的会话、正在使用的当前会话。 */
+          const force = parsed?.force === true
           const home = dshHomeDir()
-          const scan = scanInvisibleSessions(home)
-          if (scan.ok !== true) return reply(res, 409, { ok: false, error: scan.reason })
+          const scan = scanInvisibleSessions(home, { force, withFamily: true })
+          if (scan.ok !== true) {
+            return reply(res, 409, {
+              ok: false,
+              error: scan.reason,
+              registryAnomaly: scan.registryAnomaly === true,
+              /* 保险拦下的原因清单：前端据此显示「因为有保险所以没删」，而不是只给一句错。 */
+              blocked: scan.registryAnomaly === true
+                ? [{ reason: 'registry-anomaly', count: scan.anomalyCount ?? 0, ids: (scan.anomalyIds ?? []).slice(0, 50) }]
+                : [],
+            })
+          }
           const wanted = Array.isArray(parsed?.ids) && parsed.ids.length > 0
             ? scan.sessions.filter((s) => parsed.ids.includes(s.id))
             : scan.sessions
-          if (wanted.length === 0) return reply(res, 200, { ok: true, results: [], freedMB: 0, note: '没有不可见会话' })
-          /* 删除守卫（可见会话硬拒绝 + 批量需 confirmBulk）——见 guardDeletion 注释。 */
-          const guard = guardDeletion(home, wanted.map((s) => s.id), parsed)
-          if (guard.ok !== true) return reply(res, 409, { ok: false, error: guard.error, details: guard.details })
-          if (parsed.write !== true) {
-            return reply(res, 200, { ok: true, dryRun: true, results: wanted.map((s) => ({ id: s.id, status: 'planned', sizeMB: s.sizeMB })) })
+          if (wanted.length === 0) return reply(res, 200, { ok: true, results: [], skipped: [], freedMB: 0, note: '没有不可见会话' })
+          /* 家族保护：默认逐条跳过并记账（与 purgeTombstones 同一套规矩），skipped 里回报原因。 */
+          const targets = force ? wanted : wanted.filter((s) => s.family !== true)
+          const skipped = (force ? [] : wanted.filter((s) => s.family === true)).map((s) => ({
+            id: s.id,
+            title: s.title ?? null,
+            sizeMB: s.sizeMB,
+            reasons: ['family-protected'],
+            note: '版本家族成员（有 parentSession 或被子会话引用）：切版本还要用到，默认不动刀',
+          }))
+          /* 全被保险跳过时**不能**去调 guardDeletion —— 空名单会得到一句「没有指定要删除的会话」，
+             看起来像坏了。直接回报「一条都没删 + 原因清单」，用户勾强制再来一次。 */
+          if (targets.length === 0) {
+            return reply(res, 200, {
+              ok: true,
+              forced: force,
+              registryAnomaly: scan.registryAnomaly === true,
+              results: [],
+              skipped,
+              freedMB: 0,
+              deletedCount: 0,
+              skippedCount: skipped.length,
+              note: '全部被保险跳过：勾选「我已确认，强制清理」并再次确认才会删',
+            })
           }
-          const results = wanted.map((s) => deleteSessionDir(ctx, home, s.id))
+          /* 删除守卫（可见会话硬拒绝 + 批量需 confirmBulk）——见 guardDeletion 注释。
+             force 代签 confirmBulk（用户已经二次确认过要全清），其余规则一条不放。 */
+          const guard = guardDeletion(home, targets.map((s) => s.id), { ...parsed, confirmBulk: parsed.confirmBulk === true || force })
+          if (guard.ok !== true) {
+            /* 整批被保险拒绝时，把原因结构化回报（前端要显示「是保险挡的，不是坏了」）。 */
+            const blocked = []
+            if (Array.isArray(guard.details?.visible)) {
+              blocked.push({ reason: 'visible-refused', count: guard.details.visible.length, ids: guard.details.visible.slice(0, 50) })
+            }
+            if (Number.isFinite(guard.details?.count)) {
+              blocked.push({ reason: 'bulk-limit', count: guard.details.count, ids: (guard.details.ids ?? []).slice(0, 50), limit: BULK_DELETE_LIMIT })
+            } else if (Array.isArray(guard.details?.ids)) {
+              blocked.push({ reason: 'self-session', count: guard.details.ids.length, ids: guard.details.ids.slice(0, 50) })
+            }
+            return reply(res, 409, { ok: false, error: guard.error, details: guard.details, blocked })
+          }
+          if (parsed.write !== true) {
+            return reply(res, 200, {
+              ok: true,
+              dryRun: true,
+              forced: force,
+              registryAnomaly: scan.registryAnomaly === true,
+              skipped,
+              results: targets.map((s) => ({ id: s.id, status: 'planned', sizeMB: s.sizeMB })),
+            })
+          }
+          const results = targets.map((s) => deleteSessionDir(ctx, home, s.id))
+          /* 没删掉的（运行中/文件不在/出错）也进原因清单，别再静默跳过。 */
+          for (const r of results) {
+            if (r.status === 'deleted') continue
+            const s = targets.find((x) => x.id === r.id)
+            skipped.push({ id: r.id, title: s?.title ?? null, sizeMB: s?.sizeMB ?? 0, reasons: [r.status], note: r.error ?? '' })
+          }
           const freedMB = +results.reduce((a, b) => a + (b.freedMB ?? 0), 0).toFixed(2)
-          appendCompatLog(`invisible purge: freed ${freedMB}MB of ${wanted.length} (${results.filter((r) => r.status === 'deleted').length} deleted)`)
-          return reply(res, 200, { ok: true, results, freedMB })        } catch (error) {
+          const deletedCount = results.filter((r) => r.status === 'deleted').length
+          appendCompatLog(`invisible purge: freed ${freedMB}MB of ${targets.length} (${deletedCount} deleted)${force ? ' [FORCE]' : ''}${skipped.length ? ` skipped ${skipped.length}` : ''}`)
+          return reply(res, 200, {
+            ok: true,
+            forced: force,
+            registryAnomaly: scan.registryAnomaly === true,
+            results,
+            skipped,
+            freedMB,
+            deletedCount,
+            skippedCount: skipped.length,
+          })
+        } catch (error) {
           return reply(res, 400, { ok: false, error: String(error?.message ?? error) })
         }
       },
