@@ -141,6 +141,32 @@ window.__ModuleLoader__.load({
       invConfirmForce: '确认强制删除 {count} 条',
       invCancel: '取消',
       invNoTitle: '（无标题）',
+      /* F线：子代理对话管理（2026-10-24） */
+      subNav: '子代理对话清理',
+      subDesc: 'workflow/子代理工具派生的子任务会话——侧栏从不显示，任务完成后就是死数据',
+      subCleanTitle: '只处理 origin=subagent 的会话（自动跳过正在运行的）',
+      subScanning: '正在扫描…',
+      subReadFailed: '读取失败',
+      subEmpty: '没有子代理会话——干净',
+      subSummary: '子代理会话 {count} 条 · 共 {mb} MB',
+      subLiveNote: '（{count} 条正在运行，会跳过）',
+      subClean: '清理子代理会话',
+      subConfirm: '确认删除 {count} 条子代理会话',
+      subFreed: '已删 {count} 条 · 释放 {mb} MB',
+      subPurgeFailed: '清理失败',
+      subNote: '真删不可逆（删前自动备份到 backup-true-delete-subagent）；正在运行的跳过',
+      /* A线：自动瘦身设置（2026-10-24） */
+      asNav: '自动瘦身',
+      asDesc: '开机自动把大会话的老轮次瘦身（擦推理流/工具输出，结构不动）。默认关',
+      asToggle: '开机自动瘦身',
+      asToggleDesc: '开了每次启动 90 秒后扫一遍：非运行中 + ≥1MB 的会话自动瘦身（走 verify/备份/回滚全套门禁）',
+      asKeep: '保留最近轮数',
+      asKeepDesc: '最近 N 轮原文完整保留，更早的才瘦身（0 = 全部瘦）',
+      asDigest: '摘要占位',
+      asDigestDesc: '占位符带「前两行 + 字数」，AI 翻旧账能认出这里原本在干嘛；关闭则纯「[内容已清除]」',
+      asMin: '事件数门槛',
+      asMinDesc: '事件数低于此值的会话不碰（防误伤小会话）',
+      asNote: '手动瘦身仍走会话与提示词里的瘦身面板；改完点保存，下次开机生效',
       invFamilyTag: '家族',
       invPathLabel: '目录',
       invFamilyNote: '其中 {count} 条是版本家族成员：默认不动刀（切版本还要用到），勾下面的强制清理才会一起删',
@@ -965,6 +991,178 @@ window.__ModuleLoader__.load({
         h('div', { className: 'ac-row-desc' }, note || ZH.invNote))
     }
 
+    /* ── F线：子代理对话管理（2026-10-24）────────────────────────
+       subagent 会话（workflow/subagent 派生的子任务）侧栏不显示、任务完成后
+       就是死数据。用户定位：无意义/不可见 → 可清。与「不可见会话」并列，
+       默认折叠；清理带两步确认（真删不可逆，删前自动备份到 backup-true-delete-subagent）。 */
+    const SUBAGENT = '/dsh-adapter-compat/subagent'
+    const SUBAGENT_PURGE = '/dsh-adapter-compat/subagent/purge'
+
+    function SubagentBlock() {
+      const [data, setData] = useState(null)
+      const [note, setNote] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [confirming, setConfirming] = useState(false)
+
+      const load = useCallback(async () => {
+        try {
+          const r = await fetchJson(SUBAGENT)
+          if (r.ok && r.data && r.data.value) setData(r.data.value)
+          else setNote(ZH.subReadFailed)
+        } catch { setNote(ZH.subReadFailed) }
+      }, [])
+
+      useEffect(() => { void load() }, [load])
+
+      const purge = async () => {
+        setBusy(true)
+        setNote('')
+        try {
+          const dead = (data.sessions ?? []).filter((s) => !s.live)
+          const r = await fetchJson(SUBAGENT_PURGE, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ ids: dead.map((s) => s.id) }),
+          })
+          if (r.ok && r.data && r.data.ok) {
+            const refused = (r.data.results || []).filter((x) => x.status !== 'deleted' && x.status !== 'not-found').length
+            setNote(ZH.subFreed.replace('{count}', String(r.data.deletedCount ?? 0)).replace('{mb}', String(r.data.freedMB ?? 0))
+              + (refused > 0 ? `（${refused} 条被拒，见结果）` : ''))
+            await load()
+          } else setNote(ZH.subPurgeFailed + '：' + String(r.data && r.data.error ? r.data.error : ZH.invUnknown))
+        } catch (e) {
+          setNote(ZH.subPurgeFailed + '：' + String(e && e.message ? e.message : e))
+        } finally {
+          setBusy(false)
+          setConfirming(false)
+        }
+      }
+
+      const wrap = (...kids) => h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
+        h('div', { className: 'ac-row' },
+          h('div', { className: 'ac-row-desc' }, ZH.subCleanTitle),
+          h('button', { className: 'ac-btn', onClick: () => void load() }, ZH.invRefresh)),
+        ...kids)
+
+      if (!data) return wrap(h('div', { className: 'ac-row-desc' }, note || ZH.subScanning))
+
+      const liveCount = (data.sessions ?? []).filter((s) => s.live).length
+      const dead = (data.sessions ?? []).filter((s) => !s.live)
+
+      const rows = dead.slice(0, 30).map((s) => h('div', { key: s.id, className: 'ac-session' },
+        h('div', { style: { minWidth: 0, flex: 1 } },
+          h('div', { className: 'ac-session-name' }, s.title ? `「${s.title}」` : ZH.invNoTitle),
+          h('div', { className: 'ac-session-hint', style: { fontFamily: 'monospace' } },
+            `${String(s.id).slice(0, 26)}  ${s.sizeMB}MB  ${s.mtime}  depth=${s.depth ?? '?'}`))))
+
+      const actionRow = h('div', { className: 'ac-row' },
+        h('div', { className: 'ac-row-desc' },
+          data.count === 0
+            ? ZH.subEmpty
+            : ZH.subSummary.replace('{count}', String(data.count)).replace('{mb}', String(data.totalMB))
+              + (liveCount > 0 ? ZH.subLiveNote.replace('{count}', String(liveCount)) : '')),
+        h('div', { style: { display: 'flex', gap: '8px' } },
+          dead.length === 0
+            ? null
+            : (confirming
+              ? h('button', { className: 'ac-btn', disabled: busy, onClick: () => void purge() },
+                  ZH.subConfirm.replace('{count}', String(dead.length)))
+              : h('button', { className: 'ac-btn', disabled: busy, onClick: () => setConfirming(true) }, ZH.subClean)),
+          confirming ? h('button', { className: 'ac-btn', onClick: () => setConfirming(false) }, ZH.invCancel) : null))
+
+      return wrap(actionRow, ...rows,
+        data.count > 30 ? h('div', { className: 'ac-row-desc' }, `…共 ${data.count} 条` ) : null,
+        h('div', { className: 'ac-row-desc' }, note || ZH.subNote))
+    }
+
+    /* ── A线：自动瘦身设置（2026-10-24，默认关）─────────────────────
+       选项存 adapter-compat-slim.json（GET/POST /dsh-adapter-compat/slim-options）：
+         autoSlim  开关（默认关——用户明令「不倾向打开」）
+         keepTurns 保留最近 N 轮原文（默认 10）
+         digest    占位带前两行摘要（默认开）
+         minEvents 触发门槛：事件数低于此不动（默认 2000，防误伤小会话）
+       开启后开机 90s 扫一遍：非 live + ≥1MB + 走全套 verify/备份/回滚门禁。 */
+    const SLIM_OPTS = '/dsh-adapter-compat/slim-options'
+
+    function AutoSlimBlock() {
+      const [opts, setOpts] = useState(null)
+      const [note, setNote] = useState('')
+      const [busy, setBusy] = useState(false)
+
+      const load = useCallback(async () => {
+        try {
+          const r = await fetchJson(SLIM_OPTS)
+          if (r.ok && r.data && r.data.options) setOpts(r.data.options)
+          else setNote('读取失败')
+        } catch { setNote('读取失败') }
+      }, [])
+
+      useEffect(() => { void load() }, [load])
+
+      const save = async () => {
+        if (!opts) return
+        setBusy(true)
+        setNote('')
+        try {
+          const r = await fetchJson(SLIM_OPTS, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              autoSlim: opts.autoSlim === true,
+              keepTurns: Math.max(0, Number(opts.keepTurns) || 0),
+              digest: opts.digest !== false,
+              minEvents: Math.max(100, Number(opts.minEvents) || 2000),
+            }),
+          })
+          if (r.ok && r.data && r.data.options) { setOpts(r.data.options); setNote('已保存 · 下次开机生效') }
+          else setNote('保存失败：' + String(r.data && r.data.error ? r.data.error : '未知原因'))
+        } catch (e) { setNote('保存失败：' + String(e && e.message ? e.message : e)) }
+        finally { setBusy(false) }
+      }
+
+      if (!opts) return h('div', { className: 'ac-row-desc' }, note || '读取设置…')
+
+      const toggle = (key) => () => setOpts((p) => ({ ...p, [key]: p[key] !== true }))
+
+      const autoRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.asToggle),
+          h('div', { className: 'ac-row-desc' }, ZH.asToggleDesc)),
+        h('button', { className: 'ac-btn', onClick: toggle('autoSlim') }, opts.autoSlim === true ? '已开启' : '已关闭'))
+
+      const keepRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.asKeep),
+          h('div', { className: 'ac-row-desc' }, ZH.asKeepDesc)),
+        h('input', {
+          className: 'ac-btn', type: 'number', min: 0, max: 500, step: 1, style: { width: '100px' },
+          value: String(opts.keepTurns ?? 10),
+          onChange: (e) => setOpts((p) => ({ ...p, keepTurns: Number(e.target.value.replace(/\D/g, '')) || 0 })),
+        }))
+
+      const digestRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.asDigest),
+          h('div', { className: 'ac-row-desc' }, ZH.asDigestDesc)),
+        h('button', { className: 'ac-btn', onClick: toggle('digest') }, opts.digest !== false ? '已开启' : '已关闭'))
+
+      const minRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.asMin),
+          h('div', { className: 'ac-row-desc' }, ZH.asMinDesc)),
+        h('input', {
+          className: 'ac-btn', type: 'number', min: 100, max: 100000, step: 100, style: { width: '110px' },
+          value: String(opts.minEvents ?? 2000),
+          onChange: (e) => setOpts((p) => ({ ...p, minEvents: Number(e.target.value.replace(/\D/g, '')) || 2000 })),
+        }))
+
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
+        autoRow, keepRow, digestRow, minRow,
+        h('div', { className: 'ac-row' },
+          h('div', { className: 'ac-row-desc' }, note || ZH.asNote),
+          h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? '保存中…' : '保存')))
+    }
+
     function HealSection() {      const [opts, setOpts] = useState({ bootScan: false, sendScan: false, skipUnchanged: false })
       const [manualBusy, setManualBusy] = useState('')
       const [manualNote, setManualNote] = useState('')
@@ -1128,6 +1326,9 @@ window.__ModuleLoader__.load({
               buttons,
               reportBlock,
               fixBlock),
+            /* A线（2026-10-24）：自动瘦身（默认关）。设置存 adapter-compat-slim.json，
+               与 heal-options 解耦；手动瘦身照旧走会话与提示词里的瘦身面板。 */
+            h(Fold, { key: 'autoslim', title: ZH.asNav, desc: ZH.asDesc }, h(AutoSlimBlock)),
             /* 2026-10-16 用户要求：扫描频率/自动扫描/校准频率都做成开关，手动校准也要有。 */
             h(Fold, { key: 'cadence', title: ZH.cadNav, desc: ZH.cadDesc },
               h('div', { className: 'ac-row-desc' }, ZH.cadChangeTitle),
@@ -1150,6 +1351,7 @@ window.__ModuleLoader__.load({
                   manualBtn('/dsh-adapter-compat/warm-now', ZH.cadManualWarm, 'warm'))),
               h('div', { className: 'ac-row-desc' }, manualNote || ZH.cadRestartHint)),
             h(Fold, { key: 'inv', title: ZH.invNav, desc: ZH.invDesc }, h(InvisibleBlock)),
+            h(Fold, { key: 'sub', title: ZH.subNav, desc: ZH.subDesc }, h(SubagentBlock)),
             h(Fold, { key: 'ver', title: ZH.verNav, desc: ZH.verDesc }, h(VersionsBlock)))
         : h('div', { className: 'ac-row-desc' }, '加载选项…')
 

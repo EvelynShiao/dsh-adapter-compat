@@ -1786,7 +1786,8 @@ export function installMoveRoute(ctx, config = {}) {
  * repairCurrentSession 的权威范式：409 让用户切走再操作。
  * @param {object} ctx - cordis 上下文（只用于 live 判定与列表刷新）。
  * @param {string} sessionId - 目标会话 id。
- * @param {{write?:boolean, home?:string}} options - write:true 才落盘（默认干跑）。
+ * @param {{write?:boolean, home?:string, keepTurns?:number, digest?:boolean}} options
+ *   write:true 才落盘（默认干跑）；keepTurns/digest 透传 slimSession（A线 2026-10-24）。
  */
 export async function slimSessionFile(ctx, sessionId, options = {}) {
   const home = options.home ?? dshHomeDir()
@@ -1796,11 +1797,11 @@ export async function slimSessionFile(ctx, sessionId, options = {}) {
   if (isSessionLive(ctx, sessionId)) {
     throw Object.assign(new Error('session is open in the host; switch to another conversation first'), { code: 'SESSION_LIVE' })
   }
-  const r = slimSession(located.file)
+  const r = slimSession(located.file, { keepTurns: options.keepTurns, digest: options.digest })
   if (!r.ok) {
     throw Object.assign(new Error('slim verify failed: ' + (r.problems?.[0] ?? '')), { code: 'VERIFY_FAILED', problems: r.problems })
   }
-  const result = { ok: true, write, id: sessionId, before: r.before, after: r.after, saved: r.saved, events: r.events }
+  const result = { ok: true, write, id: sessionId, before: r.before, after: r.after, saved: r.saved, events: r.events, keptTurns: r.keptTurns ?? 0 }
   if (!write) return result
   // 备份（独立目录，别和真删除墓碑清理的备份混一起）
   const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR + '-slim'
@@ -1924,11 +1925,119 @@ export function installSlimRoute(ctx, config = {}) {
       })
       appendCompatLog('slim-list route registered')
     } catch { /* 列表路由失败不影响瘦身路由 */ }
+    /* A线（2026-10-24）：自动瘦身选项读写。GET 拿当前四项；POST 改并落盘。
+       独立文件 adapter-compat-slim.json——与 heal-options 解耦，互不污染。 */
+    try {
+      web.register({
+        kind: 'exact',
+        path: '/dsh-adapter-compat/slim-options',
+        handler: async (req, res) => {
+          const reply = (status, obj) => {
+            try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+          }
+          if (req.method === 'GET') return reply(200, { ok: true, options: readSlimOptions() })
+          if (req.method !== 'POST') return reply(405, { ok: false, error: 'method-not-allowed' })
+          let raw = ''
+          try {
+            for await (const chunk of req) { raw += chunk; if (raw.length > 8192) throw new Error('body too large') }
+            const parsed = JSON.parse(raw || '{}')
+            const next = applySlimPatch(parsed)
+            if (next.error) return reply(400, { ok: false, error: next.error })
+            appendCompatLog(`slim-options saved: ${JSON.stringify(next.value)}`)
+            return reply(200, { ok: true, options: next.value })
+          } catch (e) { return reply(400, { ok: false, error: String(e?.message ?? e) }) }
+        },
+      })
+      appendCompatLog('slim-options route registered')
+    } catch { /* 选项路由失败不影响手动瘦身 */ }
     return true
   } catch (e) {
     appendCompatLog('slim route FAILED: ' + String(e?.message ?? e).slice(0, 200))
     return false
   }
+}
+
+/* ── A线：自动瘦身选项（2026-10-24）──────────────────────────
+   用户定案：默认关 + 保留最近 N 轮可调 + 摘要占位。独立开关——关掉时
+   开机完全零成本（连定时器都不挂）；开启时也只动「非 live 且超过事件阈值」
+   的会话，逐个走 slimSessionFile 的全套门禁（verify/备份/回滚/projcache）。 */
+const SLIM_OPTIONS_FILE = 'adapter-compat-slim.json'
+const SLIM_DEFAULTS = { autoSlim: false, keepTurns: 10, digest: true, minEvents: 2000 }
+
+export function readSlimOptions(home = dshHomeDir()) {
+  try {
+    const raw = JSON.parse(readFileSync(home + '/' + SLIM_OPTIONS_FILE, 'utf8'))
+    return {
+      autoSlim: raw.autoSlim === true,
+      keepTurns: Number.isFinite(raw.keepTurns) && raw.keepTurns >= 0 ? Math.floor(raw.keepTurns) : SLIM_DEFAULTS.keepTurns,
+      digest: raw.digest !== false,
+      minEvents: Number.isFinite(raw.minEvents) && raw.minEvents >= 100 ? Math.floor(raw.minEvents) : SLIM_DEFAULTS.minEvents,
+    }
+  } catch {
+    return { ...SLIM_DEFAULTS }
+  }
+}
+
+function applySlimPatch(patch) {
+  const next = readSlimOptions()
+  const errors = []
+  if (patch?.autoSlim !== undefined) {
+    if (typeof patch.autoSlim !== 'boolean') errors.push('autoSlim 应为布尔')
+    else next.autoSlim = patch.autoSlim
+  }
+  if (patch?.keepTurns !== undefined) {
+    const n = Number(patch.keepTurns)
+    if (!Number.isFinite(n) || n < 0 || n > 500) errors.push('keepTurns 应为 0~500')
+    else next.keepTurns = Math.floor(n)
+  }
+  if (patch?.digest !== undefined) {
+    if (typeof patch.digest !== 'boolean') errors.push('digest 应为布尔')
+    else next.digest = patch.digest
+  }
+  if (patch?.minEvents !== undefined) {
+    const n = Number(patch.minEvents)
+    if (!Number.isFinite(n) || n < 100 || n > 100000) errors.push('minEvents 应为 100~100000')
+    else next.minEvents = Math.floor(n)
+  }
+  if (errors.length > 0) return { error: errors.join('；') }
+  try { writeFileSync(dshHomeDir() + '/' + SLIM_OPTIONS_FILE, JSON.stringify(next, null, 1), 'utf8') } catch (e) {
+    return { error: '写入失败: ' + String(e?.message ?? e) }
+  }
+  return { value: next }
+}
+
+/**
+ * A线：开机自动瘦身（用户开了 autoSlim 才挂；默认关 = 零成本）。
+ * 规则：只动「非 live 且事件数 ≥ minEvents」的会话，keepTurns/digest 从设置读；
+ * 逐个走 slimSessionFile 全套门禁（verify/备份/写后复核），单个失败不影响其余。
+ */
+export function installAutoSlim(ctx) {
+  const opts = readSlimOptions()
+  if (opts.autoSlim !== true) return undefined
+  const t = setTimeout(async () => {
+    try {
+      const home = dshHomeDir()
+      const done = []
+      for (const entry of listSessionFiles(home)) {
+        try {
+          /* 便宜预筛：文件太小没必要动（<1MB 压缩后约 < 2k 事件），省一次整读。 */
+          const st = statSync(entry.file)
+          if (st.size < 1024 * 1024) continue
+          const r = await slimSessionFile(ctx, entry.id, { write: true, keepTurns: opts.keepTurns, digest: opts.digest })
+          if (r.saved > 0) done.push({ id: entry.id, saved: r.saved })
+        } catch (e) {
+          const code = e?.code
+          if (code === 'SESSION_LIVE' || code === 'NOT_FOUND') continue
+          appendCompatLog(`auto-slim ${entry.id.slice(0, 18)} failed: ` + String(e?.message ?? e).slice(0, 120))
+        }
+      }
+      if (done.length > 0) appendCompatLog(`auto-slim: ${done.length} 个会话瘦身，共省 ${done.reduce((a, b) => a + b.saved, 0)} 字符`)
+    } catch (e) {
+      appendCompatLog('auto-slim run FAILED: ' + String(e?.message ?? e).slice(0, 160))
+    }
+  }, 90 * 1000) /* 90s：避开启动高峰（head-guard 4/25/45s 都在前面跑完） */
+  if (typeof t.unref === 'function') t.unref()
+  return t
 }
 
 /* ============ 第八层：断号修复（seq-gap repair） ===========
@@ -3185,6 +3294,104 @@ export function scanInvisibleSessions(home = dshHomeDir(), options = {}) {
   }
 }
 
+/* ── F线（2026-10-24）：子代理对话管理 ──────────────────────────
+   用户定位：subagent 会话（workflow/subagent 工具派生的子任务）对他「无意义/不可见」
+   ——侧栏从不显示、任务完成后就是死数据。权威判据 = 头帧 origin==='subagent'
+   （目录名不带 session- 前缀只是伴生特征，不作为判据）。
+   清理策略：独立扫描 + 独立清理路由（live 拒删、身份双检、逐个备份后真删）；
+   不并进 invisible 的保险链——那是「登记表缺失」的世界，这是「明确身份」的世界。 */
+export function scanSubagentSessions(home = dshHomeDir(), options = {}) {
+  const ctxHint = options.ctx
+  const dirs = sessionDirs(home)
+  const out = []
+  let totalBytes = 0
+  for (const [sid, info] of dirs) {
+    const h = readSessionHeader(info.file)
+    if (h?.origin !== 'subagent' && !(typeof h?.delegationDepth === 'number' && h.delegationDepth > 0)) continue
+    const live = ctxHint ? isSessionLive(ctxHint, sid) : false
+    totalBytes += info.sizeBytes
+    out.push({
+      id: sid,
+      title: sessionTitleLite(home, sid, info) ?? null,
+      sizeMB: +(info.sizeBytes / 1048576).toFixed(2),
+      sizeBytes: info.sizeBytes,
+      mtime: new Date(info.mtimeMs).toISOString().slice(0, 16).replace('T', ' '),
+      live,
+      depth: h?.delegationDepth ?? null,
+    })
+  }
+  out.sort((a, b) => b.sizeMB - a.sizeMB)
+  return { ok: true, sessions: out, totalMB: +(totalBytes / 1048576).toFixed(2), count: out.length, scannedAt: new Date().toISOString() }
+}
+
+/** F线：子代理会话路由：GET 清单 / POST 清理（ids 显式 + live 双检 + 备份 + 真删）。 */
+export function installSubagentRoute(ctx, config = {}) {
+  if (config?.invisiblePanel === false) return false
+  try {
+    const web = serviceOf(ctx, 'webServer')
+    if (!web || typeof web.register !== 'function') return false
+    const reply = (res, status, obj) => {
+      try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+    }
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/subagent',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        try { return reply(res, 200, { ok: true, value: scanSubagentSessions(dshHomeDir(), { ctx }) }) }
+        catch (e) { return reply(res, 500, { ok: false, error: String(e?.message ?? e) }) }
+      },
+    })
+    web.register({
+      kind: 'exact',
+      path: '/dsh-adapter-compat/subagent/purge',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        try {
+          let body = ''
+          for await (const chunk of req) { body += chunk; if (body.length > 65536) throw new Error('body too large') }
+          const parsed = JSON.parse(body || '{}')
+          if (!Array.isArray(parsed?.ids) || parsed.ids.length === 0) return reply(res, 400, { ok: false, error: 'ids required' })
+          const home = dshHomeDir()
+          const results = []
+          let freedBytes = 0
+          for (const rawId of parsed.ids) {
+            const sid = String(rawId)
+            try {
+              if (isSessionLive(ctx, sid)) { results.push({ id: sid, status: 'live-refused' }); continue }
+              const info = sessionDirs(home).get(sid)
+              if (!info) { results.push({ id: sid, status: 'not-found' }); continue }
+              const h = readSessionHeader(info.file)
+              /* 身份双检：只删真 subagent（防 id 伪造端掉普通会话）。 */
+              if (h?.origin !== 'subagent' && !(typeof h?.delegationDepth === 'number' && h.delegationDepth > 0)) {
+                results.push({ id: sid, status: 'not-subagent' }); continue
+              }
+              const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR + '-subagent'
+              try {
+                mkdirSync(backupDir, { recursive: true })
+                copyFileSync(info.file, backupDir + '/' + sid + '.jsonl.zstd')
+              } catch { /* 备份尽力而为：用户已确认，subagent 本就是可弃数据 */ }
+              rmSync(info.file, { force: true })
+              try { rmSync(join(info.dir, 'session.lock'), { force: true }) } catch { /* 无锁正常 */ }
+              try { const left = readdirSync(info.dir); if (left.length === 0) rmSync(info.dir, { recursive: true, force: true }) } catch { /* ignore */ }
+              freedBytes += info.sizeBytes
+              results.push({ id: sid, status: 'deleted' })
+            } catch (e) { results.push({ id: sid, status: 'failed', error: String(e?.message ?? e).slice(0, 120) }) }
+          }
+          const deletedCount = results.filter((r) => r.status === 'deleted').length
+          appendCompatLog(`subagent purge: deleted=${deletedCount} refused=${results.filter((r) => r.status === 'live-refused').length} freedMB=${(freedBytes / 1048576).toFixed(2)}`)
+          return reply(res, 200, { ok: true, deletedCount, freedMB: +(freedBytes / 1048576).toFixed(2), results })
+        } catch (e) { return reply(res, 500, { ok: false, error: String(e?.message ?? e) }) }
+      },
+    })
+    appendCompatLog('subagent routes registered')
+    return true
+  } catch (e) {
+    appendCompatLog('subagent route FAILED: ' + String(e?.message ?? e).slice(0, 160))
+    return false
+  }
+}
+
 /** 不可见会话路由：GET 清单 / POST 删除（不带 write 即干跑）。 */
 
 export function installInvisibleRoute(ctx, config = {}) {
@@ -3759,6 +3966,13 @@ export function apply(ctx, config = {}) {
     /* 路由注册失败绝不拖垮 apply */
   }
 
+  // -3.51) A线：开机自动瘦身（autoSlim 默认关——关着时这里零成本直接 return）
+  try {
+    installAutoSlim(ctx)
+  } catch {
+    /* 自动瘦身失败绝不拖垮 apply；手动瘦身路由照常可用 */
+  }
+
   // -3.55) 断号修复：路由（强退丢批兜底，不依赖 llm，排在早退之前）
   try {
     installRepairRoute(ctx, config)
@@ -3790,6 +4004,13 @@ export function apply(ctx, config = {}) {
   // -3.59) 不可见会话（侧栏选不出来的）清单 + 清理路由
   try {
     installInvisibleRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.585) F线：子代理对话管理（扫描 + 清理路由；随 invisiblePanel 开关）
+  try {
+    installSubagentRoute(ctx, config)
   } catch {
     /* 路由注册失败绝不拖垮 apply */
   }

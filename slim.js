@@ -100,14 +100,64 @@ export const SLIM_TYPES = new Set([
   'assistant/message', 'assistant/attempt', 'llm/retry', 'llm/retry-started', 'tool/result',
 ])
 
+/** 摘要占位（2026-10-24 A线，用户批准）：擦掉的正文留个念想——前两行 + 总字数。
+ *  AI 翻旧账时至少知道「这里原本在干嘛」，真细节找备份（备份是瘦身落盘的硬前置）。 */
+export function digestOf(text) {
+  const body = String(text ?? '')
+  if (body.trim() === '') return SLIM_PLACEHOLDER
+  const lines = body.split(/\r?\n/).filter((l) => l.trim() !== '')
+  const head = lines.slice(0, 2).map((l) => l.trim().slice(0, 60)).join(' / ')
+  const chars = body.length
+  return head ? `[内容已清除 · 约${chars}字 · 原: ${head}]` : `[内容已清除 · 约${chars}字]`
+}
+
+/** 摘要占位版单条瘦身：与 slimEvent 同构，tool/result 的占位带前两行摘要。 */
+function slimEventWithDigest(event) {
+  const e = slimEvent(event)
+  const d = e?.data
+  if (e.type === 'tool/result' && d && Array.isArray(d.message?.content)) {
+    /* slimEvent 已把 content 擦成纯占位；用原文重算摘要版占位替换回去。 */
+    const raw = (event?.data?.message?.content ?? [])
+      .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+      .map((b) => b.text)
+      .join('\n')
+    if (raw.trim()) d.message.content = [{ type: 'text', text: digestOf(raw) }]
+  }
+  return e
+}
+
 /**
  * 瘦身整个会话文件：读 → 逐条瘦身 → verify → （调用方决定）备份+写+读回复核。
- * @returns {{ok, problems, before, after, saved, events, header, slimmed}}
+ * @param {string} file
+ * @param {{keepTurns?: number, digest?: boolean}} [options]
+ *   keepTurns：保留**最近 N 个 turn** 原文不瘦（更早的才动刀）。0/缺省 = 全部瘦
+ *              （原行为，向下兼容）。turn = turn/start..turn/end 一段，按事件序从后往前数；
+ *              总轮数 ≤ keepTurns 时不瘦任何东西（返回 ok 且 saved=0）。
+ *   digest：true 时占位符带「前两行+字数」摘要（默认 false = 纯占位，原行为）。
+ * @returns {{ok, problems, before, after, saved, events, header, slimmed, keptTurns}}
  */
-export function slimSession(file) {
+export function slimSession(file, options = {}) {
+  const keepTurns = Number.isFinite(options.keepTurns) && options.keepTurns > 0 ? Math.floor(options.keepTurns) : 0
+  const digest = options.digest === true
   const { header, events } = readSession(file)
   const before = JSON.stringify(events).length
-  const slimmed = events.map((e) => (SLIM_TYPES.has(e.type) ? slimEvent(e) : e))
+
+  /* 保留边界：最近 keepTurns 个 turn 的起始事件下标——这些及之后的全保留原文。
+     keepTurns=0（缺省）= 不保留任何整轮 → keepFromIndex = Infinity（所有事件都参与瘦身，
+     即原行为）。注意不能用 0 当「全不瘦」哨兵：i >= 0 恒真。 */
+  let keepFromIndex = Infinity
+  if (keepTurns > 0) {
+    const turnStarts = []
+    events.forEach((e, i) => { if (e?.type === 'turn/start') turnStarts.push(i) })
+    /* 总轮数 ≤ 保留数：全部轮都在保留区 → 从第一个 turn 起全保（哨兵 -1 让 i>=恒假）。 */
+    keepFromIndex = turnStarts.length > keepTurns ? turnStarts[turnStarts.length - keepTurns] : -1
+  }
+
+  const slimmed = events.map((e, i) => {
+    if (i >= keepFromIndex) return e
+    if (!SLIM_TYPES.has(e.type)) return e
+    return digest ? slimEventWithDigest(e) : slimEvent(e)
+  })
   const after = JSON.stringify(slimmed).length
   const v = verify(header, slimmed)
   return {
@@ -119,5 +169,6 @@ export function slimSession(file) {
     events: slimmed.length,
     header,
     slimmed,
+    keptTurns: keepTurns,
   }
 }
