@@ -64,7 +64,9 @@ window.__ModuleLoader__.load({
       txtChunkLabel: '附件分段阈值（全局）',
       txtChunkDesc: '单段 .txt 上限字节；LDW 侧据此把大附件切 partN-ofM 逐段上传。API 通道不适用但保持可见（用户定案：全局入口一律完整呈现）',
       chatOnlyLabel: '纯聊天模式（全局）',
-      chatOnlyDesc: '全局侧的纯聊天开关（与 LDW 的 lite-chat 预设对应）；API 通道由预设本身控制工具面，此处开关为统一入口展示',
+      chatOnlyDesc: '开：API 通道进 provider 前清空工具目录（模型收不到工具=纯聊天）；LDW 侧仍走 lite-chat 预设。压缩/标题请求不受影响',
+      zhToolNamesLabel: '中文工具名',
+      zhToolNamesDesc: '开：API 工具目录每项带「（中文名：XX，两个名字等价）」标注，模型可用中文说工具名（如「我要用工具 读取文件」），翻译层自动翻回真名。独立开关，默认关',
       kbLabel: '知识库自然语言协议',
       kbDesc: '开：模型说「我要调动第一层/第二层知识库，搜索xx」会被翻译成真正的检索调用（lite-chat-kb 预设配套，网页端不露代码块，降低风控特征）；关：这句话按普通文字处理',
       nlToolLabel: '自然语言工具调用（通用）',
@@ -508,6 +510,8 @@ window.__ModuleLoader__.load({
               directSendThresholdChars: Math.max(0, Number(prefs.directSendThresholdChars) || 0),
               txtChunkBytes: Math.max(0, Number(prefs.txtChunkBytes) || 0),
               chatOnly: prefs.chatOnly === true,
+              /** 中文工具名（2026-10-24）：同源 webin config。 */
+              zhToolNames: prefs.zhToolNames === true,
             }),
           })
           if (r.ok && r.data && r.data.ok) {
@@ -618,6 +622,17 @@ window.__ModuleLoader__.load({
           onClick: () => setPrefs((p) => ({ ...p, chatOnly: p.chatOnly !== true })),
         }, prefs.chatOnly === true ? '开启' : '关闭'))
 
+      /* 中文工具名（2026-10-24 用户点名「调用时用汉字代替不要漏名字」）：
+         独立开关——开启后 API 请求的工具目录带中文名标注，模型说中文工具名也能翻回真名。 */
+      const zhRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.zhToolNamesLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.zhToolNamesDesc)),
+        h('button', {
+          className: 'ac-btn',
+          onClick: () => setPrefs((p) => ({ ...p, zhToolNames: p.zhToolNames === true ? false : true })),
+        }, prefs.zhToolNames === true ? '开启' : '关闭'))
+
       const nlRow = h('div', { className: 'ac-row' },
         h('div', null,
           h('div', { className: 'ac-row-title' }, ZH.nlToolLabel),
@@ -640,7 +655,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'ac-row-desc' }, note || ZH.exitNote),
         h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? '保存中…' : ZH.save))
 
-      return wrap([pagerRow, renderFxRow, modeRow, thresholdRow, directThresholdRow, txtChunkRow, chatOnlyRow, kbRow, nlRow, titleRow, foot])
+      return wrap([pagerRow, renderFxRow, modeRow, thresholdRow, directThresholdRow, txtChunkRow, chatOnlyRow, zhRow, kbRow, nlRow, titleRow, foot])
     }
 
     /* ── 版本家族与磁盘占用（9999.9.25）──────────────────────────

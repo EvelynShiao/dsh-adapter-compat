@@ -25,17 +25,24 @@ export function translateKbUtterance(text, toolNames) {
   return { name: tool, arguments: JSON.stringify({ query }) }
 }
 
-/** 通用工具句式（动态映射）。 */
+/** 通用工具句式（动态映射）。
+ * 2026-10-24 中文工具名支持：模型可说「我要用工具 读取文件，参数{...}」——
+ * 中文名先经 enToolName 翻回英文真名再匹配（两个名字等价）。 */
+import { enToolName } from './tool-names.js'
+
 export function translateToolUtterance(text, tools) {
   const t = String(text ?? '').trim()
   if (t === '' || t.length > 240) return null
-  const anchor = t.search(/我要(?:用工具|调用|使用)\s*[A-Za-z_]/u)
+  const anchor = t.search(/我要(?:用工具|调用|使用)\s*/u)
   if (anchor < 0) return null
   if (anchor > 0 && !UTTERANCE_LEADINS.test(t.slice(0, anchor))) return null
   const rest = t.slice(anchor)
-  const m = rest.match(/^我要(?:用工具|调用|使用)\s*([A-Za-z_][A-Za-z0-9_-]*)\s*[，,、]?\s*(?:参数\s*)?(.+?)\s*$/u)
+  /** 工具名：英文字母开头（老形态）或中文串（新形态，tool-names 表里的中文名）。 */
+  const m = rest.match(/^我要(?:用工具|调用|使用)\s*([A-Za-z_][A-Za-z0-9_-]*|[\u4e00-\u9fff]{2,10})\s*[，,、]?\s*(?:参数\s*)?(.+?)\s*$/u)
   if (m === null) return null
-  const tool = (Array.isArray(tools) ? tools : []).find((x) => x?.name === m[1])
+  /** 中文名 → 英文真名（表里没有的原样返回——英文真名直接匹配）。 */
+  const realName = enToolName(m[1])
+  const tool = (Array.isArray(tools) ? tools : []).find((x) => x?.name === realName)
   if (tool === undefined) return null
   let raw = m[2].trim()
   if (raw.startsWith('{')) {

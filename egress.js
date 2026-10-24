@@ -33,9 +33,10 @@ export const EGRESS_NORMALIZER = Symbol.for('dsh-adapter-compat.egress-normalize
 
 /** 自然语言调用翻译（2026-10-21 重建——全局 egress 层，API 车道同样生效）。 */
 import { translateUtterance } from './nl-utterance.js'
+import { zhToolName, TOOL_ZH_NAMES } from './tool-names.js'
 
 /** 统计（自检接口展示；>0 说明真的在干活）。 */
-export const egressStats = { thinkingStripped: 0, xmlToolCalls: 0, markersDropped: 0, skippedByScope: 0, nlUtterances: 0 }
+export const egressStats = { thinkingStripped: 0, xmlToolCalls: 0, markersDropped: 0, skippedByScope: 0, nlUtterances: 0, chatOnlyStripped: 0, nlTaught: 0, zhLocalized: 0 }
 
 /** 内置「网页端」路由判定前缀：webin 的路由名形如 `webin-<平台>`（见 webin 的 routeFor()）。 */
 export const BUILTIN_WEB_ROUTE_PREFIX = 'webin'
@@ -402,6 +403,12 @@ export function normalizeEgressOptions(raw = {}) {
     /* NL 协议全局开关（真源 webin config 的 kbProtocol/nlToolProtocol——同排钮控制两道）。 */
     kbProtocol: raw?.kbProtocol !== false,
     nlToolProtocol: raw?.nlToolProtocol === true,
+    /* 入口三件套（2026-10-24 用户点名单）：chatOnly（API 通道纯聊天：进 provider 前清 tools） */
+    chatOnly: raw?.chatOnly === true,
+    /* NL 教学（API 通道模型不知道 NL 句式——system 里注入一句式说明，仅 nlToolProtocol 开时） */
+    nlTeach: raw?.nlToolProtocol === true && raw?.kbProtocol !== false,
+    /* 中文工具名（用户点名「调用时用汉字代替不要漏名字」）：目录与翻译层双向映射 */
+    zhToolNames: raw?.zhToolNames === true,
   }
 }
 
@@ -428,16 +435,66 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
   try {
     ctx.effect(function* () {
       yield ctx.on('llm/stream', function (options, next) {
-        const inner = next()
         let opts
         try { opts = readOptions() ?? {} } catch { opts = {} }
         const scope = opts.egressScope ?? 'all'
-        if (scope === 'off') return inner
+        if (scope === 'off') return next()
         if (scope === 'web' && !isWebRoute(options?.provider, extraRoutes)) {
           egressStats.skippedByScope += 1
-          return inner
+          return next()
         }
-        return normalizeEgressStream(inner, options, normalizeEgressOptions(opts), log)
+        /**
+        * ## 入口改造（2026-10-24 用户点名单，llm/stream 瀑布在 next() 前改 options）：
+        *
+        * ① chatOnly（API 通道纯聊天）：true ⇒ tools 清空——模型收不到任何工具定义，
+        *    自然退化成纯聊天。LDW 车道不受影响（webin 自己有 lite-chat 预设）。
+        *    ⚠️ 独立开关（webin config.chatOnly），关=零影响。压缩请求/标题请求不清
+        *    （那些不带工具本来也不受影响，但明确跳过防误伤）。
+        *
+        * ② nlTeach（API 通道 NL 教学）：LDW 有 TOOL_PROTOCOL 教模型句式，API 通道裸的
+        *    ——模型不知道可以说「我要调动第一层知识库，搜索XX」。在 system 尾部
+        *    注入一小段句式说明（只有 kb/nl 开关开着才注）。
+        *
+        * ③ zhToolNames（中文工具名）：工具目录里给模型看的名字/描述换成中文优先
+        *    （真名保留在 name 字段——API 的 function calling 调用时还是用真名，
+        *    description 前缀加「中文名」标注让模型知道两个名字等价）。
+        *    回复端的 NL 翻译层同步认中文名（translateUtterance 收到「我要用工具 读取文件」
+        *    能翻回 read）。
+        */
+        const eo = normalizeEgressOptions(opts)
+        if (options !== null && typeof options === 'object') {
+          const purpose = String(options.purpose ?? '')
+          if (eo.chatOnly === true && purpose !== 'compaction' && purpose !== 'session-title' && Array.isArray(options.tools) && options.tools.length > 0) {
+            options = { ...options, tools: [] }
+            egressStats.chatOnlyStripped = (egressStats.chatOnlyStripped ?? 0) + 1
+            log('chatOnly: 本轮 API 请求的工具目录已清空（纯聊天模式）')
+          }
+          if (eo.nlTeach === true && purpose !== 'compaction' && purpose !== 'session-title') {
+            const teach = [
+              '',
+              '【自然语言调用知识库】当你需要检索跨会话记忆时，不要调用工具——直接用自然语言说出这句话（整条回复只有这一句）：',
+              '「我要调动第一层知识库，搜索XX」（结论卡片）或「我要调动第二层知识库，搜索XX」（原始对话原文）。',
+              '宿主会自动把它翻译成真正的检索调用。',
+            ].join('\n')
+            const sys = String(options.system ?? '')
+            if (sys === '' || !sys.includes('我要调动第一层知识库')) {
+              options = { ...options, system: sys + (sys === '' ? '' : '\n\n') + teach }
+              egressStats.nlTaught = (egressStats.nlTaught ?? 0) + 1
+            }
+          }
+          if (eo.zhToolNames === true && Array.isArray(options.tools) && options.tools.length > 0) {
+            options = { ...options, tools: options.tools.map((t) => {
+              if (t === null || typeof t !== 'object') return t
+              const zh = zhToolName(t.name)
+              if (zh === t.name) return t
+              const desc = String(t.description ?? '')
+              return { ...t, description: `（中文名：${zh}，两个名字等价，调用时用任一均可）\n${desc}` }
+            }) }
+            egressStats.zhLocalized = (egressStats.zhLocalized ?? 0) + 1
+          }
+        }
+        const inner = next()
+        return normalizeEgressStream(inner, options, eo, log)
       })
     }, 'adapter-compat: egress normalizer')
   } catch (e) {

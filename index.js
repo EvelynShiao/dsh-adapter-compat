@@ -2302,6 +2302,17 @@ export function readHealOptions(home = dshHomeDir()) {
   try {
     value = normalizeHealOptions(JSON.parse(readFileSync(home + '/' + HEAL_OPTIONS_FILE, 'utf8')))
   } catch { /* 无文件 = 出厂默认 */ }
+  /* [2026-10-24 入口三件套] chatOnly/中文工具名/NL 键与 webin config 同源
+   *（egress 挂载点的 readOptions() 走这里——webin config 是真源，heal 文件不管这些键）。 */
+  try {
+    const webin = JSON.parse(readFileSync(webinConfigPath(home), 'utf8'))
+    if (webin !== null && typeof webin === 'object') {
+      value.chatOnly = webin.chatOnly === true
+      value.zhToolNames = webin.zhToolNames === true
+      value.kbProtocol = webin.kbProtocol !== false
+      value.nlToolProtocol = webin.nlToolProtocol === true
+    }
+  } catch { /* webin config 不存在/损坏：上面默认值兜底 */ }
   healOptionsCache = { at: now, value }
   return value
 }
@@ -2608,6 +2619,8 @@ export function readExitPrefs(home = dshHomeDir()) {
     directSendThresholdChars: Number(webin.directSendThresholdChars) > 0 ? Math.round(Number(webin.directSendThresholdChars)) : 6000,
     txtChunkBytes: Number(webin.txtChunkBytes) > 0 ? Math.round(Number(webin.txtChunkBytes)) : 409600,
     chatOnly: webin.chatOnly === true,
+    /* 中文工具名（2026-10-24 用户点名「调用时用汉字代替」）：真源 webin config，默认关（独立开关，铁律）。 */
+    zhToolNames: webin.zhToolNames === true,
   }
 }
 
@@ -2669,6 +2682,10 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
     if (typeof patch.chatOnly !== 'boolean') errors.push('chatOnly 应为布尔')
     else if (patch.chatOnly !== next.chatOnly) { next.chatOnly = patch.chatOnly; touchWebin = true }
   }
+  if (patch?.zhToolNames !== undefined) {
+    if (typeof patch.zhToolNames !== 'boolean') errors.push('zhToolNames 应为布尔')
+    else if (patch.zhToolNames !== next.zhToolNames) { next.zhToolNames = patch.zhToolNames; touchWebin = true }
+  }
   if (errors.length > 0) return { ok: false, error: errors.join('；') }
 
   try {
@@ -2684,6 +2701,7 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
       webin.directSendThresholdChars = next.directSendThresholdChars
       webin.txtChunkBytes = next.txtChunkBytes
       webin.chatOnly = next.chatOnly
+      webin.zhToolNames = next.zhToolNames
       writeJsonAtomic(webinPath, webin)
     }
     if (touchOwn) writeJsonAtomic(exitPrefsPath(home), { hideVersionPager: next.hideVersionPager, renderFx: next.renderFx === true })
