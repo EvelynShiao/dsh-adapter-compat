@@ -1476,7 +1476,9 @@ export async function guardProtectedHeads(ctx, options = {}) {
   }
   if (useCache) {
     try {
-      mkdirSync(dirname(fpFile), { recursive: true })
+      /* storages 目录一定存在（宿主启动即建）；dirname 未 import，这里用
+         正则剥文件名（writeJsonAtomic 同款思路），零新增依赖。 */
+      mkdirSync(fpFile.replace(/[\\/][^\\/]*$/, ''), { recursive: true })
       writeFileSync(fpFile, JSON.stringify(dirtyFingerprints, null, 1))
     } catch { /* 缓存写失败不影响守卫结果 */ }
   }
