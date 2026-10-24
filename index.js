@@ -2926,6 +2926,10 @@ export function readSessionHeader(file) {
       parent,
       cwd: typeof parsed?.cwd === 'string' ? parsed.cwd : (typeof data.cwd === 'string' ? data.cwd : ''),
       createdAt: typeof parsed?.createdAt === 'number' ? parsed.createdAt : (typeof data.createdAt === 'number' ? data.createdAt : 0),
+      /* F线（2026-10-24）：origin/delegationDepth——子代理判据就靠它们。
+         历史会话可能没有 origin 字段（旧格式），undefined 是正常值。 */
+      origin: typeof parsed?.origin === 'string' ? parsed.origin : (typeof data.origin === 'string' ? data.origin : undefined),
+      delegationDepth: typeof parsed?.delegationDepth === 'number' ? parsed.delegationDepth : (typeof data.delegationDepth === 'number' ? data.delegationDepth : 0),
     }
   } catch {
     return null
