@@ -75,6 +75,11 @@ window.__ModuleLoader__.load({
       pagerDesc: '分叉会话 / 修改过对话后出现在消息下方的版本分页器（dsh-easyrewrite 提供）',
       pagerHidden: '已隐藏',
       pagerShown: '显示中',
+      /* [B线 2026-10-24] 消息流懒渲染 */
+      renderFxLabel: '长会话滚动优化',
+      renderFxDesc: '屏幕外的消息跳过布局与绘制（content-visibility），长会话滚动更顺；时间轴不受影响。默认关，改完点保存',
+      renderFxOn: '已开启',
+      renderFxOff: '已关闭',
       modeLabel: '压缩 .txt 出口',
       modeDesc: '压缩摘要（/compact）输入太大时，把全文打包成 .txt 附件传给网页端',
       thresholdLabel: '直接发送阈值（字符）',
@@ -424,6 +429,43 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /* [B线 2026-10-24] 消息流懒渲染：屏幕外的消息项跳过布局与绘制（content-visibility）。
+       宿主消息流容器 [data-conversation-scroll]，消息项 .EvIC1a_flowItem（宿主 chat 包的
+       稳定 class）；预估高度给 contain-intrinsic-size 防滚动跳动。Timeline 的 turn 轨道
+       （.eGxaPq_frame，绝对定位独立层）不在消息流内、且显式豁免——缩略条/刻度照常渲染。 */
+    const RENDER_FX_CSS = [
+      '[data-conversation-scroll] .EvIC1a_flowItem {',
+      '  content-visibility: auto;',
+      '  contain-intrinsic-size: auto 220px;',
+      '}',
+      '/* Timeline 轨道豁免：绝对定位层不吃 content-visibility，双保险显式还原 */',
+      '[data-conversation-scroll] .eGxaPq_frame,',
+      '[data-conversation-scroll] .eGxaPq_slot,',
+      '[data-conversation-scroll] .eGxaPq_scroller,',
+      '[data-conversation-scroll] .eGxaPq_marks {',
+      '  content-visibility: visible;',
+      '}',
+    ].join('\n')
+
+    /** 按开关注入/移除懒渲染 CSS（幂等：同一个 style 节点）。 */
+    function applyRenderFx(on) {
+      try {
+        let el = document.querySelector('style[data-plugin="dsh-adapter-compat-renderfx"]')
+        if (on !== true) {
+          if (el) el.remove()
+          return
+        }
+        if (!el) {
+          el = document.createElement('style')
+          el.dataset.plugin = 'dsh-adapter-compat-renderfx'
+          document.head.appendChild(el)
+        }
+        el.textContent = RENDER_FX_CSS
+      } catch {
+        /* 注入失败不影响其它功能 */
+      }
+    }
+
     function ExitSection() {
       const [prefs, setPrefs] = useState(null)
       const [note, setNote] = useState('')
@@ -436,6 +478,7 @@ window.__ModuleLoader__.load({
           if (r.ok && r.data && r.data.value) {
             setPrefs(r.data.value)
             applyPagerHidden(r.data.value.hideVersionPager !== false)
+            applyRenderFx(r.data.value.renderFx === true)
           } else setNote('读取失败，可重试')
         }).catch(() => { if (!dead) setNote('读取失败，可重试') })
         return () => { dead = true }
@@ -456,6 +499,7 @@ window.__ModuleLoader__.load({
               compactionFileMode: prefs.compactionFileMode,
               compactionFileThresholdChars: prefs.compactionFileThresholdChars,
               hideVersionPager: prefs.hideVersionPager,
+              renderFx: prefs.renderFx === true,
               kbProtocol: prefs.kbProtocol !== false,
               nlToolProtocol: prefs.nlToolProtocol === true,
               titlePrefix: prefs.titlePrefix !== false,
@@ -470,6 +514,7 @@ window.__ModuleLoader__.load({
             const v = r.data.value || prefs
             setPrefs(v)
             applyPagerHidden(v.hideVersionPager !== false)
+            applyRenderFx(v.renderFx === true)
             setNote('已保存 · 即时生效')
           } else setNote('保存失败：' + String(r.data && r.data.error ? r.data.error : '未知原因'))
         } catch (e) {
@@ -496,6 +541,17 @@ window.__ModuleLoader__.load({
           className: 'ac-btn',
           onClick: () => setPrefs((p) => ({ ...p, hideVersionPager: p.hideVersionPager !== true })),
         }, prefs.hideVersionPager !== true ? ZH.pagerShown : ZH.pagerHidden))
+
+      /* [B线 2026-10-24] 消息流懒渲染开关（默认关）：开了以后屏幕外的消息跳过布局绘制，
+         长会话滚动更顺；Timeline 时间轴不受影响（独立渲染层）。 */
+      const renderFxRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.renderFxLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.renderFxDesc)),
+        h('button', {
+          className: 'ac-btn',
+          onClick: () => setPrefs((p) => ({ ...p, renderFx: p.renderFx !== true })),
+        }, prefs.renderFx === true ? ZH.renderFxOn : ZH.renderFxOff))
 
       const modeRow = h('div', { className: 'ac-row' },
         h('div', null,
@@ -584,7 +640,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'ac-row-desc' }, note || ZH.exitNote),
         h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? '保存中…' : ZH.save))
 
-      return wrap([pagerRow, modeRow, thresholdRow, directThresholdRow, txtChunkRow, chatOnlyRow, kbRow, nlRow, titleRow, foot])
+      return wrap([pagerRow, renderFxRow, modeRow, thresholdRow, directThresholdRow, txtChunkRow, chatOnlyRow, kbRow, nlRow, titleRow, foot])
     }
 
     /* ── 版本家族与磁盘占用（9999.9.25）──────────────────────────
@@ -1164,7 +1220,11 @@ window.__ModuleLoader__.load({
          不再单开顶级分区 —— 上面的 HealSection 里渲染 h(InvisibleBlock)。 */
       try {
         fetchJson(EXIT_PREFS).then((r) => {
-          if (r.ok && r.data && r.data.value) applyPagerHidden(r.data.value.hideVersionPager !== false)
+          if (r.ok && r.data && r.data.value) {
+            applyPagerHidden(r.data.value.hideVersionPager !== false)
+            /* [B线] 启动即应用懒渲染——用户没打开设置页时也吃到开关。 */
+            applyRenderFx(r.data.value.renderFx === true)
+          }
         }).catch(() => { /* 读不到就保持默认（不隐藏），不影响其它功能 */ })
       } catch {
         /* ignore */

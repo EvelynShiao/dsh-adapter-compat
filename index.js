@@ -1419,11 +1419,32 @@ export async function guardProtectedHeads(ctx, options = {}) {
   const deep = options.deep === true
   const backupDir = options.backupDir ?? `${home}/${HEAD_GUARD_BACKUP_DIR}`
   const only = options.only instanceof Set ? options.only : undefined
-  const out = { write, deep, scanned: 0, headless: 0, written: 0, liveSkipped: 0, failed: 0, deduped: 0, results: [] }
+  /* [D线 2026-10-24] 指纹缓存：同 (size,mtime) 的会话两轮浅扫/深扫都跳过。
+     缓存落盘（head-guard-fingerprints.json），重启也在；守卫写过盘或会话被
+     外部改动（mtime 变）都会自然失效。指纹不匹配就照旧全流程——宁可多扫
+     也绝不漏扫。hook 定向补扫（only 给了明确 id 集合）不走缓存，保证真删除
+     后的补扫永远新鲜。 */
+  const fpFile = `${home}/storages/head-guard-fingerprints.json`
+  const useCache = only === undefined
+  let fingerprints = {}
+  if (useCache) {
+    try { fingerprints = JSON.parse(readFileSync(fpFile, 'utf8')) } catch { /* 首次无缓存 */ }
+  }
+  const fpOf = (entry) => {
+    try { const st = statSync(entry.file); return `${st.size}:${st.mtimeMs}` } catch { return null }
+  }
+  const out = { write, deep, scanned: 0, headless: 0, written: 0, liveSkipped: 0, failed: 0, deduped: 0, cachedSkipped: 0, results: [] }
+  const dirtyFingerprints = {}
   for (const entry of listSessionFiles(home)) {
     if (only !== undefined && !only.has(entry.id)) continue
     out.scanned += 1
     if (isSessionLive(ctx, entry.id)) { out.liveSkipped += 1; continue }
+    const fp = fpOf(entry)
+    if (useCache && deep && fp !== null && fingerprints[entry.id] === fp) {
+      out.cachedSkipped += 1
+      dirtyFingerprints[entry.id] = fp /* 原样续期：写回时保留 */
+      continue
+    }
     if (!deep) {
       let probe
       try {
@@ -1431,17 +1452,33 @@ export async function guardProtectedHeads(ctx, options = {}) {
       } catch {
         probe = undefined
       }
-      if (probe === undefined || probe.ok) continue
+      if (probe === undefined || probe.ok) {
+        /* 浅扫通过 → 记指纹：深扫若在浅扫之后跑且文件没再变，可整条跳过。 */
+        if (useCache && fp !== null) dirtyFingerprints[entry.id] = fp
+        continue
+      }
       out.headless += 1
     }
     const result = guardSessionFile(entry.file, { write, backupDir, deep })
-    if (result.status === 'clean') continue
+    if (result.status === 'clean') {
+      if (useCache && fp !== null) dirtyFingerprints[entry.id] = fp
+      continue
+    }
     if (result.status === 'unreadable') { out.failed += 1; out.results.push({ id: entry.id, ...result }); continue }
     if (result.diagnosis !== undefined) out.headless += 1
     if (result.deduped !== undefined) out.deduped += 1
     out.results.push({ id: entry.id, ...result })
-    if (result.status === 'written') out.written += 1
-    else if (result.status !== 'planned') out.failed += 1
+    if (result.status === 'written') {
+      out.written += 1
+      /* 写过盘 → 文件已变，重取新指纹（下次深扫跳过，本次改动闭环）。 */
+      if (useCache) { const nf = fpOf(entry); if (nf !== null) dirtyFingerprints[entry.id] = nf }
+    } else if (result.status !== 'planned') out.failed += 1
+  }
+  if (useCache) {
+    try {
+      mkdirSync(dirname(fpFile), { recursive: true })
+      writeFileSync(fpFile, JSON.stringify(dirtyFingerprints, null, 1))
+    } catch { /* 缓存写失败不影响守卫结果 */ }
   }
   return out
 }
@@ -2510,7 +2547,7 @@ export const COMPACT_EXIT_MODES = ['never', 'auto', 'always']
 /** 出口设置默认值：与 webin 出厂默认一致。 */
 export const COMPACT_EXIT_DEFAULTS = { compactionFileMode: 'auto', compactionFileThresholdChars: 100000 }
 /** 版本分页器开关的默认值：true = 隐藏（用户要「禁了」）。 */
-export const EXIT_PREFS_DEFAULTS = { hideVersionPager: true }
+export const EXIT_PREFS_DEFAULTS = { hideVersionPager: true, renderFx: false }
 
 /** 本插件出口偏好文件（只存「与 webin 无关」的开关，如隐藏分页器）。 */
 export function exitPrefsPath(home = dshHomeDir()) {
@@ -2555,6 +2592,9 @@ export function readExitPrefs(home = dshHomeDir()) {
     compactionFileMode: mode,
     compactionFileThresholdChars: threshold,
     hideVersionPager: own.hideVersionPager !== false,
+    /* [B线 2026-10-24] 消息流懒渲染开关：默认关（用户刚被闪退惊过，不替他做默认决定）。
+     *  开启后客户端给消息项注入 content-visibility:auto，屏幕外跳过布局绘制。 */
+    renderFx: own.renderFx === true,
     /* 知识库自然语言协议全局开关（2026-10-19）：真源同放 webin config.json
        （webin 每请求现读），默认开。 */
     kbProtocol: webin.kbProtocol !== false,
@@ -2594,6 +2634,13 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
   if (patch?.hideVersionPager !== undefined) {
     if (typeof patch.hideVersionPager !== 'boolean') errors.push('hideVersionPager 应为布尔')
     else if (patch.hideVersionPager !== next.hideVersionPager) { next.hideVersionPager = patch.hideVersionPager; touchOwn = true }
+  }
+  /* [B线 2026-10-24] 消息流懒渲染：只存开关（客户端读后注入 content-visibility CSS）。
+     与 hideVersionPager 同一张自己的偏好表（adapter-compat-heal.json 的伴文件），
+     不碰 webin 配置——纯渲染优化，与出口/协议无关。 */
+  if (patch?.renderFx !== undefined) {
+    if (typeof patch.renderFx !== 'boolean') errors.push('renderFx 应为布尔')
+    else if (patch.renderFx !== next.renderFx) { next.renderFx = patch.renderFx; touchOwn = true }
   }
   if (patch?.kbProtocol !== undefined) {
     if (typeof patch.kbProtocol !== 'boolean') errors.push('kbProtocol 应为布尔')
@@ -2639,7 +2686,7 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
       webin.chatOnly = next.chatOnly
       writeJsonAtomic(webinPath, webin)
     }
-    if (touchOwn) writeJsonAtomic(exitPrefsPath(home), { hideVersionPager: next.hideVersionPager })
+    if (touchOwn) writeJsonAtomic(exitPrefsPath(home), { hideVersionPager: next.hideVersionPager, renderFx: next.renderFx === true })
     if (touchWebin || touchOwn) {
       appendCompatLog(`exit-prefs saved: mode=${next.compactionFileMode} threshold=${next.compactionFileThresholdChars} hidePager=${next.hideVersionPager} kbProtocol=${next.kbProtocol} nlTool=${next.nlToolProtocol} titlePrefix=${next.titlePrefix}`)
     }
