@@ -464,8 +464,15 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
         const eo = normalizeEgressOptions(opts)
         if (options !== null && typeof options === 'object') {
           const purpose = String(options.purpose ?? '')
+          /**
+           * 🔥 2026-10-25 根因修复：cordis waterfall 的 next() 是无参闭包——
+           * `(cbs.shift() ?? inner)(...args)`，args 里的 options 是【原始对象引用】。
+           * 之前 `options = { ...options, ... }` 只改局部变量（新对象传给下游=从没发生），
+           * 用户实测三件套全失效（c8bdf267：教学没进 system/目录没中文名/tools 没清）。
+           * 修法：**原位 mutate** options 对象——瀑布下游（provider）持有的同一引用。
+           */
           if (eo.chatOnly === true && purpose !== 'compaction' && purpose !== 'session-title' && Array.isArray(options.tools) && options.tools.length > 0) {
-            options = { ...options, tools: [] }
+            options.tools = []
             egressStats.chatOnlyStripped = (egressStats.chatOnlyStripped ?? 0) + 1
             log('chatOnly: 本轮 API 请求的工具目录已清空（纯聊天模式）')
           }
@@ -478,18 +485,19 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
             ].join('\n')
             const sys = String(options.system ?? '')
             if (sys === '' || !sys.includes('我要调动第一层知识库')) {
-              options = { ...options, system: sys + (sys === '' ? '' : '\n\n') + teach }
+              options.system = sys + (sys === '' ? '' : '\n\n') + teach
               egressStats.nlTaught = (egressStats.nlTaught ?? 0) + 1
             }
           }
           if (eo.zhToolNames === true && Array.isArray(options.tools) && options.tools.length > 0) {
-            options = { ...options, tools: options.tools.map((t) => {
-              if (t === null || typeof t !== 'object') return t
+            for (let ti = 0; ti < options.tools.length; ti++) {
+              const t = options.tools[ti]
+              if (t === null || typeof t !== 'object') continue
               const zh = zhToolName(t.name)
-              if (zh === t.name) return t
+              if (zh === t.name) continue
               const desc = String(t.description ?? '')
-              return { ...t, description: `（中文名：${zh}，两个名字等价，调用时用任一均可）\n${desc}` }
-            }) }
+              options.tools[ti] = { ...t, description: `（中文名：${zh}，两个名字等价，调用时用任一均可）\n${desc}` }
+            }
             egressStats.zhLocalized = (egressStats.zhLocalized ?? 0) + 1
           }
         }
