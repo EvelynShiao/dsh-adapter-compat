@@ -471,8 +471,19 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
            * 用户实测三件套全失效（c8bdf267：教学没进 system/目录没中文名/tools 没清）。
            * 修法：**原位 mutate** options 对象——瀑布下游（provider）持有的同一引用。
            */
-          if (eo.chatOnly === true && purpose !== 'compaction' && purpose !== 'session-title' && Array.isArray(options.tools) && options.tools.length > 0) {
-            options.tools = []
+          /* 🔥 2026-10-25 二次修复（session-beae66b3 实证）：options 可能被宿主冻结
+           * （Object.freeze/deepFreeze——beae66b3 turn 105/106 连环
+           * `Cannot add property system, object is not extensible` 就是 488 行裸写
+           * 冻结 options 炸的，整轮 turn 死掉会话发不出消息）。
+           * 修法与 inject.js 同款 fail-open：可扩展 → 原位 mutate（下游同引用）；
+           * 冻结 → 退化为局部副本（下游拿不到教学，但轮次绝不崩——
+           * 教学文案是增值不是命脉，inject.js 的哲学在这里同样适用）。 */
+          const optionsMutable = options !== null && typeof options === 'object' ? Object.isExtensible(options) : false
+          const mutOptions = optionsMutable ? options : (options !== null && typeof options === 'object' ? { ...options } : options)
+          if (mutOptions !== null && typeof mutOptions === 'object') {
+          const purpose = String(mutOptions.purpose ?? '')
+          if (eo.chatOnly === true && purpose !== 'compaction' && purpose !== 'session-title' && Array.isArray(mutOptions.tools) && mutOptions.tools.length > 0) {
+            mutOptions.tools = []
             egressStats.chatOnlyStripped = (egressStats.chatOnlyStripped ?? 0) + 1
             log('chatOnly: 本轮 API 请求的工具目录已清空（纯聊天模式）')
           }
@@ -483,22 +494,23 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
               '「我要调动第一层知识库，搜索XX」（结论卡片）或「我要调动第二层知识库，搜索XX」（原始对话原文）。',
               '宿主会自动把它翻译成真正的检索调用。',
             ].join('\n')
-            const sys = String(options.system ?? '')
+            const sys = String(mutOptions.system ?? '')
             if (sys === '' || !sys.includes('我要调动第一层知识库')) {
-              options.system = sys + (sys === '' ? '' : '\n\n') + teach
+              mutOptions.system = sys + (sys === '' ? '' : '\n\n') + teach
               egressStats.nlTaught = (egressStats.nlTaught ?? 0) + 1
             }
           }
-          if (eo.zhToolNames === true && Array.isArray(options.tools) && options.tools.length > 0) {
-            for (let ti = 0; ti < options.tools.length; ti++) {
-              const t = options.tools[ti]
+          if (eo.zhToolNames === true && Array.isArray(mutOptions.tools) && mutOptions.tools.length > 0) {
+            for (let ti = 0; ti < mutOptions.tools.length; ti++) {
+              const t = mutOptions.tools[ti]
               if (t === null || typeof t !== 'object') continue
               const zh = zhToolName(t.name)
               if (zh === t.name) continue
               const desc = String(t.description ?? '')
-              options.tools[ti] = { ...t, description: `（中文名：${zh}，两个名字等价，调用时用任一均可）\n${desc}` }
+              mutOptions.tools[ti] = { ...t, description: `（中文名：${zh}，两个名字等价，调用时用任一均可）\n${desc}` }
             }
             egressStats.zhLocalized = (egressStats.zhLocalized ?? 0) + 1
+          }
           }
         }
         const inner = next()
