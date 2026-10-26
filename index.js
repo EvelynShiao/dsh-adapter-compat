@@ -109,7 +109,9 @@ import {
   isWebRoute,
   egressStats,
   EGRESS_NORMALIZER,
+  normalizeEgressOptions,
 } from './egress.js'
+import * as zhNames from './tool-names.js'
 
 /* 出口规范化的纯函数与判定再导出（单测/排查直接 import 本插件即可）。 */
 export {
@@ -164,7 +166,7 @@ export const BASE_DEFAULTS = {
   async prepareCall(provider, model, signal) {
     return {
       model: await this.resolveModel(provider, model, signal),
-      stream: (options) => this.stream(options),
+      stream: (options) => patchedStreamFor((o) => this.stream(o), options),
     }
   },
 }
@@ -172,12 +174,19 @@ export const BASE_DEFAULTS = {
 /**
  * 给一个 adapter 实例回填缺失的基类默认方法。
  * 只在 `typeof adapter[key] !== 'function'` 时写入，已有实现一律不动。
+ * ⚠️ prepareCall 例外（2026-10-26）：即使 adapter 自带 prepareCall，
+ * 也要【包装】它——这是冻结请求三件套（教学/中文名/纯聊天）唯一的生效位
+ * （agent-loop 把 request 深冻结后才调用，瀑布层物理上改不动）。
+ * 包装方式：调用原实现拿到 prepared，再把 prepared.stream 换成我们的
+ * 补丁流（解冻副本上做三件套再调原 stream）。原 prepareCall 的 model
+ * 解析逻辑原样保留。
  * @returns {string[]} 实际补上的方法名（幂等调用返回空数组）。
  */
 export function backfillAdapter(adapter) {
   if (!adapter || (typeof adapter !== 'object' && typeof adapter !== 'function')) return []
   const added = []
   for (const [key, impl] of Object.entries(BASE_DEFAULTS)) {
+    if (key === 'prepareCall') continue
     if (typeof adapter[key] === 'function') continue
     try {
       adapter[key] = impl
@@ -186,7 +195,85 @@ export function backfillAdapter(adapter) {
       // 冻结/只读对象：跳过，保持与宿主同样的失败面
     }
   }
+  /* prepareCall：一律包装（自带或回填都走同一条包装路）。PREPARE_PATCHED 防重。 */
+  if (typeof adapter.prepareCall === 'function' && adapter.prepareCall[PREPARE_PATCHED] !== true) {
+    const original = adapter.prepareCall
+    const patched = async function (...args) {
+      const prepared = await original.apply(this, args)
+      const innerStream = typeof prepared?.stream === 'function' ? prepared.stream.bind(prepared) : null
+      if (innerStream === null) return prepared
+      prepared.stream = (options) => patchedStreamFor(innerStream, options)
+      return prepared
+    }
+    try {
+      Object.defineProperty(patched, PREPARE_PATCHED, { value: true })
+      adapter.prepareCall = patched
+      added.push('prepareCall*')
+    } catch {
+      // 冻结 adapter 无法包装——跳过
+    }
+  } else if (typeof adapter.prepareCall !== 'function') {
+    try {
+      adapter.prepareCall = BASE_DEFAULTS.prepareCall
+      added.push('prepareCall')
+    } catch { /* 同上 */ }
+  }
   return added
+}
+
+/** prepareCall 包装标记（防热重载/多次 sweep 重复包装）。 */
+const PREPARE_PATCHED = Symbol.for('dsh-adapter-compat.prepare-call-patched')
+
+/**
+ * 冻结请求三件套补丁流（2026-10-26 晚定案的真正生效位）：
+ * request 被 agent-loop Object.freeze 深冻结——瀑布层改不动（物理限制）。
+ * 这里在【调用底层 stream 前】用 structuredClone 解冻副本做三件套，
+ * 底层 adapter 收到的就是改写后的请求。原件不碰（宿主安全）。
+ */
+function patchedStreamFor(innerStream, options) {
+  try {
+    const heal = readHealOptions()
+    const eo = normalizeEgressOptions(heal)
+    const needPatch = options !== null && typeof options === 'object'
+      && (eo.nlTeach === true || eo.zhToolNames === true || eo.chatOnly === true)
+    if (!needPatch) return innerStream(options)
+    const purpose = String(options.purpose ?? '')
+    const mutable = Object.isExtensible(options) ? options : structuredClone(options)
+    if (eo.chatOnly === true && purpose !== 'compaction' && purpose !== 'session-title'
+      && Array.isArray(mutable.tools) && mutable.tools.length > 0) {
+      mutable.tools = []
+      egressStats.chatOnlyStripped = (egressStats.chatOnlyStripped ?? 0) + 1
+    }
+    if (eo.nlTeach === true && purpose !== 'compaction' && purpose !== 'session-title') {
+      const teach = [
+        '',
+        '【自然语言调用知识库】当你需要检索跨会话记忆时，不要调用工具——直接用自然语言说出这句话（整条回复只有这一句）：',
+        '「我要调动第一层知识库，搜索XX」（结论卡片）或「我要调动第二层知识库，搜索XX」（原始对话原文）。',
+        '宿主会自动把它翻译成真正的检索调用。',
+      ].join('\n')
+      const sys = String(mutable.system ?? '')
+      if (sys === '' || !sys.includes('我要调动第一层知识库')) {
+        mutable.system = sys + (sys === '' ? '' : '\n\n') + teach
+        egressStats.nlTaught = (egressStats.nlTaught ?? 0) + 1
+      }
+    }
+    if (eo.zhToolNames === true && Array.isArray(mutable.tools) && mutable.tools.length > 0) {
+      try {
+        const { ZH_TOOL_DESCRIPTIONS } = zhNames
+        mutable.tools = mutable.tools.map((t) => {
+          if (t === null || typeof t !== 'object') return t
+          const zhDesc = ZH_TOOL_DESCRIPTIONS[t.name]
+          if (typeof zhDesc !== 'string' || zhDesc === '') return t
+          return { ...t, description: zhDesc }
+        })
+        egressStats.zhLocalized = (egressStats.zhLocalized ?? 0) + 1
+      } catch { /* 替换失败不阻断 */ }
+    }
+    return innerStream(mutable)
+  } catch {
+    /* fail-open：补丁失败退回原请求，绝不炸轮次 */
+    return innerStream(options)
+  }
 }
 
 /** 扫描 llm.adapters 注册表（value 形如 { adapter, provider }），回填所有 adapter。 */

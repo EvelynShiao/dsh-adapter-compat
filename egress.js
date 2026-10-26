@@ -478,7 +478,46 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
            * 修法与 inject.js 同款 fail-open：可扩展 → 原位 mutate（下游同引用）；
            * 冻结 → 退化为局部副本（下游拿不到教学，但轮次绝不崩——
            * 教学文案是增值不是命脉，inject.js 的哲学在这里同样适用）。 */
+          /* 🔥 2026-10-26 晚定案（用户子代理实测铁证）：宿主 agent-loop 在 L1269
+           * `Object.freeze({...header.config, ...})` 把整个 request options 深冻结后
+           * 才进 llm/stream 瀑布——【原位 mutate 永远不可能】（Object.isExtensible=false
+           * 恒走副本，副本改动传不到 provider）。此前 stats 涨是 handler 在跑的假象。
+           *
+           * 真解：【接管 inner 调用】。瀑布 handler 不再 next() 放行原始 options，
+           * 而是 next() 后拿到流、并自己用【改写后的副本 options】重新调用
+           * ……不行——next() 内部才真正调 provider，无法二次调用。
+           *
+           * 唯一可行：**cordis 瀑布 args 传引用**——waterfall(...args) 的 args 数组
+           * 持有 options 引用，下游 (cbs.shift()||inner)(...args) 展开的也是同一引用。
+           * 冻结的是 options 对象本身的属性树，但【args 数组本身可改】！
+           * handler 收到的第二参数 next 闭包捕获 args——handler 无法改 args……
+           *
+           * ⭐ 真正能用的位：宿主 streamWithRegistration(options, prepared) 的
+           * prepared.stream(options) —— 瀑布 innermost 是 adapterStream(options, prepared)。
+           * 传给 provider 的就是瀑布收到的 options 引用。所以：**改不了对象，
+           * 但可以改的是【adapter 收到的消息内容】**——不行，同样在 options 里。
+           *
+           * ⭐⭐ 最终落地：教学/中文名只在【options 可扩展】时生效（保底场景），
+           * 冻结时改走【回复端补】，即在 normalizeEgressStream 的 text 块尾部追加
+           * 教学提示？——污染正文，不行。
+           *
+           * ⭐⭐⭐ 唯一正解（本轮实现）：**包装 inner 适配器路径**——替换
+           * prepared.stream：在 next() 前把瀑布里的 options 换成可变副本，
+           * 内层 adapterStream 用副本调用。但 next() 无参不可传……
+           * → 检查 cordis waterfall 源码（lib/index.js L317-325）：
+           *   next = () => (cbs.shift() ?? inner)(...args) —— args 是闭包数组，
+           *   handler 收到的 options 就是 args[0]。【args 数组没被冻结】，
+           *   但 handler 拿不到 args 本体（只拿到展开值）。
+           * → 结论：**修改 args 不可能，mutate 冻结对象不可能** ⇒
+           *   在 egress 层对冻结请求的教学/中文名【物理上不可行】。
+           *   保持 fail-open 副本（至少 thinking 剥离等流层功能不受影响），
+           *   并在 stats 旁标记 frozenSkipped，让「为什么没生效」可观测。
+           */
           const optionsMutable = options !== null && typeof options === 'object' ? Object.isExtensible(options) : false
+          if (!optionsMutable && (eo.nlTeach === true || eo.zhToolNames === true || eo.chatOnly === true)) {
+            egressStats.frozenSkipped = (egressStats.frozenSkipped ?? 0) + 1
+            log('llm/stream: 请求对象被宿主深冻结（agent-loop Object.freeze），教学/中文名/纯聊天本轮跳过（宿主架构限制，无法在瀑布层改冻结请求）')
+          }
           const mutOptions = optionsMutable ? options : (options !== null && typeof options === 'object' ? { ...options } : options)
           if (mutOptions !== null && typeof mutOptions === 'object') {
           const purpose = String(mutOptions.purpose ?? '')
