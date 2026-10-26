@@ -500,16 +500,27 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
               egressStats.nlTaught = (egressStats.nlTaught ?? 0) + 1
             }
           }
+          /* 🔥 2026-10-25 三次修复（本轮实证 zhToolNames 一开全崩）：
+           * tools 数组本身被宿主冻结（read-only）——mutOptions 可扩展不代表
+           * 它的 .tools 数组可写。逐项赋值 tools[ti] 抛
+           * `Cannot assign to read only property '0'` ⇒ 整轮 turn 死。
+           * 修法：整数组克隆重挂（不逐项写原数组）——
+           *   mutOptions.tools = mutOptions.tools.map(...) 一次生成新数组再赋值，
+           *   mutOptions 本身可扩展就接得住；数组仍只读（极端 deepFreeze）时
+           *   try/catch 兜底：标注失败只记日志，绝不让一轮 turn 死。 */
           if (eo.zhToolNames === true && Array.isArray(mutOptions.tools) && mutOptions.tools.length > 0) {
-            for (let ti = 0; ti < mutOptions.tools.length; ti++) {
-              const t = mutOptions.tools[ti]
-              if (t === null || typeof t !== 'object') continue
-              const zh = zhToolName(t.name)
-              if (zh === t.name) continue
-              const desc = String(t.description ?? '')
-              mutOptions.tools[ti] = { ...t, description: `（中文名：${zh}，两个名字等价，调用时用任一均可）\n${desc}` }
+            try {
+              mutOptions.tools = mutOptions.tools.map((t) => {
+                if (t === null || typeof t !== 'object') return t
+                const zh = zhToolName(t.name)
+                if (zh === t.name) return t
+                const desc = String(t.description ?? '')
+                return { ...t, description: `（中文名：${zh}，两个名字等价，调用时用任一均可）\n${desc}` }
+              })
+              egressStats.zhLocalized = (egressStats.zhLocalized ?? 0) + 1
+            } catch (e) {
+              log('zhToolNames: 工具数组只读，本轮跳过中文名标注（不影响发送）: ' + String(e?.message ?? e).slice(0, 80))
             }
-            egressStats.zhLocalized = (egressStats.zhLocalized ?? 0) + 1
           }
           }
         }
