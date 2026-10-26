@@ -33,7 +33,7 @@ export const EGRESS_NORMALIZER = Symbol.for('dsh-adapter-compat.egress-normalize
 
 /** 自然语言调用翻译（2026-10-21 重建——全局 egress 层，API 车道同样生效）。 */
 import { translateUtterance } from './nl-utterance.js'
-import { zhToolName, TOOL_ZH_NAMES } from './tool-names.js'
+import { zhToolName, ZH_TOOL_DESCRIPTIONS } from './tool-names.js'
 
 /** 统计（自检接口展示；>0 说明真的在干活）。 */
 export const egressStats = { thinkingStripped: 0, xmlToolCalls: 0, markersDropped: 0, skippedByScope: 0, nlUtterances: 0, chatOnlyStripped: 0, nlTaught: 0, zhLocalized: 0 }
@@ -514,12 +514,14 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
                 if (t === null || typeof t !== 'object') return t
                 const zh = zhToolName(t.name)
                 if (zh === t.name) return t
-                const desc = String(t.description ?? '')
-                return { ...t, description: `（中文名：${zh}，两个名字等价，调用时用任一均可）\n${desc}` }
+                /* 2026-10-26 用户点名「为什么还有英文工具名」——中文描述完全替换英文
+                 * description（name 字段保留英文真名供 function calling；没映射的退回原文）。 */
+                const zhDesc = ZH_TOOL_DESCRIPTIONS[t.name]
+                return { ...t, description: typeof zhDesc === 'string' && zhDesc !== '' ? zhDesc : String(t.description ?? '') }
               })
               egressStats.zhLocalized = (egressStats.zhLocalized ?? 0) + 1
             } catch (e) {
-              log('zhToolNames: 工具数组只读，本轮跳过中文名标注（不影响发送）: ' + String(e?.message ?? e).slice(0, 80))
+              log('zhToolNames: 工具数组只读，本轮跳过中文名（不影响发送）: ' + String(e?.message ?? e).slice(0, 80))
             }
           }
           }
