@@ -462,6 +462,10 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
         *    能翻回 read）。
         */
         const eo = normalizeEgressOptions(opts)
+        /* 2026-10-28 scope fix: mutOptions was declared inside the block below,
+         * while the return at the end referenced it from outside -> every llm/stream
+         * threw ReferenceError: mutOptions is not defined. Hoist the declaration. */
+        let mutOptions = options
         if (options !== null && typeof options === 'object') {
           const purpose = String(options.purpose ?? '')
           /**
@@ -518,7 +522,7 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
             egressStats.frozenSkipped = (egressStats.frozenSkipped ?? 0) + 1
             log('llm/stream: 请求对象被宿主深冻结（agent-loop Object.freeze），教学/中文名/纯聊天本轮跳过（宿主架构限制，无法在瀑布层改冻结请求）')
           }
-          const mutOptions = optionsMutable ? options : (options !== null && typeof options === 'object' ? { ...options } : options)
+          mutOptions = optionsMutable ? options : (options !== null && typeof options === 'object' ? { ...options } : options)
           if (mutOptions !== null && typeof mutOptions === 'object') {
           const purpose = String(mutOptions.purpose ?? '')
           if (eo.chatOnly === true && purpose !== 'compaction' && purpose !== 'session-title' && Array.isArray(mutOptions.tools) && mutOptions.tools.length > 0) {
@@ -566,7 +570,7 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
           }
         }
         const inner = next()
-        return normalizeEgressStream(inner, options, eo, log)
+        return normalizeEgressStream(inner, mutOptions ?? options, eo, log)
       })
     }, 'adapter-compat: egress normalizer')
   } catch (e) {
