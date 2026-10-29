@@ -196,14 +196,21 @@ export function backfillAdapter(adapter) {
     }
   }
   /* prepareCall：一律包装（自带或回填都走同一条包装路）。PREPARE_PATCHED 防重。 */
-  if (typeof adapter.prepareCall === 'function' && adapter.prepareCall[PREPARE_PATCHED] !== true) {
+  if (typeof adapter.prepareCall === 'function'
+    && adapter.prepareCall !== BASE_DEFAULTS.prepareCall
+    && adapter.prepareCall[PREPARE_PATCHED] !== true) {
     const original = adapter.prepareCall
     const patched = async function (...args) {
       const prepared = await original.apply(this, args)
       const innerStream = typeof prepared?.stream === 'function' ? prepared.stream.bind(prepared) : null
-      if (innerStream === null) return prepared
-      prepared.stream = (options) => patchedStreamFor(innerStream, options)
-      return prepared
+      if (innerStream === null || prepared === null || typeof prepared !== 'object') return prepared
+      const stream = (options) => patchedStreamFor(innerStream, options)
+      try {
+        prepared.stream = stream
+        return prepared
+      } catch {
+        try { return { ...prepared, stream } } catch { return prepared }
+      }
     }
     try {
       Object.defineProperty(patched, PREPARE_PATCHED, { value: true })
@@ -227,8 +234,9 @@ const PREPARE_PATCHED = Symbol.for('dsh-adapter-compat.prepare-call-patched')
 /**
  * 冻结请求三件套补丁流（2026-10-26 晚定案的真正生效位）：
  * request 被 agent-loop Object.freeze 深冻结——瀑布层改不动（物理限制）。
- * 这里在【调用底层 stream 前】用 structuredClone 解冻副本做三件套，
- * 底层 adapter 收到的就是改写后的请求。原件不碰（宿主安全）。
+ * 这里在【调用底层 stream 前】用顶层浅副本做三件套：
+ * 工具数组和信号数组只复制容器，AbortSignal 实例保持原引用。
+ * 底层 adapter 收到的是改写后的副本，原件不碰（宿主安全）。
  */
 function patchedStreamFor(innerStream, options) {
   try {
@@ -238,7 +246,11 @@ function patchedStreamFor(innerStream, options) {
       && (eo.nlTeach === true || eo.zhToolNames === true || eo.chatOnly === true)
     if (!needPatch) return innerStream(options)
     const purpose = String(options.purpose ?? '')
-    const mutable = Object.isExtensible(options) ? options : structuredClone(options)
+    const mutable = {
+      ...options,
+      ...(Array.isArray(options.signals) ? { signals: options.signals.slice() } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+    }
     if (eo.chatOnly === true && purpose !== 'compaction' && purpose !== 'session-title'
       && Array.isArray(mutable.tools) && mutable.tools.length > 0) {
       mutable.tools = []
