@@ -4311,10 +4311,10 @@ export function apply(ctx, config = {}) {
   // 4) settings null-Config 防崩守卫（与 autoGate 开关无关，无条件执行）
   let guardInstalled = false
   try {
-    guardInstalled = guardSettingsSchema(ctx)
+    /* 只做启动期一次性归一；不接管 settings.schema，避免模型选择页被全局包装影响。 */
     const normalized = normalizeRuntimeConfigs(ctx)
-    if (guardInstalled || normalized > 0) {
-      ctx.logger?.info?.(`[adapter-compat] settings null-Config guard: schemaWrapped=${guardInstalled} normalized=${normalized}`)
+    if (normalized > 0) {
+      ctx.logger?.info?.(`[adapter-compat] settings null-Config normalized=${normalized}`)
     }
   } catch {
     // 守卫失败不影响其余两层
@@ -4323,7 +4323,6 @@ export function apply(ctx, config = {}) {
   for (const ms of [1000, 3000, 8000]) {
     const t = setTimeout(() => {
       try {
-        guardSettingsSchema(ctx)
         normalizeRuntimeConfigs(ctx)
       } catch {
         /* 幂等静默 */

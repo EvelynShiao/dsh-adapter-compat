@@ -1455,7 +1455,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            marker: 'adapter-client-9999.9.30',
+            marker: 'adapter-client-9999.9.42',
             nested: nestedExitActive,
             fallback: typeof standaloneExitDispose === 'function',
             skExtraEntries,
