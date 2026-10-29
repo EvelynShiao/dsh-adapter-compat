@@ -60,6 +60,12 @@ export function digestRequest(options) {
     purpose: options?.purpose,
     count: messages.length,
     systemLen: typeof options?.system === 'string' ? options.system.length : 0,
+    nlTeach: typeof options?.system === 'string' && options.system.includes('我要调动第一层知识库'),
+    toolCount: Array.isArray(options?.tools) ? options.tools.length : 0,
+    tools: Array.isArray(options?.tools) ? options.tools.map((tool) => ({
+      name: tool?.name,
+      description: typeof tool?.description === 'string' ? tool.description.slice(0, 160) : undefined,
+    })) : null,
     messages: messages.map(digestMessage),
   }
 }
