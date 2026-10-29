@@ -244,7 +244,10 @@ function patchedStreamFor(innerStream, options) {
     const eo = normalizeEgressOptions(heal)
     const needPatch = options !== null && typeof options === 'object'
       && (eo.nlTeach === true || eo.zhToolNames === true || eo.chatOnly === true)
-    if (!needPatch) return innerStream(options)
+    if (!needPatch) {
+      recordWireRequest(options, undefined, 'adapter-dispatch')
+      return innerStream(options)
+    }
     const purpose = String(options.purpose ?? '')
     const mutable = {
       ...options,
@@ -281,7 +284,7 @@ function patchedStreamFor(innerStream, options) {
         egressStats.zhLocalized = (egressStats.zhLocalized ?? 0) + 1
       } catch { /* 替换失败不阻断 */ }
     }
-    recordWireRequest(mutable)
+    recordWireRequest(mutable, undefined, 'adapter-dispatch')
     return innerStream(mutable)
   } catch {
     /* fail-open：补丁失败退回原请求，绝不炸轮次 */

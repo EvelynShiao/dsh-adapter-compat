@@ -52,10 +52,11 @@ export function digestMessage(message, index) {
 }
 
 /** 整个请求 → 可落盘的一行。 */
-export function digestRequest(options) {
+export function digestRequest(options, stage) {
   const messages = Array.isArray(options?.messages) ? options.messages : []
   return {
     t: new Date().toISOString(),
+    ...(stage ? { stage } : {}),
     provider: options?.provider,
     model: options?.model,
     purpose: options?.purpose,
@@ -72,9 +73,9 @@ export function digestRequest(options) {
 }
 
 /** Record the payload after adapter-side option rewriting, immediately before dispatch. */
-export function recordWireRequest(options, home = homeDir()) {
+export function recordWireRequest(options, home = homeDir(), stage) {
   if (!wireTapEnabled) return
-  try { appendBounded(JSON.stringify(digestRequest(options)), home) } catch { /* evidence must never block dispatch */ }
+  try { appendBounded(JSON.stringify(digestRequest(options, stage)), home) } catch { /* evidence must never block dispatch */ }
 }
 
 /** 有界追加：超过上限就把旧文件改名（只保留一代 .1）。 */
@@ -600,10 +601,10 @@ export function installWireGuard(ctx, deps = {}) {
  * @returns {boolean} 是否装上
  */
 export function installWireTap(ctx, config = {}, deps = {}) {
-  if (config?.wireTap === false && config?.wireGuard === false) return false
-  const home = deps.home ?? homeDir()
   const tap = config?.wireTap !== false
   wireTapEnabled = tap
+  if (!tap && config?.wireGuard === false) return false
+  const home = deps.home ?? homeDir()
   const guard = config?.wireGuard !== false
   const append = (doc) => { try { appendBounded(JSON.stringify(doc), home) } catch { /* 取证失败绝不影响请求 */ } }
   /* 出口修 v2 先装（真正生效的那条路）。llm 服务此刻可能还没就绪：记一行，再定时重试。 */

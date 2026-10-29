@@ -35,9 +35,10 @@ test('digestRequest reports absent tools and teaching safely', () => {
 test('recordWireRequest writes the final request digest to the bounded wire file', () => {
   const home = mkdtempSync(join(tmpdir(), 'dsh-wire-digest-'))
   try {
-    recordWireRequest({ provider: 'tiantian', model: 'deepseek-v4.1-flash', tools: [] }, home)
+    recordWireRequest({ provider: 'tiantian', model: 'deepseek-v4.1-flash', tools: [] }, home, 'adapter-dispatch')
     const line = readFileSync(join(home, 'llm-wire.jsonl'), 'utf8').trim()
     const result = JSON.parse(line)
+    assert.equal(result.stage, 'adapter-dispatch')
     assert.equal(result.provider, 'tiantian')
     assert.equal(result.model, 'deepseek-v4.1-flash')
     assert.equal(result.toolCount, 0)
