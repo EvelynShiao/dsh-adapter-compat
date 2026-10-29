@@ -809,25 +809,13 @@ export function calibrateContextPressure(projections) {
   } catch {
     /* 无 registrations 面：只靠 register 包装 */
   }
-  // b) 包装 register：将来注册（token-meter 晚于本插件加载时走这条）
-  if (typeof projections.register === 'function' && !projections.register[PRESSURE_CALIBRATED]) {
-    const original = projections.register.bind(projections)
-    const wrapped = (definition) => {
-      try {
-        patchDef(definition)
-      } catch {
-        /* 单个定义失败不拦注册 */
-      }
-      return original(definition)
-    }
-    wrapped[PRESSURE_CALIBRATED] = true
-    wrapped.original = original
-    try {
-      projections.register = wrapped
-    } catch {
-      /* 服务对象不可写时只剩 (a) 路径 */
-    }
-  }
+  // b) 不包装 projections.register。原因（2026-10-29 实测）：
+  //    sessionProjections.register() 的 disposer 绑定在「调用方 Fiber」上，ref-count 归零即删键。
+  //    Adapter 一旦替换 register，其它插件（permission / modelSelection）的注册就多背一层
+  //    Adapter 的闭包：停用 Adapter 期间这些键被读成 undefined，弹出
+  //    「permissions session projection is not registered」，模型选择也写不进去。
+  //    校准只需覆盖已在册的 contextPressure 单元（上面 a 路径），晚注册单元由
+  //    installPressureCalibration 的定时重试补齐（1s/3s/8s + 可配周期）。
   return patched
 }
 
@@ -4331,8 +4319,8 @@ export function apply(ctx, config = {}) {
     if (typeof t.unref === 'function') t.unref()
   }
 
-  // 6) 压缩摘要跟随「当前选中模型」（与 autoGate 解耦：关掉自动压缩硬闸时手动 /compact 照样生效）
-  armSummarizerSelection(ctx)
+  // 压缩摘要模型跟随已停用：模型选择必须完全交给宿主原生链路。
+  // 保留 armSummarizerSelection 导出供旧测试/诊断使用，但不在插件入口挂载。
 
   // 5) 自动压缩硬闸（默认开；cordis.patch.yml 本插件行 config.autoGate:false 可恢复官方行为）
   if (config?.autoGate === false) return

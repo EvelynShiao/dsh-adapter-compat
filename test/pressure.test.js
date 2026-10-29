@@ -112,24 +112,25 @@ test('calibrateContextPressure：已注册单元被就地包裹且幂等', () =>
   assert.equal(captured.view(state).projectedTokens, 315000)
 })
 
-test('calibrateContextPressure：晚注册（register 包装）路径也生效', () => {
+test('calibrateContextPressure：不接管 register（停用期投影键被读成未注册的根因）', () => {
   const registered = []
-  const projections = { registrations: new Map(), register: (def) => registered.push(def) }
+  const nativeRegister = (def) => {
+    registered.push(def)
+    return () => {}
+  }
+  const projections = { registrations: new Map(), register: nativeRegister }
   assert.equal(typeof calibrateContextPressure(projections), 'number')
-  // 本插件加载后才注册的单元，经包装后的 register 进入时即被校准
-  projections.register({
-    key: 'contextPressure',
-    wire: {
-      view: ({ pressureTokens, surfaceTokens, sampledSurfaceTokens }) => ({
-        projectedTokens: pressureTokens + surfaceTokens - sampledSurfaceTokens,
-      }),
-    },
-  })
+  // 本插件不得替换宿主 register：permission / modelSelection 的注册必须保持原生 ref-count 语义
+  assert.equal(projections.register, nativeRegister)
+  // 晚注册的 contextPressure 仍未被就地包装（由 installPressureCalibration 的定时重试补齐）
+  projections.register({ key: 'contextPressure', wire: { view: () => ({ projectedTokens: 1 }) } })
+  assert.equal(registered[0].key, 'contextPressure')
+  // 重试路径：单元已在册后，再跑一次校准即可生效
+  const captured = { view: (state) => ({ projectedTokens: state.pressureTokens + state.surfaceTokens - state.sampledSurfaceTokens }) }
+  projections.registrations.set('contextPressure', { def: { key: 'contextPressure', wire: captured } })
+  assert.equal(calibrateContextPressure(projections), 1)
   const state = { pressureTokens: 200000, surfaceTokens: 150000, sampledSurfaceTokens: 100000 }
-  assert.equal(registered[0].wire.view(state).projectedTokens, 315000)
-  // 其他 key 不碰
-  projections.register({ key: 'title', wire: { view: () => ({ title: 'x' }) } })
-  assert.equal(registered[1].wire.view({}).title, 'x')
+  assert.equal(captured.view(state).projectedTokens, 315000)
 })
 
 test('calibrateContextPressure：缺服务时不炸', () => {
