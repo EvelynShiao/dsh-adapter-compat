@@ -1,6 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { digestRequest } from '../wire-tap.js'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { digestRequest, recordWireRequest } from '../wire-tap.js'
 
 test('digestRequest records protocol teaching and tool metadata without message bodies', () => {
   const result = digestRequest({
@@ -27,4 +30,18 @@ test('digestRequest reports absent tools and teaching safely', () => {
   assert.equal(result.nlTeach, false)
   assert.equal(result.toolCount, 0)
   assert.equal(result.tools, null)
+})
+
+test('recordWireRequest writes the final request digest to the bounded wire file', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-wire-digest-'))
+  try {
+    recordWireRequest({ provider: 'tiantian', model: 'deepseek-v4.1-flash', tools: [] }, home)
+    const line = readFileSync(join(home, 'llm-wire.jsonl'), 'utf8').trim()
+    const result = JSON.parse(line)
+    assert.equal(result.provider, 'tiantian')
+    assert.equal(result.model, 'deepseek-v4.1-flash')
+    assert.equal(result.toolCount, 0)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
 })

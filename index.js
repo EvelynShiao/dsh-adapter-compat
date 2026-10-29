@@ -98,7 +98,7 @@ import { purgeSessionFile, readPendingLedger, writePendingLedger, assertRowsDens
 import { redactEventPayload, redactSessionFile } from './purge.js'
 import { readSession, writeSession, verify as verifySessionEvents } from './true-delete.js'
 import { guardSessionFile, probeProtectedHead } from './head-guard.js'
-import { installWireTap, healBlankToolResults } from './wire-tap.js'
+import { installWireTap, recordWireRequest, healBlankToolResults } from './wire-tap.js'
 import { healDeadAttachments } from './attachments.js'
 import { slimSession } from './slim.js'
 import { repairEvents, scanFile, describeGap, healStructure, healToolOrphans, scanToolOrphans } from './repair.js'
@@ -281,6 +281,7 @@ function patchedStreamFor(innerStream, options) {
         egressStats.zhLocalized = (egressStats.zhLocalized ?? 0) + 1
       } catch { /* 替换失败不阻断 */ }
     }
+    recordWireRequest(mutable)
     return innerStream(mutable)
   } catch {
     /* fail-open：补丁失败退回原请求，绝不炸轮次 */

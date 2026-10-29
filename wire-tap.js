@@ -16,6 +16,7 @@ import { attachmentAvailability, placeholderForBlock } from './attachments.js'
 
 export const WIRE_TAP_FILE = 'llm-wire.jsonl'
 const MAX_BYTES = 8 * 1024 * 1024
+let wireTapEnabled = true
 
 /** DSH 主目录（与 index.js 的 dshHomeDir 同规则；这里自带一份以免循环 import）。 */
 function homeDir(env = process.env) {
@@ -68,6 +69,12 @@ export function digestRequest(options) {
     })) : null,
     messages: messages.map(digestMessage),
   }
+}
+
+/** Record the payload after adapter-side option rewriting, immediately before dispatch. */
+export function recordWireRequest(options, home = homeDir()) {
+  if (!wireTapEnabled) return
+  try { appendBounded(JSON.stringify(digestRequest(options)), home) } catch { /* evidence must never block dispatch */ }
 }
 
 /** 有界追加：超过上限就把旧文件改名（只保留一代 .1）。 */
@@ -596,6 +603,7 @@ export function installWireTap(ctx, config = {}, deps = {}) {
   if (config?.wireTap === false && config?.wireGuard === false) return false
   const home = deps.home ?? homeDir()
   const tap = config?.wireTap !== false
+  wireTapEnabled = tap
   const guard = config?.wireGuard !== false
   const append = (doc) => { try { appendBounded(JSON.stringify(doc), home) } catch { /* 取证失败绝不影响请求 */ } }
   /* 出口修 v2 先装（真正生效的那条路）。llm 服务此刻可能还没就绪：记一行，再定时重试。 */
