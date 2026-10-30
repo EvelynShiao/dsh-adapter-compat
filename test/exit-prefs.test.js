@@ -17,6 +17,7 @@ import { join } from 'node:path'
 import {
   readExitPrefs,
   writeExitPrefs,
+  readHealOptions,
   exitPrefsPath,
   webinConfigPath,
   COMPACT_EXIT_DEFAULTS,
@@ -90,4 +91,25 @@ test('原子写：不残留 .tmp 文件', () => {
   assert.equal(writeExitPrefs({ compactionFileThresholdChars: 123456 }, home).ok, true)
   const leftovers = readdirSync(join(home, 'webin')).filter((f) => f.includes('.tmp-cad-'))
   assert.deepEqual(leftovers, [])
+})
+
+test('写 webin 开关后 2s 缓存窗口内 readHealOptions 立即读到新值（2026-10-30 4.E 竞态修复）', () => {
+  const home = tempHome()
+  seedWebinConfig(home, { kbProtocol: false, nlToolProtocol: false, chatOnly: false, zhToolNames: false })
+  // 预热：把 kb=false 读进模块级 healOptionsCache（2s TTL）
+  const before = readHealOptions(home)
+  assert.equal(before.kbProtocol, false)
+  assert.equal(before.kbTrim, false)
+  // 走 exit-prefs 真实写路径改 kb=true，立刻读——不许命中刚预热进缓存的旧值
+  const r = writeExitPrefs({ kbProtocol: true }, home)
+  assert.equal(r.ok, true)
+  assert.equal(r.changed.webin, true)
+  const after = readHealOptions(home)
+  assert.equal(after.kbProtocol, true)
+  assert.equal(after.kbTrim, true)
+  // 反向：改回去也必须立刻生效（同一 2s 窗口语义）
+  assert.equal(writeExitPrefs({ kbProtocol: false }, home).ok, true)
+  const back = readHealOptions(home)
+  assert.equal(back.kbProtocol, false)
+  assert.equal(back.kbTrim, false)
 })

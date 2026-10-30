@@ -2939,6 +2939,11 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
       webin.chatOnly = next.chatOnly
       webin.zhToolNames = next.zhToolNames
       writeJsonAtomic(webinPath, webin)
+      /* [2026-10-30 重测 4.E 竞态修复] 写完 webin config 必须立刻失效 healOptionsCache：
+         readHealOptions 有 2s TTL 缓存，写盘后 ≤2s 内的请求会命中旧开关值——
+         4.E 实锤（memory-distill 后台请求恰好在其 setSwitches 前 1.65s 刷新过缓存，
+         首轮 dispatch tc=54 未裁剪，续轮 6.2s 后才 tc=9）。置空强制下一次重读文件。 */
+      healOptionsCache = { at: 0, home: null, value: null }
     }
     if (touchOwn) writeJsonAtomic(exitPrefsPath(home), { hideVersionPager: next.hideVersionPager, renderFx: next.renderFx === true })
     if (touchWebin || touchOwn) {
