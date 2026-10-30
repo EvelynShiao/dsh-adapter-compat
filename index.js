@@ -238,14 +238,15 @@ const PREPARE_PATCHED = Symbol.for('dsh-adapter-compat.prepare-call-patched')
  * 工具数组和信号数组只复制容器，AbortSignal 实例保持原引用。
  * 底层 adapter 收到的是改写后的副本，原件不碰（宿主安全）。
  */
-function patchedStreamFor(innerStream, options) {
+export function patchedStreamFor(innerStream, options, home) {
   try {
-    const heal = readHealOptions()
+    /* home 仅供单测注入临时目录；生产路径调用方不传 ⇒ 落回 dshHomeDir() 默认。 */
+    const heal = readHealOptions(home)
     const eo = normalizeEgressOptions(heal)
     const needPatch = options !== null && typeof options === 'object'
       && (eo.nlTeach === true || eo.zhToolNames === true || eo.chatOnly === true)
     if (!needPatch) {
-      recordWireRequest(options, undefined, 'adapter-dispatch')
+      recordWireRequest(options, home, 'adapter-dispatch')
       return innerStream(options)
     }
     const purpose = String(options.purpose ?? '')
@@ -284,7 +285,7 @@ function patchedStreamFor(innerStream, options) {
         egressStats.zhLocalized = (egressStats.zhLocalized ?? 0) + 1
       } catch { /* 替换失败不阻断 */ }
     }
-    recordWireRequest(mutable, undefined, 'adapter-dispatch')
+    recordWireRequest(mutable, home, 'adapter-dispatch')
     return innerStream(mutable)
   } catch {
     /* fail-open：补丁失败退回原请求，绝不炸轮次 */
@@ -2455,7 +2456,7 @@ const HEAL_NUMBER_LIMITS = {
   watchPollMs: { min: 5000, max: 3600000 },
   pressureCalibrationIntervalMs: { min: 0, max: 3600000 },
 }
-let healOptionsCache = { at: 0, value: null }
+let healOptionsCache = { at: 0, home: null, value: null }
 
 /** 归一化一份用户选项（布尔只认布尔、数值夹到区间内，非法一律回默认）。 */
 function normalizeHealOptions(raw) {
@@ -2499,7 +2500,10 @@ function applyHealPatch(base, raw) {
 
 export function readHealOptions(home = dshHomeDir()) {
   const now = Date.now()
-  if (healOptionsCache.value && now - healOptionsCache.at < 2000) return healOptionsCache.value
+  /* 缓存必须认 home：否则单测往临时目录写配置会被上一份缓存吃掉（只按时间判会串目录）。 */
+  if (healOptionsCache.value && healOptionsCache.home === home && now - healOptionsCache.at < 2000) {
+    return healOptionsCache.value
+  }
   let value = { ...HEAL_DEFAULTS }
   try {
     value = normalizeHealOptions(JSON.parse(readFileSync(home + '/' + HEAL_OPTIONS_FILE, 'utf8')))
@@ -2515,7 +2519,7 @@ export function readHealOptions(home = dshHomeDir()) {
       value.nlToolProtocol = webin.nlToolProtocol === true
     }
   } catch { /* webin config 不存在/损坏：上面默认值兜底 */ }
-  healOptionsCache = { at: now, value }
+  healOptionsCache = { at: now, home, value }
   return value
 }
 
@@ -2527,7 +2531,7 @@ export function writeHealOptions(next, home = dshHomeDir()) {
   })()
   const value = applyHealPatch(current, next)
   writeFileSync(home + '/' + HEAL_OPTIONS_FILE, JSON.stringify(value, null, 1), 'utf8')
-  healOptionsCache = { at: Date.now(), value }
+  healOptionsCache = { at: Date.now(), home, value }
   return value
 }
 
