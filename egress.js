@@ -36,7 +36,7 @@ import { translateUtterance } from './nl-utterance.js'
 import { zhToolName, ZH_TOOL_DESCRIPTIONS } from './tool-names.js'
 
 /** 统计（自检接口展示；>0 说明真的在干活）。 */
-export const egressStats = { thinkingStripped: 0, xmlToolCalls: 0, markersDropped: 0, skippedByScope: 0, nlUtterances: 0, chatOnlyStripped: 0, nlTaught: 0, zhLocalized: 0, catalogTrimmed: 0, toolPolicyBlocked: 0, attachmentsInlined: 0 }
+export const egressStats = { thinkingStripped: 0, xmlToolCalls: 0, markersDropped: 0, skippedByScope: 0, nlUtterances: 0, chatOnlyStripped: 0, nlTaught: 0, zhLocalized: 0, catalogTrimmed: 0, toolPolicyBlocked: 0, attachmentsInlined: 0, emptyTextDropped: 0, emptyMessageDropped: 0 }
 
 /** 内置「网页端」路由判定前缀：webin 的路由名形如 `webin-<平台>`（见 webin 的 routeFor()）。 */
 export const BUILTIN_WEB_ROUTE_PREFIX = 'webin'
@@ -330,6 +330,26 @@ export function pushEgressDelta(state, delta, opts = {}) {
       }
       st.started = true
     }
+    /* 正文中/结尾出现 <thinking>…</thinking>：吞掉标签与内容，防止思维标签泄漏到回答。
+       必须在 findMarkerStart 之前处理，否则 <thinking 会被误当标记前缀缓冲。 */
+    if (thinking && !st.inThinking) {
+      const midOpen = buf.search(/<thinking(\s[^>]*)?>/i)
+      if (midOpen !== -1) {
+        out += buf.slice(0, midOpen)
+        const rest = buf.slice(midOpen)
+        const close = rest.search(/<\/thinking>/i)
+        if (close === -1) {
+          const partial = /<\/?t?h?i?n?k?i?n?g?$/i.exec(rest)
+          st.pending = partial === null ? '' : partial[0]
+          st.inThinking = true
+          changed = true
+          return { text: out, state: st, changed }
+        }
+        buf = rest.slice(close + THINK_CLOSE.length)
+        changed = true
+        continue
+      }
+    }
     const hold = findMarkerStart(buf)
     if (hold === -1) { out += buf; return { text: out, state: st, changed } }
     const tail = buf.slice(hold)
@@ -349,6 +369,32 @@ export function pushEgressDelta(state, delta, opts = {}) {
   }
 }
 
+/* 裸思考泄漏去重：模型把同一段思考同时写进 reasoning 通道和 content 通道，
+   但 content 里没有 <thinking> 标签，stripLeadingThinking 剥不掉。
+   当 text 与 pending reasoning 内容高度重合，说明是裸思考泄漏，返回空串供调用方丢弃该 text 块。 */
+export function dedupeReasoningText(text, reasoning) {
+  const t = String(text ?? '').replace(/\s+/g, ' ').trim()
+  const r = String(reasoning ?? '').replace(/\s+/g, ' ').trim()
+  if (!t || !r) return text
+  if (t === r) return ''
+  if (r.includes(t)) return ''
+  if (r.startsWith(t)) return ''
+  if (t.includes(r)) return ''
+  /* 部分前缀重合：若两者前 80 字符相同，说明 text 是 reasoning 的另一份拷贝（可能因截断/空白差异不完全一致），丢弃 text。 */
+  let common = 0
+  const lim = Math.min(t.length, r.length, 400)
+  while (common < lim && t[common] === r[common]) common++
+  if (common >= 80) return ''
+  /* 句子级泄漏：reasoning 里任意长句子（>60 字符）出现在 text 中，
+     说明模型把思考当正文写了，没有 <thinking> 标签，strip 剥不掉。 */
+  const sentences = r.split(/[。！？.!?]+/)
+  for (const s of sentences) {
+    const ss = s.trim()
+    if (ss.length > 60 && t.includes(ss)) return ''
+  }
+  return text
+}
+
 /**
  * 块结束（或一次性拿到完整文本）时的最终处理。
  * 注意：block-end 的 `block.text` 是**完整文本**，不是增量 —— 所以这里从零重算，
@@ -365,6 +411,15 @@ export function finalizeEgressText(fullText, opts = {}) {
   if (opts.thinking !== false) {
     const r = stripLeadingThinking(text)
     if (r.changed) { text = r.text; parts.push('thinking') }
+    /* 兜底：剥离正文中/结尾残留的 <thinking>…</thinking> 段（非起始位置）。
+       模型若在文本中间夹带思维标签，stripLeadingThinking 只认开头，会漏剥；
+       这里再做一次全文兜底，避免思维标签原文泄露到回答。 */
+    const remainder = text.replace(/<thinking[\s\S]*?<\/thinking>/gi, '')
+    if (remainder !== text) {
+      text = remainder
+      if (!parts.includes('thinking')) parts.push('thinking')
+      egressStats.thinkingStripped += 1
+    }
   }
   const parsed = parseXmlToolCalls(text)
   if (parsed.clean !== text) { text = parsed.clean; parts.push('xml-markers') }
@@ -613,6 +668,50 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
               log('zhToolNames: 工具数组只读，本轮跳过中文名（不影响发送）: ' + String(e?.message ?? e).slice(0, 80))
             }
           }
+          /* 【2026-10-31 空正文消息过滤 · 400 根因的请求侧防线】
+             历史里只要残留一条 content 为空的 user 消息（实测来源：
+             dsh-session-kit-memory-context 的记忆召回快照在无命中时写入了
+             content:[{type:'text',text:''}]），严格上游就整轮 400：
+             invalid_request_error，usage.inputTokens=0（校验阶段被拒，没进推理）。
+             本层在发请求前把这类消息剔掉——已落盘的历史同样受益，无需改会话文件。
+             判定从严，只碰「正文确实为空」的 user 消息：
+               · role 必须是 user（assistant/tool 的空结构另有语义，一律不动）
+               · content 为字符串且 trim 为空，或数组里没有任何非空文本块
+               · 有非 text 块（附件/图片）或 toolCallId 的一律保留
+             全程 fail-open：结构不认识就原样保留，绝不因为过滤把轮次弄崩。 */
+          if (Array.isArray(mutOptions.messages)) {
+            try {
+              const kept = []
+              let dropped = 0
+              for (const message of mutOptions.messages) {
+                if (message === null || typeof message !== 'object' || message.role !== 'user') {
+                  kept.push(message)
+                  continue
+                }
+                const content = message.content
+                let isEmpty = false
+                if (typeof content === 'string') {
+                  /* 只认真正的空串：实测纯空格（"   "）上游返回 200，不是 400 源，
+                     删它属于多余改动，一律保留。 */
+                  isEmpty = content === ''
+                } else if (Array.isArray(content)) {
+                  const hasNonTextBlock = content.some((b) => b !== null && typeof b === 'object' && b.type !== 'text')
+                  const hasText = content.some((b) => b !== null && typeof b === 'object' && b.type === 'text'
+                    && typeof b.text === 'string' && b.text !== '')
+                  isEmpty = !hasNonTextBlock && !hasText
+                }
+                if (isEmpty) { dropped += 1; continue }
+                kept.push(message)
+              }
+              if (dropped > 0 && kept.length > 0) {
+                mutOptions.messages = kept
+                egressStats.emptyMessageDropped += 1
+                log(`emptyMessage: 剔除 ${dropped} 条空正文 user 消息（防上游 400 invalid_request_error）`)
+              }
+            } catch (e) {
+              log('emptyMessage: 过滤失败，保留原 messages: ' + String(e?.message ?? e).slice(0, 80))
+            }
+          }
           }
         }
         const inner = next()
@@ -643,6 +742,9 @@ function normalizeEgressStream(inner, options, opts, log) {
     let maxIndex = -1
     let converted = 0
     let logged = false
+    /* 同一条消息里，若 text 块与 reasoning 块内容高度重合，说明模型把裸思考也写进了正文；
+       此时丢弃 text，避免思考链泄露到回答。只对 `thinking` 开启时生效。 */
+    let pendingReasoning = ''
     /**
     * NL 协议选项（2026-10-21 重建）：压缩请求/空工具目录不翻——
     * 与 .txt 出口互不干扰（NL 翻译在回复端，.txt 在发送端）。
@@ -668,11 +770,41 @@ function normalizeEgressStream(inner, options, opts, log) {
         continue
       }
 
+      if (chunk.type === 'block-end' && chunk.block?.type === 'reasoning' && typeof chunk.block.text === 'string') {
+        pendingReasoning += chunk.block.text
+        yield chunk
+        continue
+      }
+
       if (chunk.type === 'block-end' && chunk.block?.type === 'text' && typeof chunk.block.text === 'string') {
         const key = chunk.index ?? 0
         states.delete(key)
         const f = finalizeEgressText(chunk.block.text, { ...opts, xmlTools: stripMarkers ? opts.xmlTools : 'off', allowConvert, tools: options?.tools ?? [], nlUtterance: nlUtteranceOpts })
-        yield { ...chunk, block: { ...chunk.block, text: f.text } }
+        let deduped = f.text
+        if (opts.thinking !== false && pendingReasoning) {
+          deduped = dedupeReasoningText(f.text, pendingReasoning)
+          if (deduped !== f.text) egressStats.thinkingStripped += 1
+        }
+        /* 【2026-10-31 空正文块守卫 · 400 根因修复】
+           整块被判为思考泄漏时 deduped === ''。绝不能把空块透传下去：
+           它最终落成 content:[{type:'text',text:''}]，而严格上游
+           （实测 tiantian/deepseek-v4.1-flash，POST /v1/chat/completions）
+           对空 content 直接返回 400 invalid_request_error，整轮报废
+           （usage.inputTokens=0，说明在校验阶段就被拒，没进推理）。
+           修法：只吞掉 block-end 的发射，块内工具调用抽离照旧执行
+           （NL/XML 调用可能就挂在这段被判泄漏的正文里）。
+           仅当「原本有非空正文、处理后变空」才丢弃，避免误伤本来就空的块。 */
+        const wasText = String(chunk.block.text ?? '').trim() !== ''
+        const textDropped = deduped === '' && wasText
+        if (textDropped) {
+          egressStats.emptyTextDropped += 1
+          if (!logged) {
+            logged = true
+            log('egress normalizer: 整块正文被判为思考泄漏，已丢弃该空文本块（防上游 400）')
+          }
+        } else {
+          yield { ...chunk, block: { ...chunk.block, text: deduped } }
+        }
         if (f.parts.includes('thinking')) egressStats.thinkingStripped += 1
         if (f.parts.includes('xml-markers')) egressStats.markersDropped += 1
         /** NL 命中与 XML convert 共用「产调用 + reason→tool-calls」出口。 */
