@@ -110,6 +110,8 @@ import {
   egressStats,
   EGRESS_NORMALIZER,
   normalizeEgressOptions,
+  resolveToolTrimMode,
+  filterToolCatalogByMode,
 } from './egress.js'
 import * as zhNames from './tool-names.js'
 
@@ -243,8 +245,11 @@ export function patchedStreamFor(innerStream, options, home) {
     /* home 仅供单测注入临时目录；生产路径调用方不传 ⇒ 落回 dshHomeDir() 默认。 */
     const heal = readHealOptions(home)
     const eo = normalizeEgressOptions(heal)
+    /* needPatch 必须含目录裁剪标志：nl 开 + kb 显式关时 nlTeach/zh/chatOnly 全 false，
+     * 漏了这条会让 no-kb 裁剪静默失效（首轮单测抓到过）。 */
     const needPatch = options !== null && typeof options === 'object'
-      && (eo.nlTeach === true || eo.zhToolNames === true || eo.chatOnly === true)
+      && (eo.nlTeach === true || eo.zhToolNames === true || eo.chatOnly === true
+        || eo.kbTrim === true || eo.noKbTrim === true)
     if (!needPatch) {
       recordWireRequest(options, home, 'adapter-dispatch')
       return innerStream(options)
@@ -259,6 +264,17 @@ export function patchedStreamFor(innerStream, options, home) {
       && Array.isArray(mutable.tools) && mutable.tools.length > 0) {
       mutable.tools = []
       egressStats.chatOnlyStripped = (egressStats.chatOnlyStripped ?? 0) + 1
+    }
+    /* [2026-10-29 按钮优先级·目录裁剪]（冻结请求的真正生效位）：裁剪放在中文名标注之前，
+     * 幸存集合才拿得到中文描述。mutable 是顶层浅副本，换数组绝不碰宿主原对象。 */
+    const trimMode = resolveToolTrimMode(eo)
+    if (trimMode !== 'none' && purpose !== 'compaction' && purpose !== 'session-title'
+      && Array.isArray(mutable.tools) && mutable.tools.length > 0) {
+      const before = mutable.tools.length
+      mutable.tools = filterToolCatalogByMode(mutable.tools, trimMode)
+      if (mutable.tools.length !== before) {
+        egressStats.catalogTrimmed = (egressStats.catalogTrimmed ?? 0) + 1
+      }
     }
     if (eo.nlTeach === true && purpose !== 'compaction' && purpose !== 'session-title') {
       const teach = [
@@ -2498,6 +2514,27 @@ function applyHealPatch(base, raw) {
   return value
 }
 
+/**
+ * [2026-10-24 入口三件套 → 2026-10-29 目录优先级] webin config 是真源，读/写后统一合并：
+ * chatOnly/中文工具名/NL 键 + 目录裁剪标志（heal 文件不管这些键）。
+ * kbTrim/noKbTrim 只在 webin config【存在且给出显式布尔】时才可能为 true——
+ * 缺省/文件缺失/损坏一律不裁（防默认态把模型工具全丢）。
+ */
+function mergeWebinSwitches(value, home) {
+  try {
+    const webin = JSON.parse(readFileSync(webinConfigPath(home), 'utf8'))
+    if (webin !== null && typeof webin === 'object') {
+      value.chatOnly = webin.chatOnly === true
+      value.zhToolNames = webin.zhToolNames === true
+      value.kbProtocol = webin.kbProtocol !== false
+      value.nlToolProtocol = webin.nlToolProtocol === true
+      value.kbTrim = webin.kbProtocol === true && webin.nlToolProtocol !== true
+      value.noKbTrim = webin.nlToolProtocol === true && webin.kbProtocol === false
+    }
+  } catch { /* webin config 不存在/损坏：保持原值（kbTrim/noKbTrim 未定义 ⇒ 不裁） */ }
+  return value
+}
+
 export function readHealOptions(home = dshHomeDir()) {
   const now = Date.now()
   /* 缓存必须认 home：否则单测往临时目录写配置会被上一份缓存吃掉（只按时间判会串目录）。 */
@@ -2508,17 +2545,7 @@ export function readHealOptions(home = dshHomeDir()) {
   try {
     value = normalizeHealOptions(JSON.parse(readFileSync(home + '/' + HEAL_OPTIONS_FILE, 'utf8')))
   } catch { /* 无文件 = 出厂默认 */ }
-  /* [2026-10-24 入口三件套] chatOnly/中文工具名/NL 键与 webin config 同源
-   *（egress 挂载点的 readOptions() 走这里——webin config 是真源，heal 文件不管这些键）。 */
-  try {
-    const webin = JSON.parse(readFileSync(webinConfigPath(home), 'utf8'))
-    if (webin !== null && typeof webin === 'object') {
-      value.chatOnly = webin.chatOnly === true
-      value.zhToolNames = webin.zhToolNames === true
-      value.kbProtocol = webin.kbProtocol !== false
-      value.nlToolProtocol = webin.nlToolProtocol === true
-    }
-  } catch { /* webin config 不存在/损坏：上面默认值兜底 */ }
+  value = mergeWebinSwitches(value, home)
   healOptionsCache = { at: now, home, value }
   return value
 }
@@ -2531,6 +2558,9 @@ export function writeHealOptions(next, home = dshHomeDir()) {
   })()
   const value = applyHealPatch(current, next)
   writeFileSync(home + '/' + HEAL_OPTIONS_FILE, JSON.stringify(value, null, 1), 'utf8')
+  /* 写后缓存也必须合并 webin 真源——否则 2 秒缓存窗口内 readHealOptions 会拿到
+   * 没有 chatOnly/kbProtocol/裁剪标志的旧值（写后立刻读的静默回退，隐性 bug）。 */
+  mergeWebinSwitches(value, home)
   healOptionsCache = { at: Date.now(), home, value }
   return value
 }

@@ -99,13 +99,15 @@ test('patchedStreamFor：nlTeach 只在 kb+nl 同开时注入系统教学', () =
     assert.match(String(on.seen.system), /我要调动第一层知识库/, 'kb+nl 同开必须注入教学')
     assert.match(String(on.seen.system), /基础系统提示/, '原有 system 要保留')
 
-    /* kb 关 = nlTeach 假（egress.js 的定义就是 nlToolProtocol === true && kbProtocol !== false）：
-       此时走「不需要补丁」分支，请求原样透传，不注入教学。 */
+    /* kb 关 + nl 开 = nlTeach 假（egress.js 定义：nlToolProtocol === true && kbProtocol !== false）
+     * ⇒ 不注入教学；但 2026-10-29 起这个组合还触发 no-kb 目录裁剪（按钮优先级），
+     * 所以走的是补丁分支（副本），不再是原引用透传。 */
     const off = spyStream()
-    const req = { system: '基础系统提示' }
+    const req = { system: '基础系统提示', tools: [{ name: 'read' }, { name: 'knowledge_search' }] }
     patchedStreamFor(off.stream, req, offHome)
-    assert.equal(off.seen, req, '不需要补丁时必须原对象引用透传')
+    assert.notEqual(off.seen, req, 'kb 关 + nl 开要裁目录 ⇒ 必须走补丁副本分支')
     assert.doesNotMatch(String(off.seen.system), /我要调动第一层知识库/, 'kb 关不许注入教学')
+    assert.deepEqual(off.seen.tools.map((t) => t.name), ['read'], 'no-kb 裁剪：知识库工具出局、普通工具保留')
   } finally {
     rmSync(onHome, { recursive: true, force: true })
     rmSync(offHome, { recursive: true, force: true })

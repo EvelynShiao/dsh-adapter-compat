@@ -36,7 +36,7 @@ import { translateUtterance } from './nl-utterance.js'
 import { zhToolName, ZH_TOOL_DESCRIPTIONS } from './tool-names.js'
 
 /** 统计（自检接口展示；>0 说明真的在干活）。 */
-export const egressStats = { thinkingStripped: 0, xmlToolCalls: 0, markersDropped: 0, skippedByScope: 0, nlUtterances: 0, chatOnlyStripped: 0, nlTaught: 0, zhLocalized: 0 }
+export const egressStats = { thinkingStripped: 0, xmlToolCalls: 0, markersDropped: 0, skippedByScope: 0, nlUtterances: 0, chatOnlyStripped: 0, nlTaught: 0, zhLocalized: 0, catalogTrimmed: 0 }
 
 /** 内置「网页端」路由判定前缀：webin 的路由名形如 `webin-<平台>`（见 webin 的 routeFor()）。 */
 export const BUILTIN_WEB_ROUTE_PREFIX = 'webin'
@@ -407,9 +407,47 @@ export function normalizeEgressOptions(raw = {}) {
     chatOnly: raw?.chatOnly === true,
     /* NL 教学（API 通道模型不知道 NL 句式——system 里注入一句式说明，仅 nlToolProtocol 开时） */
     nlTeach: raw?.nlToolProtocol === true && raw?.kbProtocol !== false,
+    /* [2026-10-29 按钮优先级·工具目录层]（用户清单第 4/5 条）：
+     * kbTrim   = KB 开 且 通用 NL 非开 ⇒ 目录只留知识库工具
+     * noKbTrim = 通用 NL 开 且 KB 显式关 ⇒ 目录去掉知识库工具
+     * 两个标志只由 readHealOptions 从 webin config 的【显式布尔】算出（见 index.js），
+     * 缺省/文件缺失一律 false ⇒ 绝不从 kbProtocol 的默认值推断裁剪——防默认态丢光工具。 */
+    kbTrim: raw?.kbTrim === true,
+    noKbTrim: raw?.noKbTrim === true,
     /* 中文工具名（用户点名「调用时用汉字代替不要漏名字」）：目录与翻译层双向映射 */
     zhToolNames: raw?.zhToolNames === true,
   }
+}
+
+/* ==================== ③½ 按钮优先级·工具目录裁剪（2026-10-29） ====================
+ * 用户清单第 4/5 条 + 10-25 铁律「上对下有优先级，因为有的功能互斥」：
+ *   纯聊天（chatOnly）            > 全清（已有逻辑，最高优先）
+ *   知识库 NL（kbProtocol 开）     > 目录只留知识库工具（knowledge_* + archives_search）
+ *   通用 NL（nlToolProtocol 开）   > KB 显式关时目录去掉知识库工具，其余全留
+ *   都开 ⇒ 全留；都关/缺省 ⇒ 全留（不裁）。
+ * 裁剪只改【传给 provider 的目录副本】，宿主原对象与工具对象一律不动；
+ * 压缩/标题请求豁免（与 chatOnly 同规）。
+ */
+
+/** 知识库工具判定：第一层 knowledge_* + 第二层 archives_search（KB 句式能翻译到的全部目标）。 */
+export function isKnowledgeTool(name) {
+  if (typeof name !== 'string' || name === '') return false
+  return name === 'archives_search' || name.startsWith('knowledge_')
+}
+
+/** 目录裁剪模式：'kb-only' | 'no-kb' | 'none'。只认显式标志，绝不从默认值推断。 */
+export function resolveToolTrimMode(eo) {
+  if (eo?.kbTrim === true) return 'kb-only'
+  if (eo?.noKbTrim === true) return 'no-kb'
+  return 'none'
+}
+
+/** 按模式裁剪目录，恒返回新数组（原数组与工具对象一律不动）。 */
+export function filterToolCatalogByMode(tools, mode) {
+  const list = Array.isArray(tools) ? tools : []
+  if (mode === 'kb-only') return list.filter((t) => t !== null && typeof t === 'object' && isKnowledgeTool(t.name))
+  if (mode === 'no-kb') return list.filter((t) => !(t !== null && typeof t === 'object' && isKnowledgeTool(t.name)))
+  return list.slice()
 }
 
 /* ==================== ④ 安装 ==================== */
@@ -514,9 +552,10 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
            *   并在 stats 旁标记 frozenSkipped，让「为什么没生效」可观测。
            */
           const optionsMutable = options !== null && typeof options === 'object' ? Object.isExtensible(options) : false
-          if (!optionsMutable && (eo.nlTeach === true || eo.zhToolNames === true || eo.chatOnly === true)) {
+          const trimMode = resolveToolTrimMode(eo)
+          if (!optionsMutable && (eo.nlTeach === true || eo.zhToolNames === true || eo.chatOnly === true || trimMode !== 'none')) {
             egressStats.frozenSkipped = (egressStats.frozenSkipped ?? 0) + 1
-            log('llm/stream: 请求对象被宿主深冻结（agent-loop Object.freeze），教学/中文名/纯聊天本轮跳过（宿主架构限制，无法在瀑布层改冻结请求）')
+            log('llm/stream: 请求对象被宿主深冻结（agent-loop Object.freeze），教学/中文名/纯聊天/目录裁剪本轮跳过（宿主架构限制，无法在瀑布层改冻结请求；冻结请求的真实生效位是 prepareCall 补丁层）')
           }
           const mutOptions = optionsMutable ? options : (options !== null && typeof options === 'object' ? { ...options } : options)
           if (mutOptions !== null && typeof mutOptions === 'object') {
@@ -525,6 +564,17 @@ export function installEgressNormalizer(ctx, config = {}, deps = {}) {
             mutOptions.tools = []
             egressStats.chatOnlyStripped = (egressStats.chatOnlyStripped ?? 0) + 1
             log('chatOnly: 本轮 API 请求的工具目录已清空（纯聊天模式）')
+          }
+          /* [2026-10-29 按钮优先级·目录裁剪] 在中文名标注【之前】裁——幸存集合才拿得到中文描述。
+           * 原位换数组（对象可扩展时直接赋值；冻结时 mutOptions 本身就是副本）。 */
+          if (trimMode !== 'none' && purpose !== 'compaction' && purpose !== 'session-title'
+            && Array.isArray(mutOptions.tools) && mutOptions.tools.length > 0) {
+            const before = mutOptions.tools.length
+            mutOptions.tools = filterToolCatalogByMode(mutOptions.tools, trimMode)
+            if (mutOptions.tools.length !== before) {
+              egressStats.catalogTrimmed = (egressStats.catalogTrimmed ?? 0) + 1
+              log(`toolCatalog[${trimMode}]: ${before} -> ${mutOptions.tools.length}（按钮优先级裁目录）`)
+            }
           }
           if (eo.nlTeach === true && purpose !== 'compaction' && purpose !== 'session-title') {
             const teach = [
