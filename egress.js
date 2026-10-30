@@ -36,7 +36,7 @@ import { translateUtterance } from './nl-utterance.js'
 import { zhToolName, ZH_TOOL_DESCRIPTIONS } from './tool-names.js'
 
 /** 统计（自检接口展示；>0 说明真的在干活）。 */
-export const egressStats = { thinkingStripped: 0, xmlToolCalls: 0, markersDropped: 0, skippedByScope: 0, nlUtterances: 0, chatOnlyStripped: 0, nlTaught: 0, zhLocalized: 0, catalogTrimmed: 0 }
+export const egressStats = { thinkingStripped: 0, xmlToolCalls: 0, markersDropped: 0, skippedByScope: 0, nlUtterances: 0, chatOnlyStripped: 0, nlTaught: 0, zhLocalized: 0, catalogTrimmed: 0, toolPolicyBlocked: 0 }
 
 /** 内置「网页端」路由判定前缀：webin 的路由名形如 `webin-<平台>`（见 webin 的 routeFor()）。 */
 export const BUILTIN_WEB_ROUTE_PREFIX = 'webin'

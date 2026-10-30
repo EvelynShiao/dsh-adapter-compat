@@ -234,6 +234,113 @@ export function backfillAdapter(adapter) {
 const PREPARE_PATCHED = Symbol.for('dsh-adapter-compat.prepare-call-patched')
 
 /**
+ * [2026-10-30 盲调拦截·工具目录白名单]（用户清单第 4 条主观预期的补完）。
+ *
+ * 背景（重测 4.E/4.F 实锤）：目录裁剪只控制「发给模型什么目录」，模型仍可
+ * 原生 tool-call 盲调目录外工具（如 kb 独占时调 ops_bash 数桌面），宿主
+ * dsh-tools 的 UNKNOWN_TOOL 校验的是【注册表】，不是【本轮下发目录】——
+ * 注册表里的工具照常执行。用户预期是「预期它说无法调用」。
+ *
+ * 方案：在本层（prepareCall 补丁流，最贴近 provider、agent-loop 必经）
+ * 把模型输出流里的 tool-call 块按【本轮实际下发的目录】做白名单：
+ *   - 名字在白名单内 → 原样放行（三段块 index/内容一律不动）；
+ *   - 名字不在 → 整段吞掉（block-start/delta/block-end），并在 finish 前
+ *     注入一段拒绝说明文本，让模型下一轮读到自己被拒的历史 → 对用户
+ *     转述「无法调用」；
+ *   - 全部调用都被拦且 finish reason 是 tool-calls → 改成 stop
+ *     （镜像 egress.js L695 的反方向改写，保持宿主协议自洽）。
+ *
+ * 安全设计：
+ *   - 白名单恒等于 mutable.tools（裁剪/chatOnly 之后的实际下发目录）——
+ *     「下发什么就允许什么」，compaction/session-title 等内部请求同样自洽；
+ *   - 不认识的 chunk 一律原样放行（fail-open），绝不炸流；
+ *   - 缓冲只发生在 tool-call 三段块内部（宿主本就等 block-end 才聚合执行，
+ *     不改变执行时机）；text/thinking/finish 全程透传。
+ * @param {AsyncGenerator} inner - 底层 provider 流（async generator）
+ * @param {Set<string>} allowedNames - 本轮实际下发的工具名集合
+ * @param {{purpose?: string, mode?: string}} [meta] - 仅用于日志
+ */
+export function guardedToolStream(inner, allowedNames, meta = {}) {
+  return (async function* () {
+    const allowed = allowedNames instanceof Set ? allowedNames : new Set()
+    const pending = new Map() // index -> { started, deltas: [], name }
+    const blockedNames = []
+    let aliveCalls = 0
+    let maxIndex = -1
+    let logged = false
+    for await (const chunk of inner) {
+      if (chunk === null || typeof chunk !== 'object') { yield chunk; continue }
+      if (typeof chunk.index === 'number' && chunk.index > maxIndex) maxIndex = chunk.index
+
+      /* 三段式 tool-call 块：先攒，block-end 时统一裁决。 */
+      if (chunk.type === 'block-start' && chunk.blockType === 'tool-call') {
+        const key = chunk.index ?? 0
+        const held = pending.get(key)
+        if (held === undefined) pending.set(key, { started: chunk, deltas: [], name: '' })
+        else held.started = chunk /* 同 index 重复 start：覆盖，保持一份 */
+        continue
+      }
+      if (chunk.type === 'tool-call-delta') {
+        const key = chunk.index ?? 0
+        const held = pending.get(key)
+        if (held !== undefined) {
+          held.deltas.push(chunk)
+          if (!held.name && typeof chunk.name === 'string' && chunk.name !== '') held.name = chunk.name
+        } else if (typeof chunk.name === 'string' && chunk.name !== '' && !allowed.has(chunk.name)) {
+          /* 孤儿 delta（无 start）：按名字直接拦，不产出残块。 */
+          if (!blockedNames.includes(chunk.name)) blockedNames.push(chunk.name)
+          continue
+        } else {
+          yield chunk
+        }
+        continue
+      }
+      if (chunk.type === 'block-end' && chunk.block?.type === 'tool-call') {
+        const key = chunk.index ?? 0
+        const held = pending.get(key)
+        pending.delete(key)
+        const name = (held?.name !== undefined && held?.name !== '' ? held.name : '')
+          || (typeof chunk.block.name === 'string' ? chunk.block.name : '')
+        if (name !== '' && !allowed.has(name)) {
+          if (!blockedNames.includes(name)) blockedNames.push(name)
+          continue /* 整段丢弃：start/delta 都没放行过，这里只丢 end */
+        }
+        if (held !== undefined) {
+          if (held.started !== undefined) yield held.started
+          for (const d of held.deltas) yield d
+        }
+        aliveCalls += 1
+        yield chunk
+        continue
+      }
+
+      /* finish：有拦截 → 先注入拒绝说明文本，再按存活情况修 reason。 */
+      if (chunk.type === 'finish' && blockedNames.length > 0) {
+        const idx = maxIndex + 1
+        const text = `[tool-policy] 检测到对未启用工具的调用（${blockedNames.join('、')}）：`
+          + '这些工具不在本次请求启用的工具目录中，调用已被拦截、不会执行、也不会有结果。'
+          + '请只使用当前目录内的工具；若没有合适工具，直接用自然语言回答用户。'
+        yield { type: 'block-start', index: idx, blockType: 'text' }
+        yield { type: 'text-delta', index: idx, text }
+        yield { type: 'block-end', index: idx, block: { type: 'text', text } }
+        if (!logged) {
+          logged = true
+          egressStats.toolPolicyBlocked += blockedNames.length
+          appendCompatLog(`tool-policy: blocked blind call(s) [${blockedNames.join(', ')}] (allowed=${allowed.size}${meta.mode ? `, mode=${meta.mode}` : ''}${meta.purpose ? `, purpose=${meta.purpose}` : ''})`)
+        }
+        if (aliveCalls === 0 && chunk.reason?.kind === 'tool-calls') {
+          yield { ...chunk, reason: { kind: 'stop' } }
+          continue
+        }
+      }
+
+      yield chunk
+    }
+    /* 流结束仍未闭合的缓冲块：宿主本就聚合不到完整块，直接丢弃（不产残块）。 */
+  })()
+}
+
+/**
  * 冻结请求三件套补丁流（2026-10-26 晚定案的真正生效位）：
  * request 被 agent-loop Object.freeze 深冻结——瀑布层改不动（物理限制）。
  * 这里在【调用底层 stream 前】用顶层浅副本做三件套：
@@ -301,8 +408,21 @@ export function patchedStreamFor(innerStream, options, home) {
         egressStats.zhLocalized = (egressStats.zhLocalized ?? 0) + 1
       } catch { /* 替换失败不阻断 */ }
     }
+    /* [2026-10-30 盲调拦截] 白名单 = 裁剪/chatOnly 之后的实际下发目录。
+     * 「下发什么就允许什么」：没裁剪时白名单=全量（行为不变），
+     * chatOnly 时白名单=空集（原生盲调也进不来），kb/no-kb 裁剪时对应生效。 */
+    const allowedNames = new Set(
+      (Array.isArray(mutable.tools) ? mutable.tools : [])
+        .map((t) => (t !== null && typeof t === 'object' && typeof t.name === 'string' ? t.name : ''))
+        .filter((n) => n !== ''),
+    )
     recordWireRequest(mutable, home, 'adapter-dispatch')
-    return innerStream(mutable)
+    const result = innerStream(mutable)
+    /* 只有 async generator 形态才包白名单流；其他形态原样返回（fail-open）。 */
+    if (result !== null && typeof result === 'object' && typeof result[Symbol.asyncIterator] === 'function') {
+      return guardedToolStream(result, allowedNames, { purpose, mode: trimMode })
+    }
+    return result
   } catch {
     /* fail-open：补丁失败退回原请求，绝不炸轮次 */
     return innerStream(options)
