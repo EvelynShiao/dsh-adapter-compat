@@ -340,6 +340,112 @@ export function guardedToolStream(inner, allowedNames, meta = {}) {
   })()
 }
 
+/* ==================== 附件内联（2026-10-30 用户拍板：附件任何模式都应可读） ==================== */
+
+/** 宿主 projectFilesToText 投影出的附件句柄文本特征（fileHandleText）。 */
+const ATTACHMENT_HANDLE_SRC = 'verbatim read-only copy saved at "([^"]+)"'
+
+/**
+ * 附件句柄的判重键：统一反斜杠 + 小写（Windows 路径大小写不敏感）。
+ */
+function attachmentHandleKey(rawPath) {
+  return String(rawPath).replaceAll('\\\\', '\\').toLowerCase()
+}
+
+/**
+ * 读一个附件文件、组装内联文本块；读不到/非文本返回 null（调用方保留句柄原样）。
+ * 超出 inlineLimit 的文件读前 inlineLimit 字节并标注截断。
+ * @param {string} rawPath - 句柄文本里捕获的路径（可能带字面双反斜杠）
+ * @param {number} inlineLimit - 内联字节上限
+ */
+export function readAttachmentForInline(rawPath, inlineLimit) {
+  if (typeof rawPath !== 'string' || rawPath.length === 0) return null
+  const candidates = [rawPath, rawPath.replaceAll('\\\\', '\\')]
+  for (const p of candidates) {
+    try {
+      const st = statSync(p)
+      if (!st.isFile()) continue
+      const truncated = st.size > inlineLimit
+      const content = truncated
+        ? readFileSync(p).subarray(0, inlineLimit).toString('utf8')
+        : readFileSync(p, 'utf8')
+      const base = p.split(/[\\/]/).pop() ?? p
+      const head = `[adapter-compat·附件内联] 附件「${base}」全文如下（当前会话模式没有文件工具，已代为读取）：`
+      const tail = truncated
+        ? `\n<<<附件内容结束（原文件 ${st.size} 字节，超出内联上限 ${inlineLimit} 字节被截断；完整文件见句柄路径）>>>`
+        : '\n<<<附件内容结束>>>'
+      return `${head}\n<<<附件内容开始>>>\n${content}${tail}`
+    } catch { /* 该候选读不到，试下一个 */ }
+  }
+  return null
+}
+
+/**
+ * 把一段文本里全部附件句柄替换为「句柄原文 + 内联块」。
+ * 同一附件路径跨消息只内联一次（seen 判重，防止多轮对话每轮重复注入全文）。
+ * @returns 新文本（无内联时与原文相等）
+ */
+export function inlineHandlesInText(text, inlineLimit, seen, onInlined) {
+  const re = new RegExp(ATTACHMENT_HANDLE_SRC, 'g')
+  let out = ''
+  let cursor = 0
+  let m
+  while ((m = re.exec(text)) !== null) {
+    const handleEnd = m.index + m[0].length
+    out += text.slice(cursor, handleEnd)
+    cursor = handleEnd
+    const key = attachmentHandleKey(m[1])
+    if (seen.has(key)) continue
+    const block = readAttachmentForInline(m[1], inlineLimit)
+    if (block === null) continue
+    seen.add(key)
+    out += `\n\n${block}`
+    if (typeof onInlined === 'function') onInlined()
+  }
+  out += text.slice(cursor)
+  return out
+}
+
+/**
+ * 单条消息的附件内联。只处理 user 消息（附件是用户发的）；content 支持
+ * 字符串与 [{type:'text',text}] 数组两种形态。无句柄/不适用时返回原引用。
+ */
+export function inlineAttachmentInMessage(message, inlineLimit, seen, onInlined) {
+  if (message === null || typeof message !== 'object' || message.role !== 'user') return message
+  const content = message.content
+  if (typeof content === 'string') {
+    if (!content.includes('verbatim read-only copy saved at')) return message
+    const text2 = inlineHandlesInText(content, inlineLimit, seen, onInlined)
+    return text2 === content ? message : { ...message, content: text2 }
+  }
+  if (!Array.isArray(content)) return message
+  let changed = false
+  const content2 = content.map((part) => {
+    if (part === null || typeof part !== 'object' || part.type !== 'text' || typeof part.text !== 'string') return part
+    if (!part.text.includes('verbatim read-only copy saved at')) return part
+    const text2 = inlineHandlesInText(part.text, inlineLimit, seen, onInlined)
+    if (text2 === part.text) return part
+    changed = true
+    return { ...part, text: text2 }
+  })
+  return changed ? { ...message, content: content2 } : message
+}
+
+/**
+ * 附件内联入口：目录里没有只读文件工具时，把 messages 里全部附件句柄
+ * 读出内联（跨消息同路径去重）。恒不抛、不改原数组/原消息对象。
+ * @param {Array} messages - 请求消息数组（可能被宿主冻结）
+ * @param {number} inlineLimit - 单附件内联字节上限
+ * @returns {{messages: Array, inlined: number}} messages2 与原数组元素引用复用（未内联项）
+ */
+export function inlineAttachmentsForNoFileTool(messages, inlineLimit) {
+  const seen = new Set()
+  let inlined = 0
+  const onInlined = () => { inlined += 1 }
+  const messages2 = (Array.isArray(messages) ? messages : []).map((m) => inlineAttachmentInMessage(m, inlineLimit, seen, onInlined))
+  return { messages: messages2, inlined }
+}
+
 /**
  * 冻结请求三件套补丁流（2026-10-26 晚定案的真正生效位）：
  * request 被 agent-loop Object.freeze 深冻结——瀑布层改不动（物理限制）。
@@ -416,6 +522,23 @@ export function patchedStreamFor(innerStream, options, home) {
         .map((t) => (t !== null && typeof t === 'object' && typeof t.name === 'string' ? t.name : ''))
         .filter((n) => n !== ''),
     )
+    /* [2026-10-30 附件内联·用户拍板] 附件是用户亲手拖进窗口的内容，任何模式都应可读。
+     * 附件发给模型的只是「文件存放在某路径，请用文件工具去读」的句柄说明——
+     * 但纯聊天（tools=[]）和 kb 独占（无文件工具）下模型没有工具可读，拿着地址没有钥匙。
+     * 本层在【本轮目录里没有任何只读文件工具】时把句柄所指文件读出、内联进消息文本，
+     * 模型无需工具即可看到内容。目录里有文件工具（全关/zh 单开/nl 独开）时不内联——现状已工作。
+     * 同一附件跨消息去重（多轮对话历史句柄不重复注入）；fail-open：读失败保留句柄原样。 */
+    if (!allowedNames.has('read') && !allowedNames.has('ops_inspect_local_file') && Array.isArray(mutable.messages)) {
+      try {
+        const inlineLimit = Math.max(1024, Number(readExitPrefs(home).txtChunkBytes) || 409600)
+        const { messages: messages2, inlined } = inlineAttachmentsForNoFileTool(mutable.messages, inlineLimit)
+        mutable.messages = messages2
+        if (inlined > 0) {
+          egressStats.attachmentsInlined = (egressStats.attachmentsInlined ?? 0) + inlined
+          appendCompatLog(`attachment-inline: inlined ${inlined} attachment(s) (catalog has no file tool, tools=${allowedNames.size})`)
+        }
+      } catch { /* fail-open：内联失败保留原 messages */ }
+    }
     recordWireRequest(mutable, home, 'adapter-dispatch')
     const result = innerStream(mutable)
     /* 只有 async generator 形态才包白名单流；其他形态原样返回（fail-open）。 */
