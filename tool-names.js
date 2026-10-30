@@ -15,8 +15,8 @@ export const TOOL_ZH_NAMES = {
   edit: '编辑文件',
   glob: '搜索文件名',
   grep: '搜索内容',
-  pwsh: '运行命令',
-  ops_bash: '运行命令',
+  pwsh: '运行PowerShell',
+  ops_bash: '运行bash',
   ops_glob: '查找文件',
   ops_grep: '查找内容',
   ops_inspect_local_file: '查看文件',
@@ -61,6 +61,9 @@ export const TOOL_ZH_NAMES = {
   job_output: '后台任务读取',
   job_kill: '后台任务停止',
   find_dsh_plugin: '找插件',
+  exit_plan_mode: '退出计划模式',
+  read_image: '读图片',
+  skill: '加载技能',
 }
 
 /** 英文名 → 中文名（没映射的回退英文原名的首词大写？不——原样返回英文，绝不编造）。 */
@@ -127,6 +130,9 @@ export const ZH_TOOL_DESCRIPTIONS = {
   job_output: '读取一个后台任务的输出。',
   job_kill: '请求停止一个正在运行的后台任务。',
   find_dsh_plugin: '在 GitHub 上搜索 DeepSeek Harness 插件。',
+  exit_plan_mode: '仅在计划模式使用。把你的计划呈给用户审阅，等待批准后退出计划模式。',
+  read_image: '读取一个 PNG/JPEG/WebP/GIF 图片文件并返回图像本身；大图会自动缩放。',
+  skill: '加载一个技能的完整指令；在按该技能行动之前先调用它。',
 }
 
 /** 中文名 → 英文真名（NL 翻译用：模型说中文名时翻回真名）。反向查表。 */
