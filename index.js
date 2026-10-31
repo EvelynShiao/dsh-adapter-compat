@@ -342,8 +342,17 @@ export function guardedToolStream(inner, allowedNames, meta = {}) {
 
 /* ==================== 附件内联（2026-10-30 用户拍板：附件任何模式都应可读） ==================== */
 
-/** 宿主 projectFilesToText 投影出的附件句柄文本特征（fileHandleText）。 */
-const ATTACHMENT_HANDLE_SRC = 'verbatim read-only copy saved at "([^"]+)"'
+/**
+ * 宿主 projectFilesToText 投影的附件句柄【完整段】形态（fileHandleText）：
+ * [File "原名" (N bytes, sha256:hex): verbatim read-only copy saved at "落盘路径". Read that path ... can read it.]
+ * group1=原文件名 group2=字节数 group3=落盘路径。
+ * 句柄段里的「Read that path with your file tools」会引导模型盲调文件工具——
+ * 在无文件工具的模式（纯聊天/kb 独占）下这正是不该出现的引导，因此内联采用
+ * 【整段替换】而不是追加：模型看到的直接是附件全文，无从调起。
+ */
+const ATTACH_SEGMENT_SRC = '\\[File "([^"]+)" \\((\\d+) bytes, sha256:[A-Za-z0-9]+\\): verbatim read-only copy saved at "([^"]+)"\\.[^\\]]*\\]'
+/** 退化形态：只有裸短语（无 [File 包裹）时兜底，吞掉短语到行尾的引导句。 */
+const ATTACH_PHRASE_SRC = 'verbatim read-only copy saved at "([^"]+)"\\.[^\\n]*'
 
 /**
  * 附件句柄的判重键：统一反斜杠 + 小写（Windows 路径大小写不敏感）。
@@ -355,10 +364,13 @@ function attachmentHandleKey(rawPath) {
 /**
  * 读一个附件文件、组装内联文本块；读不到/非文本返回 null（调用方保留句柄原样）。
  * 超出 inlineLimit 的文件读前 inlineLimit 字节并标注截断。
+ * 文案显式禁止模型再调用文件工具（防句柄引导残留导致盲调被拦）。
  * @param {string} rawPath - 句柄文本里捕获的路径（可能带字面双反斜杠）
  * @param {number} inlineLimit - 内联字节上限
+ * @param {string} [displayName] - 展示用文件名（完整段里有宿主记录的原名）
+ * @param {number} [displayBytes] - 展示用字节数（完整段里有宿主记录的大小）
  */
-export function readAttachmentForInline(rawPath, inlineLimit) {
+export function readAttachmentForInline(rawPath, inlineLimit, displayName, displayBytes) {
   if (typeof rawPath !== 'string' || rawPath.length === 0) return null
   const candidates = [rawPath, rawPath.replaceAll('\\\\', '\\')]
   for (const p of candidates) {
@@ -369,10 +381,11 @@ export function readAttachmentForInline(rawPath, inlineLimit) {
       const content = truncated
         ? readFileSync(p).subarray(0, inlineLimit).toString('utf8')
         : readFileSync(p, 'utf8')
-      const base = p.split(/[\\/]/).pop() ?? p
-      const head = `[adapter-compat·附件内联] 附件「${base}」全文如下（当前会话模式没有文件工具，已代为读取）：`
+      const base = displayName ?? (p.split(/[\\/]/).pop() ?? p)
+      const sizeNote = `${displayBytes ?? st.size} 字节${truncated ? `，内联上限 ${inlineLimit} 字节，以下为前 ${inlineLimit} 字节` : ''}`
+      const head = `[adapter-compat·附件内联] 用户发来附件「${base}」（${sizeNote}），全文如下（当前会话模式没有文件工具，内容已代为读取；请直接引用以下内容回答，不要调用文件工具）：`
       const tail = truncated
-        ? `\n<<<附件内容结束（原文件 ${st.size} 字节，超出内联上限 ${inlineLimit} 字节被截断；完整文件见句柄路径）>>>`
+        ? `\n<<<附件内容结束（已截断；完整文件在宿主附件库，本模式不可用文件工具读取）>>>`
         : '\n<<<附件内容结束>>>'
       return `${head}\n<<<附件内容开始>>>\n${content}${tail}`
     } catch { /* 该候选读不到，试下一个 */ }
@@ -381,29 +394,66 @@ export function readAttachmentForInline(rawPath, inlineLimit) {
 }
 
 /**
- * 把一段文本里全部附件句柄替换为「句柄原文 + 内联块」。
- * 同一附件路径跨消息只内联一次（seen 判重，防止多轮对话每轮重复注入全文）。
+ * 单个句柄的内联产物：首次 → 全文块；重复（seen 命中）→ 占位句；读失败 → null。
+ */
+function inlineBlockFor(rawPath, inlineLimit, seen, onInlined, displayName, displayBytes) {
+  const key = attachmentHandleKey(rawPath)
+  const name = displayName ?? (attachmentDisplayName(rawPath) ?? '附件')
+  if (seen.has(key)) {
+    return `[adapter-compat·附件内联] 附件「${name}」全文已在前文内联提供（此处不重复）。`
+  }
+  const block = readAttachmentForInline(rawPath, inlineLimit, displayName, displayBytes)
+  if (block === null) return null
+  seen.add(key)
+  if (typeof onInlined === 'function') onInlined()
+  return block
+}
+
+/** 从落盘路径取展示文件名。 */
+function attachmentDisplayName(rawPath) {
+  const p = String(rawPath).replaceAll('\\\\', '\\')
+  return p.split(/[\\/]/).pop() ?? null
+}
+
+/**
+ * 把一段文本里的附件句柄【整段替换】为内联块（替换而非追加——句柄里的
+ * 「用文件工具读」引导会让无工具模式的模型盲调被拦，10.A 实锤）。
+ * 同一附件路径跨消息只内联一次：首遇 → 全文块；复现 → 占位句；读失败 → 原段保留。
+ * 完整段形态优先；整段一个都没匹配到才退化处理裸短语。
  * @returns 新文本（无内联时与原文相等）
  */
 export function inlineHandlesInText(text, inlineLimit, seen, onInlined) {
-  const re = new RegExp(ATTACHMENT_HANDLE_SRC, 'g')
+  const segRe = new RegExp(ATTACH_SEGMENT_SRC, 'g')
   let out = ''
   let cursor = 0
+  let matched = 0
   let m
-  while ((m = re.exec(text)) !== null) {
-    const handleEnd = m.index + m[0].length
-    out += text.slice(cursor, handleEnd)
-    cursor = handleEnd
-    const key = attachmentHandleKey(m[1])
-    if (seen.has(key)) continue
-    const block = readAttachmentForInline(m[1], inlineLimit)
-    if (block === null) continue
-    seen.add(key)
-    out += `\n\n${block}`
-    if (typeof onInlined === 'function') onInlined()
+  while ((m = segRe.exec(text)) !== null) {
+    matched += 1
+    out += text.slice(cursor, m.index)
+    cursor = m.index + m[0].length
+    const block = inlineBlockFor(m[3], inlineLimit, seen, onInlined, m[1], Number(m[2]))
+    if (block === null) out += m[0] /* 读失败：保留原段 */
+    else out += block
   }
-  out += text.slice(cursor)
-  return out
+  if (matched > 0) {
+    out += text.slice(cursor)
+    return out
+  }
+  /* 退化：裸短语形态（吞掉短语到行尾的引导句） */
+  const phRe = new RegExp(ATTACH_PHRASE_SRC, 'g')
+  let out2 = ''
+  let cursor2 = 0
+  let m2
+  while ((m2 = phRe.exec(text)) !== null) {
+    out2 += text.slice(cursor2, m2.index)
+    cursor2 = m2.index + m2[0].length
+    const block = inlineBlockFor(m2[1], inlineLimit, seen, onInlined)
+    if (block === null) out2 += m2[0] /* 读失败：保留原短语 */
+    else out2 += block
+  }
+  out2 += text.slice(cursor2)
+  return out2
 }
 
 /**
@@ -433,7 +483,7 @@ export function inlineAttachmentInMessage(message, inlineLimit, seen, onInlined)
 
 /**
  * 附件内联入口：目录里没有只读文件工具时，把 messages 里全部附件句柄
- * 读出内联（跨消息同路径去重）。恒不抛、不改原数组/原消息对象。
+ * 整段替换为内联块（跨消息同路径去重）。恒不抛、不改原数组/原消息对象。
  * @param {Array} messages - 请求消息数组（可能被宿主冻结）
  * @param {number} inlineLimit - 单附件内联字节上限
  * @returns {{messages: Array, inlined: number}} messages2 与原数组元素引用复用（未内联项）
