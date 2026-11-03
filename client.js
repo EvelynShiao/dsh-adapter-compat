@@ -461,8 +461,10 @@ window.__ModuleLoader__.load({
        宿主消息流容器 [data-conversation-scroll]，消息项 .EvIC1a_flowItem（宿主 chat 包的
        稳定 class）；预估高度给 contain-intrinsic-size 防滚动跳动。Timeline 的 turn 轨道
        （.eGxaPq_frame，绝对定位独立层）不在消息流内、且显式豁免——缩略条/刻度照常渲染。 */
+    // hidden="until-found" relies on UA content-visibility:hidden. Never override it:
+    // doing so reveals collapsed assistant steps even while disclosure stays closed.
     const RENDER_FX_CSS = [
-      '[data-conversation-scroll] .EvIC1a_flowItem {',
+      '[data-conversation-scroll] .EvIC1a_flowItem:not([hidden]) {',
       '  content-visibility: auto;',
       '  contain-intrinsic-size: auto 220px;',
       '}',
