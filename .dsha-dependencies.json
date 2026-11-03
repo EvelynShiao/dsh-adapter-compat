@@ -1,0 +1,16 @@
+{
+  "format": 1,
+  "state": "no-dependencies",
+  "plugin": "dsh-adapter-compat",
+  "version": "9999.9.42",
+  "archiveSha256": "",
+  "manifestSha256": "6a2373a91b434f8ddd3dc90dc30d0bbfbb0da3212bc4da4dbf063f8d3e2769db",
+  "treeSha256": "1abe103e553e56b6d469c8497d24c4c88b188d7802cca2085af740b19c72a6e7",
+  "resolved": [],
+  "lockSha256": "",
+  "manager": "pnpm",
+  "managerVersion": "not-executed",
+  "integrity": "actual file tree SHA-256 and native pnpm lockfile",
+  "runtimeDsh": "0.2.0-rc.2",
+  "authorClaims": {}
+}

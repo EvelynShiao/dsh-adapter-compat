@@ -1,0 +1,1089 @@
+/**
+ * dsh-adapter-compat/repair.js — 会话日志 seq 断号扫描与补行修复
+ *
+ * 背景（2026-10-12 session-790e9a59 实证）：强退会丢掉一次未落盘的追加批次，
+ * 重启后宿主按内存续写，文件中间出现 seq 断号——zstd 帧结构完整、checksum 都对，
+ * 但加载器要求 seq 严格连续，读到断号就抛
+ *   "corrupt Zstandard session log: complete frame contains a torn JSONL record"
+ * （误导性文案：不是 zstd 撕裂，是中间缺行导致 committedBytes 停滞）。
+ * 宿主自带的自愈只覆盖**尾部撕裂**（截断丢弃），覆盖不了这种中间断号 → 历史打不开。
+ *
+ * 修复策略 = 按上下文补行（不重编号、不动任何既有行）：
+ *   - 断在 tool/call 之后最常见（工具执行中强退：result / step-end 所在批次没落盘）；
+ *     工具协议决定了缺失行必然是该 call 的 tool/result（± step/end），
+ *     这是能从上下文**确定性推断**的唯一形态；
+ *   - 无法识别的断号形态一律只报告不动手（unsupported），绝不猜；
+ *   - verify（true-delete.js 移植的宿主全套校验：seq dense + 状态机 + callId 配对）
+ *     全绿才允许落盘，写完回读复核，不过就回滚——补错宁可不修。
+ *
+ * 占位正文用 [内容已清除]（与 slim.js 的 SLIM_PLACEHOLDER 同一惯例：结构合法、正文确实
+ * 没了、一眼识别是修复占位而非真实输出）。
+ */
+import { randomUUID } from 'node:crypto'
+import { readSession, verify } from './true-delete.js'
+import { SLIM_PLACEHOLDER } from './slim.js'
+
+/**
+ * 扫描事件数组里的 seq 断号。一个「连续断段」只报一个缺口：
+ * 断口之后所有行都相对 index 平行偏移，逐行比较 index 会把一个缺口报成一串——
+ * 改为与上一行比较（seq 必须逐行 +1），跳变处即断口。
+ * @param {object[]} events
+ * @returns {{index:number, expected:number, got:number, missing:number,
+ *            prevType:string|null, nextType:string|null}[]}
+ */
+export function scanGaps(events) {
+  const gaps = []
+  if (!Array.isArray(events)) return gaps
+  for (let i = 0; i < events.length; i += 1) {
+    const ev = events[i]
+    if (!ev) continue
+    const expected = i === 0 ? 0 : (Number.isSafeInteger(events[i - 1]?.seq) ? events[i - 1].seq + 1 : i)
+    const got = Number.isSafeInteger(ev.seq) ? ev.seq : NaN
+    if (got === expected) continue
+    gaps.push({
+      index: i,
+      expected,
+      got,
+      missing: Number.isSafeInteger(got) ? got - expected : 1,
+      prevType: i > 0 && events[i - 1] ? events[i - 1].type : null,
+      nextType: ev.type ?? null,
+    })
+  }
+  return gaps
+}
+
+/** 合成行用的合法 time：基点 +1/+2，非法基点退回一个安全整数。 */
+function safeTime(base, plus) {
+  const b = Number.isSafeInteger(base) ? base : 1
+  const t = b + plus
+  return Number.isSafeInteger(t) && t >= 0 ? t : 1
+}
+
+/** 合成 tool/result 行（结构照真实行：sourceEventSeqs / surfaceOp 在**顶层**信封）。 */
+function makeToolResult(seq, time, prev) {
+  const callId = prev?.data?.callId
+  return {
+    type: 'tool/result',
+    seq,
+    time: safeTime(time, 1),
+    data: {
+      turn: prev.data.turn,
+      step: prev.data.step,
+      message: {
+        role: 'tool',
+        source: { kind: 'tool', callId },
+        toolCallId: callId,
+        content: [{ type: 'text', text: SLIM_PLACEHOLDER }],
+        isError: false,
+        id: randomUUID(),
+      },
+    },
+    sourceEventSeqs: [prev.seq],
+    surfaceOp: 'append',
+  }
+}
+
+/** 合成 step/end 行。 */
+function makeStepEnd(seq, time, prev) {
+  return {
+    type: 'step/end',
+    seq,
+    time: safeTime(time, 2),
+    data: { turn: prev.data.turn, step: prev.data.step },
+  }
+}
+
+/* ═════════════════ 大缺口（missing ≥ 3）结构重建 ═════════════════
+ *
+ * base 规则只覆盖 1~2 行（紧邻 tool/call 的 tool/result ± step/end），因为那是唯一
+ * 「从工具协议确定性推断」的形态。missing ≥ 3 只有一种常见成因：**整段 zstd 帧丢失**
+ * （2026-10-14 session-8420e924 实测：缺 10 行 = 2509-2518，跨了 3 个 step）。
+ * 帧边界是物理事实，帧里写了什么已经没了 —— 所以分两条线处理：
+ *
+ *   能确定的：**结构**。断口处的 open turn/step 与下一跳 next 的 data.turn/step 之间，
+ *     坐标只能前进，且只能经 step/end+step/start、turn/end+turn/start 走过去，
+ *     每一步是确定的行数。用 0-1 BFS 在 (open 状态 × 已用行数) 上找「恰好 missing 行、
+ *     落点满足 next 硬约束」的最省结构路径（结构行越少 ⇒ 不可见填充越多）。
+ *   不能确定的：**正文**。合成行一律 [内容已清除] 占位；填充优先用 assistant/attempt ——
+ *     它不是表层事件（不带 surfaceOp），界面上不会多出假消息。
+ *
+ * 三条底线（都是宿主真实拒载规则，见 dsh-session/lib/{index,invariant}.js）：
+ *   1. 不改任何既有行，只在断口处插行；
+ *   2. 合成 assistant/message 必须带真实 provider/model（assertMessageEventShape：
+ *      source.kind==='model' 且有 provider/model），从断口前最近一条真实 assistant/message 抄；
+ *   3. assistant/attempt|message 必须带 stream 数组（assertAssistantSettlementShape +
+ *      purge.assertRowsDense 的 settlement 规则）。
+ *
+ * 找不到合法路径就返回 null → 调用方按 unsupported 报告，绝不硬凑。
+ */
+
+/** 自动重建的行数上限（再大就不猜了，交给人工按 RUNBOOK 处理）。 */
+const MAX_FABRICATE = 240
+/** base 规则覆盖 1~2 行；≥3 行才走扩展（保守：小缺口形态学上仍可能是别的东西）。 */
+const MIN_EXTENDED_GAP = 3
+/** 未 started 的 call 被收尾时，宿主 dsh-session repair.js 用的模型可见措辞（照抄）。 */
+const CLOSER_NOT_STARTED = 'The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.'
+
+/** 断口前最近一条 assistant/message 的真实 source（合成消息要抄 provider/model）。 */
+function modelSourceBefore(events, upto) {
+  for (let i = upto - 1; i >= 0; i -= 1) {
+    const e = events[i]
+    const src = e?.data?.message?.source
+    if (e?.type === 'assistant/message' && src && typeof src.provider === 'string' && src.provider && typeof src.model === 'string' && src.model) {
+      return { kind: 'model', provider: src.provider, model: src.model }
+    }
+  }
+  return null
+}
+
+/** 断口前最近一次真实 tool/call 的工具名（合成声明要用一个像样的 name）。 */
+function toolNameBefore(events, upto) {
+  for (let i = upto - 1; i >= 0; i -= 1) {
+    const e = events[i]
+    if (e?.type === 'tool/call' && typeof e.data?.name === 'string' && e.data.name) return e.data.name
+  }
+  return null
+}
+
+/** 合成 assistant/attempt（填充用：非表层、settlement 必须带 stream）。 */
+function makeAttemptSeq(seq, time, turn, step) {
+  return { type: 'assistant/attempt', seq, time, data: { turn, step, stream: [] } }
+}
+
+/** 合成 assistant/message（声明一个丢失的 tool-call 用；必须 surfaceOp + 真实 source）。 */
+function makeAssistantMessageSeq(seq, time, turn, step, content, source) {
+  return {
+    type: 'assistant/message',
+    seq,
+    time,
+    data: { turn, step, stream: [], message: { role: 'assistant', content, source, id: randomUUID() } },
+    surfaceOp: 'append',
+  }
+}
+
+/**
+ * 合成 tool/result。started 的 call → [内容已清除] 占位成功结果（与 base 规则同款）；
+ * 未 started 的 call → 照宿主 openTurnClosers 的 TOOL_NOT_STARTED 错误形态。
+ */
+function makeResultSeq(seq, time, turn, step, call) {
+  const notStarted = call?.started !== true
+  const callId = call?.id
+  const message = {
+    role: 'tool',
+    source: { kind: 'tool', callId },
+    toolCallId: callId,
+    content: [{ type: 'text', text: notStarted ? CLOSER_NOT_STARTED : SLIM_PLACEHOLDER }],
+    isError: notStarted,
+    id: randomUUID(),
+  }
+  const data = { turn, step, message }
+  if (notStarted) data.error = { name: 'ToolNotStartedError', code: 'TOOL_NOT_STARTED' }
+  const ev = { type: 'tool/result', seq, time, data, surfaceOp: 'append' }
+  if (Number.isSafeInteger(call?.seq) && call.seq < seq) ev.sourceEventSeqs = [call.seq]
+  return ev
+}
+
+/**
+ * 回放断口前的状态机（镜像 true-delete.js verify 的 Relationships 分支）。
+ * 返回 {turn, step, nextTurn, nextStep, pending:[{id,seq,started,name,arguments}]}，
+ * 输入本身结构非法（step/start 时 step 还开着等）时返回 null —— 那种文件 verify 也过不了。
+ */
+function replayGapState(events, count) {
+  let turn = null
+  let step = null
+  let nextTurn = 1
+  let nextStep = 1
+  const pending = []
+  for (let i = 0; i < count; i += 1) {
+    const e = events[i]
+    if (!e || typeof e.type !== 'string') return null
+    const d = e.data
+    switch (e.type) {
+      case 'turn/start':
+        if (turn !== null) return null
+        turn = nextTurn
+        nextStep = 1
+        pending.length = 0
+        break
+      case 'turn/end':
+        if (turn === null || step !== null) return null
+        turn = null
+        nextTurn += 1
+        pending.length = 0
+        break
+      case 'step/start':
+        if (turn === null || step !== null) return null
+        step = nextStep
+        break
+      case 'step/end':
+        if (turn === null || step === null) return null
+        step = null
+        nextStep += 1
+        pending.length = 0
+        break
+      case 'assistant/message': {
+        if (turn === null || step === null) break
+        const content = d?.message?.content
+        if (!Array.isArray(content)) break
+        for (const b of content) {
+          if (b?.type === 'tool-call' && typeof b.id === 'string' && b.id && !pending.some((p) => p.id === b.id)) {
+            pending.push({ id: b.id, seq: e.seq, started: false, name: b.name, arguments: b.arguments })
+          }
+        }
+        break
+      }
+      case 'tool/call': {
+        const p = pending.find((x) => x.id === d?.callId)
+        if (p && !p.started) {
+          p.started = true
+          p.seq = e.seq
+          if (typeof d.name === 'string') p.name = d.name
+          if (typeof d.arguments === 'string') p.arguments = d.arguments
+        }
+        break
+      }
+      case 'tool/result': {
+        const id = d?.message?.toolCallId ?? d?.message?.source?.callId
+        const idx = pending.findIndex((x) => x.id === id)
+        if (idx >= 0) pending.splice(idx, 1)
+        break
+      }
+      default: break
+    }
+  }
+  return { turn, step, nextTurn, nextStep, pending }
+}
+
+/** 一个「动作」推进后的状态（BFS 扩展与最终物化共用，保证两者不会走样）。 */
+function applyMove(st, mv) {
+  switch (mv.kind) {
+    case 'attempt':
+      return st
+    case 'settle': {
+      const idx = st.pending.findIndex((p) => p.id === mv.id)
+      if (idx < 0) return null
+      return { ...st, pending: st.pending.filter((_, i) => i !== idx) }
+    }
+    case 'step-end':
+      return { ...st, step: null, nextStep: st.nextStep + 1, pending: [] }
+    case 'step-start':
+      return { ...st, step: st.nextStep }
+    case 'turn-end':
+      return { ...st, turn: null, nextTurn: st.nextTurn + 1, pending: [] }
+    case 'turn-start':
+      return { ...st, turn: st.nextTurn, nextStep: 1, pending: [] }
+    case 'declare':
+      if (st.pending.some((p) => p.id === mv.id)) return null
+      return { ...st, pending: [...st.pending, { id: mv.id, seq: null, started: false, name: mv.name, arguments: mv.arguments }] }
+    case 'call': {
+      const p = st.pending.find((x) => x.id === mv.id)
+      if (!p || p.started) return null
+      return { ...st, pending: st.pending.map((x) => (x.id === mv.id ? { ...x, started: true } : x)) }
+    }
+    default:
+      return null
+  }
+}
+
+/** 下一跳对「缺口收尾状态」的硬约束（与 verify / 宿主 invariant 同口径）。 */
+function gapTargetOk(st, next, need) {
+  const d = next?.data
+  switch (next?.type) {
+    case 'turn/start':
+      return st.turn === null && st.nextTurn === d?.turn
+    case 'turn/end':
+      return st.turn === d?.turn && st.step === null && st.pending.length === 0
+    case 'step/start':
+      return st.turn === d?.turn && st.step === null && st.nextStep === d?.step
+    case 'step/end':
+      return st.turn === d?.turn && st.step === d?.step && st.pending.length === 0
+    case 'tool/call':
+      return st.turn === d?.turn && st.step === d?.step && st.pending.some((p) => p.id === d?.callId && p.started === false)
+    case 'tool/result':
+      if (next.surfaceOp !== 'append') return st.turn !== null
+      return st.turn === d?.turn && st.step === d?.step && st.pending.some((p) => p.id === need?.id && p.started === true)
+    case 'assistant/attempt':
+    case 'assistant/message':
+    case 'system/message':
+    case 'developer/message':
+      return st.turn === d?.turn && st.step === d?.step
+    default:
+      if (st.turn === null) return false
+      if (Number.isSafeInteger(d?.turn) && st.turn !== d.turn) return false
+      return true
+  }
+}
+
+/** 从当前状态能走的下一步（cost 0 = 不可见填充 attempt，cost 1 = 结构行）。 */
+function gapNeighbors(st, ctx) {
+  const { need, maxTurn, maxStep, declSpec } = ctx
+  const inBounds = (s) => s !== null && s.turn <= maxTurn && s.nextTurn <= maxTurn + 1 &&
+    (s.step === null || s.step <= maxStep) && s.nextStep <= maxStep + 1
+  const out = []
+  const add = (cost, mv) => { const ns = applyMove(st, mv); if (inBounds(ns)) out.push({ cost, mv, st: ns }) }
+
+  if (st.turn !== null && st.step !== null) add(0, { kind: 'attempt' })
+  for (const p of st.pending) {
+    if (need && p.id === need.id) continue   // 下一跳要它留着，不能结算
+    if (st.step === null) continue           // tool/result(append) 必须落在开着的 step 里
+    add(1, { kind: 'settle', id: p.id })
+  }
+  if (st.step !== null && st.pending.length === 0) add(1, { kind: 'step-end' })
+  if (st.turn !== null && st.step === null) add(1, { kind: 'step-start' })
+  if (st.turn !== null && st.step === null && st.pending.length === 0) add(1, { kind: 'turn-end' })
+  if (st.turn === null) add(1, { kind: 'turn-start' })
+  if (need && st.turn !== null && st.step !== null) {
+    const have = st.pending.find((p) => p.id === need.id)
+    if (!have) add(1, { kind: 'declare', id: need.id, ...declSpec })
+    else if (!have.started && need.kind === 'result') add(1, { kind: 'call', id: need.id })
+  }
+  return out
+}
+
+/** 把动作序列物化成行（seq/time 从断口起点连续排布，turn/step 取动作发生时的 open 状态）。 */
+function materializeGapPlan(path, st0, ctx) {
+  let st = st0
+  const rows = []
+  if (Array.isArray(ctx.trace)) {
+    ctx.trace.push(`物化开始：len=${path.length} kinds=${path.map((m) => m.kind).join(',')} st0=${JSON.stringify({ turn: st0.turn, step: st0.step, nextTurn: st0.nextTurn, nextStep: st0.nextStep })}`)
+  }
+  for (let i = 0; i < path.length; i += 1) {
+    const mv = path[i]
+    const seq = ctx.expected + i
+    const time = ctx.timeBase + i
+    const turn = st.turn
+    const step = st.step
+    let row
+    switch (mv.kind) {
+      case 'attempt':
+        row = makeAttemptSeq(seq, time, turn, step)
+        break
+      case 'settle':
+        row = makeResultSeq(seq, time, turn, step, st.pending.find((x) => x.id === mv.id))
+        break
+      case 'step-end':
+        row = { type: 'step/end', seq, time, data: { turn, step } }
+        break
+      case 'step-start':
+        row = { type: 'step/start', seq, time, data: { turn, step: st.nextStep } }
+        break
+      case 'turn-end':
+        row = { type: 'turn/end', seq, time, data: { turn } }
+        break
+      case 'turn-start':
+        row = { type: 'turn/start', seq, time, data: { turn: st.nextTurn } }
+        break
+      case 'declare':
+        row = makeAssistantMessageSeq(seq, time, turn, step, [{ type: 'tool-call', id: mv.id, name: mv.name, arguments: mv.arguments }], ctx.source)
+        break
+      case 'call': {
+        const p = st.pending.find((x) => x.id === mv.id)
+        row = { type: 'tool/call', seq, time, data: { turn, step, callId: mv.id, name: p?.name, arguments: p?.arguments } }
+        break
+      }
+      default:
+        if (Array.isArray(ctx.trace)) ctx.trace.push(`物化断在第 ${i} 步：未知动作 kind=${JSON.stringify(mv)}`)
+        return null
+    }
+    rows.push(row)
+    st = applyMove(st, mv)
+    if (!st) {
+      if (Array.isArray(ctx.trace)) ctx.trace.push(`物化断在第 ${i} 步：${mv.kind} → applyMove 返回 null（当时状态 ${JSON.stringify({ turn, step })}）`)
+      return null
+    }
+  }
+  return rows
+}
+
+/** 会真正约束 open turn/step 的事件类型（其余如插件事件、user/message 不约束）。 */
+const GAP_ANCHOR_TYPES = new Set([
+  'turn/start', 'turn/end', 'step/start', 'step/end',
+  'assistant/attempt', 'assistant/message', 'system/message', 'developer/message',
+  'tool/call', 'tool/result', 'request/header', 'request/context',
+  'llm/retry', 'compaction/start', 'compaction/summary', 'compaction/end',
+])
+
+/**
+ * 断口的锚点：**下一跳可能是无坐标的插件事件**（如 `session-log-deepseek/delivery-accepted`），
+ * 它对 open turn/step 没有任何要求；真正决定「缺口收尾状态」的是往后第一条带坐标的事件。
+ * 实测 8420 [1250+12]：下一跳是 delivery-accepted，按它收尾就把 step 停在 6，
+ * 而真实后续 assistant/message 在 step 8 → 整条链错位、verify 拒绝。
+ */
+function gapAnchorIndex(events, from) {
+  const limit = Math.min(events.length, from + 64)
+  for (let i = from; i < limit; i += 1) {
+    const t = events[i]?.type
+    if (typeof t === 'string' && GAP_ANCHOR_TYPES.has(t)) return i
+  }
+  return from
+}
+
+/**
+ * 大缺口规划：找「恰好 missing 行、落点满足锚点事件硬约束」的最省结构路径。
+ * @returns {object[]|null} 合成行；无解返回 null（调用方按 unsupported 报告）。
+ */
+function planGapRows(gap, events, { forceSettle = false, trace = null } = {}) {
+  const T = (m) => { if (Array.isArray(trace)) trace.push(m) }
+  const M = gap.missing
+  const next = events[gap.index]
+  if (!next || typeof next.type !== 'string') { T('早退：没有下一跳'); return null }
+  const anchorIdx = gapAnchorIndex(events, gap.index)
+  const anchor = events[anchorIdx] ?? next
+  const source = modelSourceBefore(events, gap.index)   // 惰性：只有真要合成 assistant/message 时才是硬要求
+  const base = replayGapState(events, gap.index)
+  if (!base) { T('早退：断口前状态机回放失败'); return null }
+
+  // 锚点是不是在等一个 call（result 等它 started，tool/call 等它 declared 未 started）
+  const nd = anchor.data && typeof anchor.data === 'object' ? anchor.data : {}
+  let need = null
+  let declSpec = null
+  if (anchor.type === 'tool/result' && anchor.surfaceOp === 'append') {
+    const id = nd?.message?.toolCallId ?? nd?.message?.source?.callId
+    if (typeof id !== 'string' || !id) return null
+    need = { id, kind: 'result' }
+  } else if (anchor.type === 'tool/call') {
+    if (typeof nd?.callId !== 'string' || !nd.callId) return null
+    need = { id: nd.callId, kind: 'call' }
+  }
+  if (need) {
+    const original = base.pending.find((p) => p.id === need.id)
+    // 下一跳等的 call 不在断口前的 pending 里 → 它的声明（assistant/message）也丢了，得补一条。
+    // 合成 assistant/message 必须带真实 provider/model（宿主 assertMessageEventShape），所以这里才要 source。
+    if (!original && !source) {
+      T('早退：需合成 assistant/message 声明，但断口前没有真实 assistant/message（缺 provider/model）')
+      return null
+    }
+    if (need.kind === 'call') {
+      declSpec = { name: nd.name, arguments: nd.arguments }
+    } else if (original) {
+      declSpec = { name: original.name, arguments: original.arguments }
+    } else {
+      const name = toolNameBefore(events, gap.index)
+      if (!name) { T('早退：声明 call 至少要一个真实工具名'); return null }
+      declSpec = { name, arguments: JSON.stringify({ command: SLIM_PLACEHOLDER }) }
+    }
+    if (typeof declSpec.name !== 'string' || !declSpec.name) { T('早退：declSpec 没有合法 name'); return null }
+  }
+
+  // forceSettle 候选：先把断口前「已 started、且下一跳不是它 result」的 call 结算掉
+  // （工具协议：call 之后必是它的 result，所以它们几乎必然落在缺口里）。
+  let st = base
+  const prefix = []
+  if (forceSettle) {
+    for (const p of base.pending.filter((x) => x.started && x.id !== need?.id)) {
+      const ns = applyMove(st, { kind: 'settle', id: p.id })
+      if (!ns) return null
+      st = ns
+      prefix.push({ kind: 'settle', id: p.id })
+    }
+    if (prefix.length >= M) return null
+  }
+
+  const maxTurn = Math.max(Number.isSafeInteger(nd?.turn) ? nd.turn : 0, base.turn ?? 0, base.nextTurn) + 1
+  const maxStep = Math.max(Number.isSafeInteger(nd?.step) ? nd.step : 0, base.step ?? 0, base.nextStep) + 2
+  const ctx = {
+    need, declSpec, source, trace,
+    expected: gap.expected,
+    timeBase: Number.isSafeInteger(events[gap.index - 1]?.time) ? events[gap.index - 1].time : (Number.isSafeInteger(next.time) ? next.time : 1),
+    maxTurn,
+    maxStep,
+  }
+
+  // 0-1 BFS：cost 0 = attempt 填充，cost 1 = 结构行。队列按 cost 单调，首个命中目标即最省。
+  T(`M=${M} forceSettle=${forceSettle} prefix=${prefix.length} state0=${JSON.stringify({ turn: base.turn, step: base.step, nextTurn: base.nextTurn, nextStep: base.nextStep, pending: base.pending.map((p) => p.id.slice(0, 8) + (p.started ? '+' : '-')) })} need=${need ? need.kind + ':' + String(need.id).slice(0, 10) : 'null'} bounds=turn≤${maxTurn},step≤${maxStep} anchor=${anchor.type}@${anchorIdx}(${nd?.turn}/${nd?.step})${anchorIdx > gap.index ? ` [下一跳 ${next.type} 无坐标，跳过]` : ''}`)
+  const key = (s, k) => `${s.turn}|${s.step}|${s.nextTurn}|${s.nextStep}|${[...s.pending].map((p) => p.id + (p.started ? '+' : '-')).sort().join(',')}|${k}`
+  const start = { st, k: prefix.length, path: prefix, cost: 0 }
+  const best = new Map([[key(st, prefix.length), 0]])
+  const queue = [start]
+  let head = 0
+  let expanded = 0
+  while (head < queue.length) {
+    const node = queue[head]
+    head += 1
+    if (node.k === M) {
+      const ok = gapTargetOk(node.st, anchor, need)
+      T(`pop k=M cost=${node.cost} target=${ok} st=${JSON.stringify({ turn: node.st.turn, step: node.st.step, nextTurn: node.st.nextTurn, nextStep: node.st.nextStep })}`)
+      if (ok) {
+        const rows = materializeGapPlan(node.path, base, ctx)
+        T(rows === null ? '物化失败 → null' : `物化成功 ${rows.length} 行`)
+        return rows
+      }
+      continue
+    }
+    expanded += 1
+    if (expanded > 200000) return null
+    for (const nb of gapNeighbors(node.st, ctx)) {
+      const nk = node.k + 1
+      const ncost = node.cost + nb.cost
+      const kk = key(nb.st, nk)
+      if (best.has(kk) && best.get(kk) <= ncost) continue
+      best.set(kk, ncost)
+      const item = { st: nb.st, k: nk, path: node.path.concat(nb.mv), cost: ncost }
+      if (nb.cost === 0) queue.splice(head, 0, item)   // 0-cost 边插队首（0-1 BFS）
+      else queue.push(item)
+    }
+  }
+  return null
+}
+
+/** 扩展候选：两种口味（先结算断口前的 call / 交给规划器按需结算），都试一遍。 */
+function buildExtendedCandidates(gap, events) {
+  if (!gap || !Number.isSafeInteger(gap.missing) || gap.missing < MIN_EXTENDED_GAP || gap.missing > MAX_FABRICATE) return []
+  const out = []
+  for (const forceSettle of [true, false]) {
+    const rows = planGapRows(gap, events, { forceSettle })
+    if (Array.isArray(rows) && rows.length === gap.missing) out.push(rows)
+  }
+  return out
+}
+
+/** 导出版：单个最优扩展候选（对外只暴露这一个）。 */
+export function buildInsertsExtended(gap, events) {
+  const cands = buildExtendedCandidates(gap, events)
+  return cands.length > 0 ? cands[0] : null
+}
+
+export function buildInserts(gap, events) {
+  const cands = insertCandidates(gap, events)
+  return cands.length > 0 ? cands[0] : null
+}
+
+/**
+ * base 规则（1~2 行、从工具协议确定性推断）：
+ *   R1: missing=2, prev=tool/call, next=step/start(同 turn, step+1)
+ *       → [tool/result, step/end]（result 与 step-end 两行批次整体丢失）
+ *   R2: missing=1, prev=tool/call, next 属同 turn/step
+ *       → [tool/result]（工具协议：call 之后第一条必是它的 result）
+ * @returns {object[]|null}
+ */
+function buildInsertsBase(gap, events) {
+  const prev = gap.index > 0 ? events[gap.index - 1] : null
+  const next = events[gap.index]
+  if (!prev || prev.type !== 'tool/call') return null
+  if (!prev.data || typeof prev.data.callId !== 'string' || !Number.isSafeInteger(prev.data.turn) || !Number.isSafeInteger(prev.data.step)) return null
+  const sameStepCtx = next && next.data && next.data.turn === prev.data.turn && next.data.step === prev.data.step
+
+  if (gap.missing === 2 && next && next.type === 'step/start' &&
+      next.data?.turn === prev.data.turn && next.data.step === prev.data.step + 1) {
+    return [
+      makeToolResult(gap.expected, prev.time, prev),
+      makeStepEnd(gap.expected + 1, prev.time, prev),
+    ]
+  }
+  if (gap.missing === 1 && sameStepCtx) {
+    return [makeToolResult(gap.expected, prev.time, prev)]
+  }
+  // 1~2 行的其余形态一律不猜（形态学上还有别的可能，宁可报告）。
+  // missing ≥ 3 只可能是整帧丢失 —— 结构可从 turn/step 坐标确定性重建，正文用 [内容已清除] 占位。
+  return buildInsertsExtended(gap, events)
+}
+
+/** 一个缺口的全部候选补行方案（按优先级；空数组 = unsupported）。 */
+function insertCandidates(gap, events) {
+  const base = buildInsertsBase(gap, events)
+  if (base) return [base]
+  return buildExtendedCandidates(gap, events)
+}
+
+/* ============ 结构字段自愈（healStructure） ============
+ * 背景（2026-10-20 实证 session-beae66b3 / session-4ce9464e）：
+ * 「真删除」擦除时若用**白名单**只留定位标量（turn/step/retryId/attemptId/reason），
+ * 会把宿主校验必需的字段一起吃掉：帧完好、JSON 合法，但一加载就抛
+ *   - llm/retry 缺 provider/mode/policyKey/retry/delayMs/failure
+ *     → "retry must be a non-negative safe integer"
+ *   - llm/retry-started 缺 retry → 同上
+ *   - developer/message 的 content 被清空（tool-addition 块没了）但 headerSeq 还在
+ *     → "format v4 developer/message must omit headerSeq without tool additions"
+ * 这类损坏没有 seq 断号（行一条没少），补行修不了，只能把**结构字段补回去**。
+ *
+ * 原则：只补缺、绝不覆盖已有值；推不出来的（如缺 retryId）只报告不动手；
+ * 调用方必须 verify 全绿才允许落盘。
+ */
+const RETRY_FALLBACK_POLICY_KEY = '["normal",5,["EMPTY_RESPONSE","RATE_LIMIT","SERVER","TIMEOUT","TRANSPORT"],500,10000,0.1]'
+/** 占位正文：与 slim.js / purge.js 的 [内容已清除] 同一惯例。 */
+const HEAL_PLACEHOLDER = '[内容已清除]'
+const isSeq = (v) => Number.isSafeInteger(v) && v >= 0
+
+/** 从 attempt 的 stream 里取 finish 失败信息（llm/retry.failure 的唯一可靠来源）。 */
+function finishFailureOf(stream) {
+  if (!Array.isArray(stream)) return null
+  for (let i = stream.length - 1; i >= 0; i -= 1) {
+    const chunk = stream[i]?.chunk
+    if (chunk?.type !== 'finish') continue
+    const f = chunk.reason?.failure
+    if (f && typeof f.message === 'string' && f.message && typeof f.code === 'string' && f.code) {
+      return { message: f.message, code: f.code }
+    }
+  }
+  return null
+}
+
+/**
+ * 补回被白名单式擦除吃掉的**结构必需字段**（不改正文、不改 seq、不增删行）。
+ * @param {object} header - 会话头（只读）
+ * @param {object[]} events - 事件数组（不就地修改）
+ * @returns {{events:object[], healed:object[], problems:string[]}}
+ */
+export function healStructure(header, events) {
+  const healed = []
+  const problems = []
+  if (!Array.isArray(events)) return { events, healed, problems }
+  const out = []
+  let provider = null
+  const retries = []
+  let lastFailure = null
+
+  for (let i = 0; i < events.length; i += 1) {
+    const ev = events[i]
+    const d = ev?.data
+    if (!ev || typeof ev !== 'object' || !d || typeof d !== 'object') { out.push(ev); continue }
+    let data = null
+    const notes = []
+    const take = () => { if (data === null) data = { ...d } }
+
+    if (ev.type === 'request/header') {
+      const p = d.header?.config?.provider
+      if (typeof p === 'string' && p) provider = p
+    }
+
+    if (ev.type === 'assistant/attempt') {
+      const f = finishFailureOf(d.stream)
+      if (f) lastFailure = f
+      if (!Array.isArray(d.stream)) { take(); data.stream = []; notes.push('stream 补空数组') }
+    }
+
+    if (ev.type === 'llm/retry') {
+      take()
+      if (typeof data.retryId !== 'string' || !data.retryId) {
+        problems.push(`llm/retry@${ev.seq} 缺 retryId，无法推断所属策略链（不补）`)
+      } else {
+        if (typeof data.provider !== 'string' || !data.provider) {
+          if (provider) { data.provider = provider; notes.push('provider 取自最近的 request/header') }
+          else problems.push(`llm/retry@${ev.seq} 缺 provider 且前面没有 request/header`)
+        }
+        if (data.mode !== 'normal' && data.mode !== 'always') { data.mode = 'normal'; notes.push('mode 补 normal') }
+        let policySeed = null
+        if (typeof data.policyKey !== 'string' || !data.policyKey) {
+          /* 优先取同 turn/step/provider 的上一次重试（同一策略链），退而同会话任意一条，
+             再退默认串。policyKey 只要求非空且链内一致，不影响正文语义。 */
+          const sameChain = [...retries].reverse().find((r) => typeof r.policyKey === 'string' && r.policyKey
+            && r.turn === data.turn && r.step === data.step && r.provider === data.provider)
+          const anyRetry = [...retries].reverse().find((r) => typeof r.policyKey === 'string' && r.policyKey)
+          policySeed = sameChain ?? anyRetry ?? null
+          data.policyKey = policySeed ? policySeed.policyKey : RETRY_FALLBACK_POLICY_KEY
+          notes.push(policySeed ? 'policyKey 取自同一策略链' : 'policyKey 用默认策略串')
+        }
+        const prior = [...retries].reverse().find((r) => ['turn', 'step', 'provider', 'policyKey'].every((k) => r[k] === data[k]))
+        if (!isSeq(data.retry) || data.retry === 0) {
+          data.retry = prior === undefined ? 1 : prior.retry + 1
+          notes.push(`retry 补 ${data.retry}（链内序号）`)
+        }
+        if (data.mode === 'normal') {
+          const floor = Math.max(data.retry, 1)
+          /* 已有合法 maxRetries 就绝不覆盖（只补缺）；只在缺失/非法/小于 retry 时才补。 */
+          if (!isSeq(data.maxRetries) || data.maxRetries < floor) {
+            /* 继承顺序：同链上一条 → policyKey 的来源那条（同一策略的原始参数）→ 至少 retry。 */
+            const inherited = [prior?.maxRetries, policySeed?.maxRetries].find((v) => isSeq(v) && v >= floor)
+            const next = inherited ?? Math.max(floor, 5)
+            data.maxRetries = next
+            notes.push(`maxRetries 补 ${next}`)
+          }
+        } else if (data.maxRetries !== undefined) {
+          delete data.maxRetries
+          notes.push('always 模式去掉 maxRetries')
+        }
+        if (typeof data.delayMs !== 'number' || !Number.isFinite(data.delayMs) || data.delayMs < 0 || data.delayMs > 2147483647) {
+          const inherited = prior?.delayMs
+          data.delayMs = typeof inherited === 'number' && Number.isFinite(inherited) && inherited >= 0 ? inherited : 0
+          notes.push(`delayMs 补 ${data.delayMs}`)
+        }
+        const f = data.failure
+        if (!f || typeof f !== 'object' || typeof f.message !== 'string' || !f.message || typeof f.code !== 'string' || !f.code) {
+          data.failure = lastFailure ?? { message: HEAL_PLACEHOLDER, code: 'SERVER' }
+          notes.push(lastFailure ? 'failure 取自上一条 attempt 的 finish 错误' : 'failure 用占位')
+        }
+        retries.push(data)
+      }
+    }
+
+    if (ev.type === 'llm/retry-started') {
+      take()
+      if (typeof data.retryId !== 'string' || !data.retryId) {
+        problems.push(`llm/retry-started@${ev.seq} 缺 retryId（不补）`)
+      } else if (!isSeq(data.retry) || data.retry === 0) {
+        const scheduled = [...retries].reverse().find((r) => r.retryId === data.retryId && r.turn === data.turn && r.step === data.step)
+          ?? [...retries].reverse().find((r) => r.retryId === data.retryId)
+        if (scheduled) { data.retry = scheduled.retry; notes.push(`retry 取自配对的 llm/retry = ${scheduled.retry}`) }
+        else problems.push(`llm/retry-started@${ev.seq} 找不到可配对的 llm/retry（不补）`)
+      }
+    }
+
+    if (ev.type === 'developer/message') {
+      const blocks = d.message?.content
+      const hasAdd = Array.isArray(blocks) && blocks.some((b) => b && b.type === 'tool-addition')
+      if (!hasAdd && Object.hasOwn(d, 'headerSeq')) {
+        take()
+        delete data.headerSeq
+        notes.push('无 tool-addition，删掉 headerSeq')
+      } else if (hasAdd && !isSeq(d.headerSeq)) {
+        let found
+        for (let k = i - 1; k >= 0; k -= 1) {
+          if (events[k]?.type === 'request/header' && isSeq(events[k].seq)) { found = events[k].seq; break }
+        }
+        if (found !== undefined) { take(); data.headerSeq = found; notes.push(`headerSeq 补 ${found}（最近更早的 request/header）`) }
+        else problems.push(`developer/message@${ev.seq} 有 tool-addition 但缺 headerSeq，且前面没有 request/header`)
+      }
+    }
+
+    if (data !== null) {
+      out.push({ ...ev, data })
+      if (notes.length > 0) healed.push({ seq: ev.seq, type: ev.type, notes })
+    } else {
+      out.push(ev)
+    }
+  }
+  return { events: out, healed, problems }
+}
+
+/**
+ * 对整个会话做断号修复（纯函数，不碰文件）。
+ * @param {object} header - 会话头
+ * @param {object[]} events - readSession 读出的事件
+ * @returns {{ok:boolean, alreadyHealthy?:boolean, gaps:object[], unsupported:object[],
+ *            inserted:object[], fixed?:object[], problems:string[], stats?:object}}
+ */
+export function repairEvents(header, events) {
+  const gaps = scanGaps(events)
+  if (gaps.length === 0) {
+    return { ok: true, alreadyHealthy: true, gaps: [], unsupported: [], inserted: [], problems: [], stats: { events: events.length } }
+  }
+
+  // 每个缺口的候选方案（base 优先；扩展规划可能给两种口味）
+  const candidates = gaps.map((gap) => insertCandidates(gap, events))
+  const unsupported = gaps.filter((_, i) => candidates[i].length === 0)
+  if (unsupported.length > 0) {
+    return { ok: false, gaps, unsupported, inserted: [], problems: unsupported.map((gap) => describeGapReport(gap, events).describe) }
+  }
+
+  const assemble = (idx) => {
+    const insertsAt = new Map()
+    gaps.forEach((gap, i) => insertsAt.set(gap.index, candidates[i][idx[i]]))
+    const rows = []
+    const inserted = []
+    for (let i = 0; i < events.length; i += 1) {
+      const add = insertsAt.get(i)
+      if (add) { rows.push(...add); inserted.push(...add) }
+      rows.push(events[i])
+    }
+    return { rows, inserted }
+  }
+
+  // 候选组合搜索（缺口通常只有 1 个；上限 64 组，超了就按当前组合的 verify 结果报告）
+  const idx = new Array(gaps.length).fill(0)
+  const MAX_COMBOS = 64
+  let last = null
+  for (let attempt = 0; attempt < MAX_COMBOS; attempt += 1) {
+    const { rows, inserted } = assemble(idx)
+    const v = verify(header, rows)
+    if (v.ok === true) {
+      return { ok: true, gaps, unsupported: [], inserted, fixed: rows, problems: [], stats: v.stats }
+    }
+    last = v
+    let p = gaps.length - 1
+    while (p >= 0 && idx[p] + 1 >= candidates[p].length) { idx[p] = 0; p -= 1 }
+    if (p < 0) break
+    idx[p] += 1
+  }
+  // 所有组合都过不了 verify —— 说明合成行与既有行冲突（如 result 被补了两次），不许落盘
+  return { ok: false, gaps, unsupported: [], inserted: [], problems: (last?.problems ?? []).slice(0, 8).map(String), comboExhausted: true }
+}
+
+/** 缺口的人类可读描述（日志 / unsupported 报告用）。 */
+export function describeGap(gap) {
+  return `seq 断号：第 ${gap.index} 行应为 seq=${gap.expected}，实为 ${gap.got}` +
+    `（缺 ${gap.missing} 行；前一行=${gap.prevType ?? '∅'}，后一行=${gap.nextType ?? '∅'}）`
+}
+
+/**
+ * 缺口的结构化报告（unsupported / 人工按 RUNBOOK 处理时用）。
+ * @returns {{describe:string, missing:number, seqFrom:number, seqTo:number,
+ *            prev:object|null, next:object|null, autoRepairable:boolean, hints:string[]}}
+ */
+export function describeGapReport(gap, events) {
+  const prev = gap.index > 0 ? events[gap.index - 1] : null
+  const next = events[gap.index] ?? null
+  const strip = (e) => (e ? {
+    seq: e.seq,
+    type: e.type,
+    turn: e.data?.turn ?? null,
+    step: e.data?.step ?? null,
+    callId: e.data?.callId ?? e.data?.message?.toolCallId ?? null,
+  } : null)
+  const hints = []
+  if (!Number.isSafeInteger(gap.missing) || gap.missing < 0) {
+    hints.push('后一行 seq 比预期还小（重复/重叠写入），插行修不了，得先弄清是谁写了重复行')
+  } else {
+    if (gap.missing < MIN_EXTENDED_GAP) hints.push('缺口只有 1~2 行，必须是紧邻 tool/call 的 tool/result（± step/end）才补；本例不满足，只能人工看上下文')
+    if (gap.missing > MAX_FABRICATE) hints.push(`缺口 ${gap.missing} 行超过自动重建上限 ${MAX_FABRICATE}，要按 RUNBOOK §1 人工构造`)
+    const anchor = events[gapAnchorIndex(events, gap.index)] ?? next
+    const nd = anchor?.data
+    const waitId = anchor?.type === 'tool/call' ? nd?.callId
+      : (anchor?.type === 'tool/result' && anchor.surfaceOp === 'append' ? (nd?.message?.toolCallId ?? nd?.message?.source?.callId) : null)
+    if (typeof waitId === 'string' && waitId) {
+      const st0 = replayGapState(events, gap.index)
+      const declared = Boolean(st0 && st0.pending.some((p) => p.id === waitId))
+      if (!declared && !modelSourceBefore(events, gap.index)) {
+        hints.push('锚点事件在等一个未声明的 call，需要补 assistant/message，但断口前没有真实 assistant/message（缺 provider/model），宿主会拒载 → 人工补')
+      }
+    }
+  }
+  const anchorIdx = gapAnchorIndex(events, gap.index)
+  return {
+    describe: describeGap(gap),
+    missing: gap.missing,
+    seqFrom: gap.expected,
+    seqTo: gap.expected + gap.missing - 1,
+    prev: strip(prev),
+    next: strip(next),
+    anchor: anchorIdx > gap.index ? { ...strip(events[anchorIdx]), note: '下一跳无坐标，锚点后移' } : undefined,
+    autoRepairable: buildExtendedCandidates(gap, events).length > 0,
+    hints,
+  }
+}
+
+/**
+ * 读盘扫描一个会话文件：断号 + 读取警告（坏行跳过 / 坏帧跳过）。
+ * 文件读不开时返回 {error}（不抛）。
+ * @param {string} file - session.v4.jsonl.zstd 路径
+ */
+export function scanFile(file) {
+  try {
+    const { header, events, warnings } = readSession(file)
+    if (!header) return { error: '没有可解析的会话头' }
+    const gaps = scanGaps(events)
+    return { header, events, warnings: warnings ?? [], gaps }
+  } catch (error) {
+    return { error: String(error?.message ?? error) }
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 工具孤儿修复（2026-10-23 新增，session-f3bc4fd2 实证伤型）
+ *
+ * 伤型：真删除/擦除类工具把 assistant/message 的 content 数组清空（89 条全空），
+ *       但 **stream 字段完好**。宿主 restore 校验要求：
+ *         ① 每个 tool/call 都有前置「宣告」（assistant/message 里的 tool-call 块）；
+ *         ② 每条 assistant/message 的 content 与其嵌入流重放结果一致
+ *            （assertCurrentAssistantStreams）。
+ *       content 被清空 ⇒ 108 个 tool/call 变孤儿 ⇒ 会话打不开，
+ *       报错 "tool/call X has no advertised tool lifecycle"。
+ *
+ * 修法（无损，零编造）：content === BlockAssembler(stream).blocks()。
+ *       每条空 content 的 assistant/message，把 content 用**宿主自己的流重放语义**
+ *       从幸存的 stream 里重组回来——重组出的块天然满足 ①② 两条校验。
+ *       stream 与 content 都空的（真·无输出）不在修复范围，如实报告。
+ *       有 content 的健康行一律不碰。
+ *
+ * 流重放规格照抄宿主 worker.cjs 的 expandAssistantStream：
+ *   record.type === 'chunk'          → 原样 chunk
+ *   record.type === 'text-chunks'     → text-delta ×texts
+ *   record.type === 'reasoning-chunks'→ reasoning-delta ×texts
+ *   record.type === 'tool-call-chunks'→ tool-call-delta ×args（首片带 id/name）
+ *   BlockAssembler 的块组装语义（block-start / *-delta / finish / usage）与
+ *   dsh-llm 的 BlockAssembler 相同——这里内联移植，不 import 宿主（保持插件零宿主依赖）。
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/** 流记录 → 扁平 chunk 序列（宿主 expandAssistantStream 同款语义，去掉 time 校验的宽容版）。
+ *  非法记录返回 null（由调用方决定跳过哪条 assistant 消息，绝不半组装）。 */
+function expandStreamRecords(stream) {
+  const chunks = []
+  for (const record of stream) {
+    if (!record || typeof record !== 'object') return null
+    if (record.type === 'chunk') {
+      if (record.chunk === undefined) return null
+      chunks.push(record.chunk)
+      continue
+    }
+    if (record.type === 'text-chunks' || record.type === 'reasoning-chunks') {
+      if (!Array.isArray(record.texts) || record.texts.length === 0) return null
+      for (let i = 0; i < record.texts.length; i += 1) {
+        chunks.push({ type: record.type === 'text-chunks' ? 'text-delta' : 'reasoning-delta', index: record.index, text: record.texts[i] })
+      }
+      continue
+    }
+    if (record.type === 'tool-call-chunks') {
+      if (typeof record.id !== 'string' || !Array.isArray(record.args) || record.args.length === 0) return null
+      for (let i = 0; i < record.args.length; i += 1) {
+        const delta = { type: 'tool-call-delta', index: record.index, id: record.id, argumentsDelta: record.args[i] }
+        if (i === 0 && Object.hasOwn(record, 'name')) delta.name = record.name
+        chunks.push(delta)
+      }
+      continue
+    }
+    return null /* 未知记录类型：整条放弃（宁可不修，不修错） */
+  }
+  return chunks
+}
+
+/** BlockAssembler 的最小内联移植：只保留「chunks → content 块」的组装路径。
+ *  支持 block-start / *-delta / block-end / finish / usage。
+ *  实测（session-f3bc4fd2 seq 342）：DSH 的流里每个块都以 block-end 收尾，
+ *  **block-end 自带完整成品块**（text/id/name/arguments 全在）——重组优先用成品，
+ *  没有 block-end 的（中断流）才退回 delta 累加。与 dsh-llm 行为一致。 */
+function assembleBlocks(chunks) {
+  const blocks = []
+  const byIndex = new Map() /* index → 累加器（delta 路径用） */
+  const endedIndex = new Map() /* index → 成品块（block-end 路径用） */
+  for (const chunk of chunks) {
+    if (!chunk || typeof chunk !== 'object') return null
+    if (chunk.type === 'block-start') {
+      byIndex.set(chunk.index, { type: chunk.blockType, index: chunk.index, text: '', tool: null })
+      continue
+    }
+    if (chunk.type === 'block-end') {
+      endedIndex.set(chunk.index, chunk.block)
+      byIndex.delete(chunk.index)
+      continue
+    }
+    if (chunk.type === 'finish' || chunk.type === 'usage') continue
+    let open = byIndex.get(chunk.index)
+    if (open === undefined) {
+      if (endedIndex.has(chunk.index)) continue /* 块已收尾，迟到的 delta 丢弃（宿主同款宽容） */
+      return null /* 没开过块的 delta：放弃 */
+    }
+    if (chunk.type === 'text-delta') {
+      if (open.type !== 'text') return null
+      open.text += String(chunk.text ?? '')
+      continue
+    }
+    if (chunk.type === 'reasoning-delta') {
+      if (open.type !== 'reasoning') return null
+      open.text += String(chunk.text ?? '')
+      continue
+    }
+    if (chunk.type === 'tool-call-delta') {
+      if (open.type !== 'tool-call') return null
+      if (open.tool === null) open.tool = { id: chunk.id, name: chunk.name, arguments: '' }
+      else if (chunk.id !== undefined && chunk.id !== open.tool.id) return null
+      open.tool.arguments += String(chunk.argumentsDelta ?? '')
+      continue
+    }
+    return null /* 未知 chunk 类型 */
+  }
+  /* 输出顺序按流里出现的块 index 排序：先收尾的成品，后没收尾的累加器。 */
+  const allIndexes = [...new Set([...endedIndex.keys(), ...byIndex.keys()])]
+  for (const idx of allIndexes) {
+    if (endedIndex.has(idx)) {
+      blocks.push(endedIndex.get(idx))
+    } else {
+      blocks.push(finishBlock(byIndex.get(idx)))
+    }
+  }
+  return blocks.length > 0 ? blocks : (allIndexes.length > 0 ? [] : null)
+}
+
+/** 组装收尾：按块类型产出与宿主一致的结构。 */
+function finishBlock(open) {
+  if (open.type === 'text' || open.type === 'reasoning') {
+    return { type: open.type, text: open.text }
+  }
+  if (open.type === 'tool-call') {
+    if (open.tool === null) return { type: 'tool-call', id: '', name: undefined, arguments: '' }
+    const block = { type: 'tool-call', id: open.tool.id }
+    if (open.tool.name !== undefined) block.name = open.tool.name
+    block.arguments = open.tool.arguments
+    return block
+  }
+  return { type: open.type }
+}
+
+/**
+ * 工具孤儿扫描：数出「无宣告 tool-call 块」的 tool/call（只读，纯函数）。
+ * @returns {{orphans:number, callIds:string[], emptyAssistant:number, sample:string[]}}
+ */
+export function scanToolOrphans(events) {
+  const advertised = new Set()
+  let emptyAssistant = 0
+  for (const ev of events) {
+    if (ev?.type !== 'assistant/message') continue
+    const content = ev.data?.message?.content
+    if (Array.isArray(content)) {
+      if (content.length === 0) emptyAssistant += 1
+      for (const b of content) if (b?.type === 'tool-call' && typeof b.id === 'string') advertised.add(b.id)
+    }
+  }
+  const callIds = []
+  for (const ev of events) {
+    if (ev?.type !== 'tool/call') continue
+    const id = ev.data?.callId
+    if (typeof id === 'string' && !advertised.has(id)) callIds.push(id)
+  }
+  return {
+    orphans: callIds.length,
+    callIds: callIds.slice(0, 500),
+    emptyAssistant,
+    sample: callIds.slice(0, 10),
+  }
+}
+
+/**
+ * 工具孤儿修复（纯函数，不碰文件）：把空 content 的 assistant/message
+ * 用幸存 stream 重组回 content。零编造——重组不出来就如实报告，不动手。
+ * @param {object[]} events
+ * @returns {{events:object[]|null, healed:{seq:number,blocks:number}[], unrepairable:{seq:number,why:string}[]}}
+ *          events 为 null 表示一条都修不了（调用方直接放弃）。
+ */
+export function healToolOrphans(events) {
+  const healed = []
+  const unrepairable = []
+  const out = []
+  let anyFixed = false
+  for (const ev of events) {
+    if (ev?.type !== 'assistant/message' || !ev.data?.message) { out.push(ev); continue }
+    const message = ev.data.message
+    if (Array.isArray(message.content) && message.content.length > 0) { out.push(ev); continue }
+    const stream = ev.data.stream
+    if (!Array.isArray(stream) || stream.length === 0) {
+      unrepairable.push({ seq: ev.seq, why: 'content 与 stream 双空（真·无输出的占位行，无法恢复）' })
+      out.push(ev)
+      continue
+    }
+    const chunks = expandStreamRecords(stream)
+    if (chunks === null) {
+      unrepairable.push({ seq: ev.seq, why: 'stream 记录形状非法，重放不了（宁可不修，不修错）' })
+      out.push(ev)
+      continue
+    }
+    const blocks = assembleBlocks(chunks)
+    if (!Array.isArray(blocks) || blocks.length === 0) {
+      unrepairable.push({ seq: ev.seq, why: 'stream 重放没有产出块' })
+      out.push(ev)
+      continue
+    }
+    const toolCalls = blocks.filter((b) => b?.type === 'tool-call' && typeof b.id === 'string' && b.id)
+    if (toolCalls.length === 0) {
+      unrepairable.push({ seq: ev.seq, why: '重放出的块里没有 tool-call（本条不涉及工具宣告，只重组正文）' })
+      /* 正文块也一并恢复——content 为空但 stream 有正文的，同样打不开宿主校验 */
+    }
+    out.push({ ...ev, data: { ...ev.data, message: { ...message, content: blocks } } })
+    healed.push({ seq: ev.seq, blocks: blocks.length })
+    anyFixed = true
+  }
+  return { events: anyFixed ? out : null, healed, unrepairable }
+}
+
+/** 调试导出：内部函数不外露成公共 API，但排障脚本需要单步看规划器。 */
+export const __repairDebug = {
+  replayGapState,
+  planGapRows,
+  buildExtendedCandidates,
+  gapNeighbors,
+  gapTargetOk,
+  applyMove,
+  modelSourceBefore,
+  toolNameBefore,
+  MAX_FABRICATE,
+  MIN_EXTENDED_GAP,
+  expandStreamRecords,
+  assembleBlocks,
+}
