@@ -3128,6 +3128,12 @@ export function readExitPrefs(home = dshHomeDir()) {
   const mode = COMPACT_EXIT_MODES.includes(webin.compactionFileMode) ? webin.compactionFileMode : COMPACT_EXIT_DEFAULTS.compactionFileMode
   const rawThreshold = Number(webin.compactionFileThresholdChars)
   const threshold = Number.isFinite(rawThreshold) && rawThreshold > 0 ? Math.round(rawThreshold) : COMPACT_EXIT_DEFAULTS.compactionFileThresholdChars
+  /* [2026-11-08 LDW 面板改绑] 五键真源 = webin.ldw 段（LDW 专属地盘，d382070 的 UI 补全）：
+     ldw 段键 ?? 回落顶层键 —— 与 LDW 车道 ldwCfg() 同一语义，UI 显示 = LDW 实际生效值。
+     非布尔垃圾值一律当缺省（回落顶层），不让烂数据透传进 UI。 */
+  const ldw = (webin.ldw !== null && typeof webin.ldw === 'object') ? webin.ldw : {}
+  const ldwBool = (v, fallback) => (typeof v === 'boolean' ? v : fallback)
+  const ldwTxt = Number(ldw.txtChunkBytes)
   return {
     compactionFileMode: mode,
     compactionFileThresholdChars: threshold,
@@ -3135,21 +3141,21 @@ export function readExitPrefs(home = dshHomeDir()) {
     /* [B线 2026-10-24] 消息流懒渲染开关：默认关（用户刚被闪退惊过，不替他做默认决定）。
      *  开启后客户端给消息项注入 content-visibility:auto，屏幕外跳过布局绘制。 */
     renderFx: own.renderFx === true,
-    /* 知识库自然语言协议全局开关（2026-10-19）：真源同放 webin config.json
-       （webin 每请求现读），默认开。 */
-    kbProtocol: webin.kbProtocol !== false,
-    /* 自然语言工具调用（通用，2026-10-19）：默认关（保守）。 */
-    nlToolProtocol: webin.nlToolProtocol === true,
-    /* 标题 LDW 前缀（2026-10-19）：默认开。 */
+    /* 知识库自然语言协议（2026-10-19；2026-11-08 改绑 ldw 段）：ldw.kbProtocol ?? 顶层。 */
+    kbProtocol: ldwBool(ldw.kbProtocol, webin.kbProtocol !== false),
+    /* 自然语言工具调用（通用，2026-10-19；2026-11-08 改绑 ldw 段）：默认关（保守）。 */
+    nlToolProtocol: ldwBool(ldw.nlToolProtocol, webin.nlToolProtocol === true),
+    /* 标题 LDW 前缀（2026-10-19）：默认开。不在 ldw 白名单（车道标题逻辑读顶层），保持绑顶层。 */
     titlePrefix: webin.titlePrefix !== false,
-    /* 全局 .txt 三件套（2026-10-21 用户定案「都要弄上」）：同源 webin config。
-     *  API 通道不实际用附件（HTTP JSON 直传），但全局入口一律完整呈现；
-     *  LDW 侧优先生效，除非 LDW 覆盖键留空（跟随全局）。 */
+    /* 全局 .txt 三件套（2026-10-21 用户定案「都要弄上」）：directSendThresholdChars 不在
+     *  ldw 白名单，保持绑顶层；txtChunkBytes 2026-11-08 改绑 ldw 段（ldw 段优先，回落顶层）。 */
     directSendThresholdChars: Number(webin.directSendThresholdChars) > 0 ? Math.round(Number(webin.directSendThresholdChars)) : 6000,
-    txtChunkBytes: Number(webin.txtChunkBytes) > 0 ? Math.round(Number(webin.txtChunkBytes)) : 409600,
-    chatOnly: webin.chatOnly === true,
-    /* 中文工具名（2026-10-24 用户点名「调用时用汉字代替」）：真源 webin config，默认关（独立开关，铁律）。 */
-    zhToolNames: webin.zhToolNames === true,
+    txtChunkBytes: Number.isFinite(ldwTxt) && ldwTxt > 0 ? Math.round(ldwTxt)
+      : (Number(webin.txtChunkBytes) > 0 ? Math.round(Number(webin.txtChunkBytes)) : 409600),
+    /* 纯聊天（2026-10-20；2026-11-08 改绑 ldw 段）：仅 LDW 车道。 */
+    chatOnly: ldwBool(ldw.chatOnly, webin.chatOnly === true),
+    /* 中文工具名（2026-10-24 用户点名；2026-11-08 改绑 ldw 段）：仅 LDW 车道，默认关。 */
+    zhToolNames: ldwBool(ldw.zhToolNames, webin.zhToolNames === true),
   }
 }
 
@@ -3224,13 +3230,19 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
       const webin = readJsonOr(webinPath, {})
       webin.compactionFileMode = next.compactionFileMode
       webin.compactionFileThresholdChars = next.compactionFileThresholdChars
-      webin.kbProtocol = next.kbProtocol
-      webin.nlToolProtocol = next.nlToolProtocol
       webin.titlePrefix = next.titlePrefix
       webin.directSendThresholdChars = next.directSendThresholdChars
-      webin.txtChunkBytes = next.txtChunkBytes
-      webin.chatOnly = next.chatOnly
-      webin.zhToolNames = next.zhToolNames
+      /* [2026-11-08 LDW 面板改绑] 五键（kb/nl/txtChunk/chatOnly/zh）写 ldw 段——
+         LDW 专属地盘，不再碰顶层键。车道侧 ldwCfg()（ldw ?? 顶层）吃 UI 开关；
+         API 通道 mergeWebinSwitches 读顶层，回归基线行为（地盘分离：顶层=全局，ldw=LDW）。
+         顶层若残留旧值也不再被 UI 更新（历史值保持原样，不清除——少写少险）。 */
+      const ldw = (webin.ldw !== null && typeof webin.ldw === 'object') ? webin.ldw : {}
+      ldw.kbProtocol = next.kbProtocol === true
+      ldw.nlToolProtocol = next.nlToolProtocol === true
+      ldw.txtChunkBytes = next.txtChunkBytes
+      ldw.chatOnly = next.chatOnly === true
+      ldw.zhToolNames = next.zhToolNames === true
+      webin.ldw = ldw
       writeJsonAtomic(webinPath, webin)
       /* [2026-10-30 重测 4.E 竞态修复] 写完 webin config 必须立刻失效 healOptionsCache：
          readHealOptions 有 2s TTL 缓存，写盘后 ≤2s 内的请求会命中旧开关值——
