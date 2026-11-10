@@ -2817,12 +2817,16 @@ function mergeWebinSwitches(value, home) {
   try {
     const webin = JSON.parse(readFileSync(webinConfigPath(home), 'utf8'))
     if (webin !== null && typeof webin === 'object') {
-      value.chatOnly = webin.chatOnly === true
-      value.zhToolNames = webin.zhToolNames === true
-      value.kbProtocol = webin.kbProtocol !== false
-      value.nlToolProtocol = webin.nlToolProtocol === true
-      value.kbTrim = webin.kbProtocol === true && webin.nlToolProtocol !== true
-      value.noKbTrim = webin.nlToolProtocol === true && webin.kbProtocol === false
+      const ldw = webin.ldw && typeof webin.ldw === 'object' ? webin.ldw : {}
+      // 优先读 ldw 段（UI/Runner 写入处），回落顶层键（旧版兼容/基线）
+      value.chatOnly = ldw.chatOnly === true || webin.chatOnly === true
+      value.zhToolNames = ldw.zhToolNames === true || webin.zhToolNames === true
+      value.kbProtocol = (ldw.kbProtocol !== undefined ? ldw.kbProtocol : webin.kbProtocol) !== false
+      value.nlToolProtocol = ldw.nlToolProtocol === true || webin.nlToolProtocol === true
+      const effKb = value.kbProtocol
+      const effNl = value.nlToolProtocol
+      value.kbTrim = effKb === true && effNl !== true
+      value.noKbTrim = effNl === true && effKb !== true
     }
   } catch { /* webin config 不存在/损坏：保持原值（kbTrim/noKbTrim 未定义 ⇒ 不裁） */ }
   return value
