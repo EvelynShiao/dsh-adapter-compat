@@ -556,18 +556,26 @@ window.__ModuleLoader__.load({
     ]
 
     const SIDEFOLD_CSS = [
-      /* 让位：浮层激活期间给三角行腾出空位（logoRow 下 34px / regionArea 顶 34px / footArea 底 72px） */
+      /* 让位：浮层激活期间给三角行腾出空位。全部参数化以容忍内容显隐组合：
+         regionArea padding 60 = 行2（30）+ 内容间隙；footerActions padding 62 =
+         行3+行4 连排空间（费用块缺席/被折时两行都在这里）；
+         第一个入口行 margin-top 30 = 行4 的让位区（~ 兄弟抵消后续行），
+         费用块被折叠或插件关闭时选择器自然失效/生效，无需 JS 干预文档流。 */
       'html[data-dsk-sidefold="1"] .hHd-Xa_newSession { margin-top: 34px !important; }',
-      'html[data-dsk-sidefold="1"] .hHd-Xa_regionArea { padding-top: 34px !important; flex: 1 1 auto; min-height: 0; }',
-      /* 底部两组：三角行连排在内容上方（footerActions 顶部让位 60px）；min-height 兜全折叠塌缩 */
-      'html[data-dsk-sidefold="1"] .hHd-Xa_footerActions { padding-top: 60px !important; }',
-      'html[data-dsk-sidefold="1"] .hHd-Xa_footArea { min-height: 64px !important; }',
+      'html[data-dsk-sidefold="1"] .hHd-Xa_regionArea { padding-top: 60px !important; flex: 1 1 auto; min-height: 0; }',
+      'html[data-dsk-sidefold="1"] .hHd-Xa_footerActions { padding-top: 62px !important; }',
+      'html[data-dsk-sidefold="1"] .hHd-Xa_footArea { min-height: 68px !important; }',
+      'html[data-dsk-sidefold="1"] .hHd-Xa_footerActions .dsh-session-kit-sidebar-row { margin-top: 30px !important; }',
+      'html[data-dsk-sidefold="1"] .hHd-Xa_footerActions .dsh-session-kit-sidebar-row ~ .dsh-session-kit-sidebar-row { margin-top: 0 !important; }',
+      /* session-kit 关闭（无入口行）但余额块还在：行4 落在余额块下，给设置区让位 */
+      'html[data-dsk-sidefold="1"] .hHd-Xa_footArea:has(.cm-footer-stack):not(:has(.dsh-session-kit-sidebar-row)) .hHd-Xa_settingsArea { margin-top: 30px !important; }',
       /* 折叠成员（展开态 data 值为 "0"，规则不命中） */
       'html[data-dsk-fold-top="1"] .hHd-Xa_newSession,',
       'html[data-dsk-fold-top="1"] .hHd-Xa_panelList,',
       'html[data-dsk-fold-top="1"] [data-dsk-foreign="top"] { display: none !important; }',
       'html[data-dsk-fold-files="1"] .hHd-Xa_regionArea > * { display: none !important; }',
-      'html[data-dsk-fold-cost="1"] .cm-footer-stack { display: none !important; }',
+      'html[data-dsk-fold-cost="1"] .cm-footer-stack,',
+      'html[data-dsk-fold-cost="1"] [data-dsk-foreign="cost"] { display: none !important; }',
       'html[data-dsk-fold-settings="1"] .dsh-session-kit-sidebar-row,',
       'html[data-dsk-fold-settings="1"] .hHd-Xa_settingsArea,',
       'html[data-dsk-fold-settings="1"] [data-dsk-foreign="settings"] { display: none !important; }',
@@ -639,9 +647,13 @@ window.__ModuleLoader__.load({
       row.style.width = `${Math.round(width)}px`
     }
 
-    /* 定位（rAF 节流）：锚全用「常驻不隐藏」元素——logoRow（组1）、regionArea 容器（组2）、
-       footerActions 容器（组3/4，让位区在其 padding-top 内）。防重叠：行2 ≥ 行1+30、
-       行3 ≤ 行4−30、行4 ≤ root 底缘−28（全折叠塌缩时不溢出）。窄条（宽<100）整层隐藏。 */
+    /* 定位（rAF 节流）：全部由每帧实测的可见内容块驱动，不锚死 y 坐标——
+       插件开关（费用块/入口行增删）、内容变化都自动跟随。
+       顶部：行1=第一个常驻块底缘；行2=regionArea 顶+30（配合 padding-top:60 让位），
+             但不低于行1+30（防折叠后重叠）。
+       底部：行3=footerActions 顶（padding-top:62 让位区内）；行4=第一个可见入口行
+             头顶（其 margin-top:30 让位区内），入口行缺席时依次回退
+             余额块底/设置区头顶/footerActions 顶+34；全程钳在 root 底缘内。 */
     function syncSidefoldRows() {
       if (sidefoldRaf) return
       sidefoldRaf = requestAnimationFrame(() => {
@@ -668,16 +680,32 @@ window.__ModuleLoader__.load({
           const rFiles = rows[1]
           const rCost = rows[2]
           const rSettings = rows[3]
-          /* 顶部：行1 = logoRow 下缘；行2 = regionArea 顶，但不高于行1+30（折叠组1 后防叠） */
+          /* 顶部：行1 = logoRow 下缘（找不到 logoRow 就贴 root 顶）；行2 = regionArea 顶+30，
+             但不低于行1+30（折叠组1 后 region 上移，两值可能逼近，钳制防叠） */
           const topAnchor = logo ? logo.getBoundingClientRect().bottom : rootRect.top
           placeRow(rTop, left, topAnchor + 4, width)
           const filesAnchor = region ? region.getBoundingClientRect().top : topAnchor + 30
-          placeRow(rFiles, left, Math.max(filesAnchor + 4, topAnchor + 34), width)
-          /* 底部：行3/行4 连排在内容上方（footerActions padding-top 60px 让位区内），
-             全折叠塌缩时钳到 root 底缘，既贴底又不溢出、互不重叠 */
+          placeRow(rFiles, left, Math.max(filesAnchor + 30, topAnchor + 34), width)
+          /* 底部：行3 = footerActions 顶（让位区内）；行4 = 第一个可见入口行头顶
+             （margin-top:30 让位区），缺席时回退链：余额块底 → 设置区头顶 → faTop+34。
+             全部钳在 root 底缘内（塌缩/内容减少时贴底不溢出），行3/行4 间距 ≥30。 */
           const foot = root.querySelector('.hHd-Xa_footerActions') ?? root.querySelector('.hHd-Xa_footArea')
-          const footTop = foot ? foot.getBoundingClientRect().top : rootRect.bottom - 60
-          const rSettingsTop = Math.min(footTop + 32, rootRect.bottom - 26 - 2)
+          const footTop = foot ? foot.getBoundingClientRect().top : rootRect.bottom - 62
+          const cmStack = root.querySelector('.cm-footer-stack')
+          const cmVisible = cmStack && cmStack.getBoundingClientRect().height > 0
+          let firstEntry = null
+          for (const el of root.querySelectorAll('.dsh-session-kit-sidebar-row')) {
+            if (el.getBoundingClientRect().height > 0) { firstEntry = el; break }
+          }
+          const settingsArea = root.querySelector('.hHd-Xa_settingsArea')
+          const settingsVisible = settingsArea && settingsArea.getBoundingClientRect().height > 0
+          let rSettingsTop
+          if (firstEntry) rSettingsTop = firstEntry.getBoundingClientRect().top - 28
+          else if (cmVisible) rSettingsTop = cmStack.getBoundingClientRect().bottom + 2
+          else if (settingsVisible) rSettingsTop = settingsArea.getBoundingClientRect().top - 28
+          else rSettingsTop = footTop + 34
+          rSettingsTop = Math.min(rSettingsTop, rootRect.bottom - 26 - 2)
+          rSettingsTop = Math.max(rSettingsTop, footTop + 32)
           const rCostTop = Math.min(footTop + 2, rSettingsTop - 30)
           placeRow(rSettings, left, rSettingsTop, width)
           placeRow(rCost, left, rCostTop, width)
@@ -765,9 +793,11 @@ window.__ModuleLoader__.load({
           for (const inner of actions.children) {
             if (inner.nodeType !== 1 || inner.classList.contains('dsh-session-kit-sidebar-row')) continue
             for (const deep of inner.children) {
-              if (deep.nodeType !== 1 || deep.dataset.dskForeign || sidefoldTokenKnown(deep)) continue
+              if (deep.nodeType !== 1 || deep.dataset.dskForeign || deep.classList.contains('dsh-session-kit-sidebar-row')) continue
               if (typeof deep.className !== 'string' || deep.className.trim() === '') continue
-              deep.dataset.dskForeign = 'settings'
+              /* footer 入口区里的非入口可见块（余额条等第三方块）→「费用」组：
+                 跟随余额条的位置语义，费用折叠时一并收起。 */
+              deep.dataset.dskForeign = 'cost'
             }
           }
         }
@@ -799,7 +829,9 @@ window.__ModuleLoader__.load({
             try { markSidefoldForeign() } catch { /* ignore */ }
             syncSidefoldRows()
           })
-          mo.observe(root, { childList: true, subtree: true })
+          /* attributes 也要听：入口显隐（style/class/hidden 切换）不改 childList，
+             但会改变可见内容集合，行位置必须跟随重算。 */
+          mo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'hidden'] })
         } catch { /* ignore */ }
         try {
           const ro = new ResizeObserver(() => syncSidefoldRows())
