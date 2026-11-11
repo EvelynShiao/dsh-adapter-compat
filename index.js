@@ -103,6 +103,7 @@ import { healDeadAttachments } from './attachments.js'
 import { slimSession } from './slim.js'
 import { repairEvents, scanFile, describeGap, healStructure, healToolOrphans, scanToolOrphans } from './repair.js'
 import { installOrderRoute } from './order.js'
+import { installSidebarFoldRoute } from './sidebar-fold.js'
 import {
   installEgressNormalizer as installEgressNormalizerImpl,
   stripLeadingThinking as stripLeadingThinkingPure,
@@ -4634,6 +4635,14 @@ export function apply(ctx, config = {}) {
   // -3.6) 侧栏排序：路由（工作区/会话顺序，只读写宿主 registry，不碰 workspace.json）
   try {
     installOrderRoute(ctx, config)
+  } catch {
+    /* 路由注册失败绝不拖垮 apply */
+  }
+
+  // -3.62) 侧边栏四组折叠：存储与路由（GET/POST /dsh-adapter-compat/sidebar-groups）
+  //        折叠本体在浏览器半身（client.js），这里只管 ~/.dsh/adapter-compat-sidebar.json。
+  try {
+    installSidebarFoldRoute(ctx, config)
   } catch {
     /* 路由注册失败绝不拖垮 apply */
   }
