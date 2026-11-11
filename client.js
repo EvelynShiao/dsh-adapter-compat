@@ -556,19 +556,21 @@ window.__ModuleLoader__.load({
     ]
 
     const SIDEFOLD_CSS = [
-      /* 让位：浮层激活期间给三角行腾出空位。全部参数化以容忍内容显隐组合：
-         regionArea padding 60 = 行2（30）+ 内容间隙；footerActions padding 62 =
-         行3+行4 连排空间（费用块缺席/被折时两行都在这里）；
-         第一个入口行 margin-top 30 = 行4 的让位区（~ 兄弟抵消后续行），
-         费用块被折叠或插件关闭时选择器自然失效/生效，无需 JS 干预文档流。 */
+      /* 让位：两段式——基础态紧凑（三角行贴内容头顶 4px），对应组折叠/内容缺席时才放大
+         （行需要连排空间）。全部由 CSS 状态选择器切换，JS 不干预文档流。
+         regionArea：基础 34（行2=region 顶+4 贴文件夹头顶）；foldTop 时 60（region 上移
+         到 logoRow 底，行2 被钳到行1+30，需要更深的让位）。 */
       'html[data-dsk-sidefold="1"] .hHd-Xa_newSession { margin-top: 34px !important; }',
-      'html[data-dsk-sidefold="1"] .hHd-Xa_regionArea { padding-top: 60px !important; flex: 1 1 auto; min-height: 0; }',
-      'html[data-dsk-sidefold="1"] .hHd-Xa_footerActions { padding-top: 62px !important; }',
+      'html[data-dsk-sidefold="1"] .hHd-Xa_regionArea { padding-top: 34px !important; flex: 1 1 auto; min-height: 0; }',
+      'html[data-dsk-fold-top="1"] .hHd-Xa_regionArea { padding-top: 60px !important; }',
+      /* footerActions：基础 32（行3 贴余额头顶）；费用被折或插件关闭（:not(:has)）时 64
+         （行3+行4 连排）。行4 的让位挂在余额块 margin-bottom:30 上——不随入口行显隐失效，
+         修「下方设置折叠后行4 被钳回余额条内」。 */
+      'html[data-dsk-sidefold="1"] .hHd-Xa_footerActions { padding-top: 32px !important; }',
+      'html[data-dsk-fold-cost="1"] .hHd-Xa_footerActions,',
+      'html[data-dsk-sidefold="1"] .hHd-Xa_footerActions:not(:has(.cm-footer-stack)) { padding-top: 64px !important; }',
+      'html[data-dsk-sidefold="1"] .hHd-Xa_footerActions .cm-footer-stack { margin-bottom: 30px !important; }',
       'html[data-dsk-sidefold="1"] .hHd-Xa_footArea { min-height: 68px !important; }',
-      'html[data-dsk-sidefold="1"] .hHd-Xa_footerActions .dsh-session-kit-sidebar-row { margin-top: 30px !important; }',
-      'html[data-dsk-sidefold="1"] .hHd-Xa_footerActions .dsh-session-kit-sidebar-row ~ .dsh-session-kit-sidebar-row { margin-top: 0 !important; }',
-      /* session-kit 关闭（无入口行）但余额块还在：行4 落在余额块下，给设置区让位 */
-      'html[data-dsk-sidefold="1"] .hHd-Xa_footArea:has(.cm-footer-stack):not(:has(.dsh-session-kit-sidebar-row)) .hHd-Xa_settingsArea { margin-top: 30px !important; }',
       /* 折叠成员（展开态 data 值为 "0"，规则不命中） */
       'html[data-dsk-fold-top="1"] .hHd-Xa_newSession,',
       'html[data-dsk-fold-top="1"] .hHd-Xa_panelList,',
@@ -680,15 +682,16 @@ window.__ModuleLoader__.load({
           const rFiles = rows[1]
           const rCost = rows[2]
           const rSettings = rows[3]
-          /* 顶部：行1 = logoRow 下缘（找不到 logoRow 就贴 root 顶）；行2 = regionArea 顶+30，
-             但不低于行1+30（折叠组1 后 region 上移，两值可能逼近，钳制防叠） */
+          /* 顶部：行1 = logoRow 下缘（找不到 logoRow 就贴 root 顶）；行2 = regionArea 顶+4
+             （贴文件夹头顶，配合基础 padding 34），折叠组1 后 region 上移、由 +30 钳制防叠
+             （配合 foldTop 态 padding 60）。 */
           const topAnchor = logo ? logo.getBoundingClientRect().bottom : rootRect.top
           placeRow(rTop, left, topAnchor + 4, width)
           const filesAnchor = region ? region.getBoundingClientRect().top : topAnchor + 30
-          placeRow(rFiles, left, Math.max(filesAnchor + 30, topAnchor + 34), width)
-          /* 底部：行3 = footerActions 顶（让位区内）；行4 = 第一个可见入口行头顶
-             （margin-top:30 让位区），缺席时回退链：余额块底 → 设置区头顶 → faTop+34。
-             全部钳在 root 底缘内（塌缩/内容减少时贴底不溢出），行3/行4 间距 ≥30。 */
+          placeRow(rFiles, left, Math.max(filesAnchor + 4, topAnchor + 30), width)
+          /* 底部：行3 = 费用可见时余额头顶（faTop+2，padding 32 让位），费用缺席/被折时
+             贴行4（行4-30，padding 64 连排区）；行4 = 第一可见入口行头顶（余额 margin-bottom
+             30 让位区），缺席回退链：余额块底 → 设置区头顶 → faTop+34。全部钳 root 底缘内。 */
           const foot = root.querySelector('.hHd-Xa_footerActions') ?? root.querySelector('.hHd-Xa_footArea')
           const footTop = foot ? foot.getBoundingClientRect().top : rootRect.bottom - 62
           const cmStack = root.querySelector('.cm-footer-stack')
@@ -706,7 +709,7 @@ window.__ModuleLoader__.load({
           else rSettingsTop = footTop + 34
           rSettingsTop = Math.min(rSettingsTop, rootRect.bottom - 26 - 2)
           rSettingsTop = Math.max(rSettingsTop, footTop + 32)
-          const rCostTop = Math.min(footTop + 2, rSettingsTop - 30)
+          const rCostTop = cmVisible ? footTop + 2 : Math.min(footTop + 2, rSettingsTop - 30)
           placeRow(rSettings, left, rSettingsTop, width)
           placeRow(rCost, left, rCostTop, width)
         } catch {
