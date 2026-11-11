@@ -185,6 +185,12 @@ window.__ModuleLoader__.load({
       invReasonFailed: '删除出错',
       invFreed: '已删除 {count} 条，释放 {mb} MB',
       invPurgeFailed: '清理失败',
+      invOrphanTitle: '孤儿投影（有缓存、无会话文件）',
+      invOrphanDesc: '删除方没清理标题缓存留下的残影——任何列表都不会显示它们，只有这里看得见。清理 = 移入备份目录（session_projcache/orphans-backup-*），确认无误后可整目录手工删。',
+      invOrphanClean: '清理孤儿投影',
+      invOrphanConfirm: '确认移入备份（{count} 条）',
+      invOrphanDone: '已移入备份 {count} 条（{kb} KB）→ {dir}',
+      invOrphanTooFresh: '{count} 条太新（<5 分钟）跳过，防新建竞态',
       invUnknown: '未知',
       /* 会话日志修复分区文案（2026-10-13） */
       healNav: '会话日志修复',
@@ -830,6 +836,7 @@ window.__ModuleLoader__.load({
       const [force, setForce] = useState(false)
       const [skipped, setSkipped] = useState([])
       const [blocked, setBlocked] = useState([])
+      const [orphanConfirming, setOrphanConfirming] = useState(false)
 
       const load = useCallback(async () => {
         try {
@@ -872,6 +879,38 @@ window.__ModuleLoader__.load({
         } finally {
           setBusy(false)
           setConfirming(false)
+        }
+      }
+
+      /** 孤儿投影清理（2026-11-11）：POST purge 带 purgeOrphanProjections，写死 write:true
+          ——按钮本身已带两步确认（orphanConfirming），干跑对用户没有意义。 */
+      const purgeOrphans = async () => {
+        setBusy(true)
+        setNote('')
+        try {
+          const r = await fetchJson(INVISIBLE_PURGE, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ purgeOrphanProjections: true, write: true }),
+          })
+          if (r.ok && r.data && r.data.ok) {
+            let msg = ZH.invOrphanDone
+              .replace('{count}', String(r.data.purgedCount ?? 0))
+              .replace('{kb}', String(r.data.purgedKB ?? 0))
+              .replace('{dir}', String(r.data.backupDir ?? '-'))
+            if (Array.isArray(r.data.skippedFresh) && r.data.skippedFresh.length > 0) {
+              msg += ' · ' + ZH.invOrphanTooFresh.replace('{count}', String(r.data.skippedFresh.length))
+            }
+            setNote(msg)
+            await load()
+          } else {
+            setNote(ZH.invPurgeFailed + '：' + String(r.data && r.data.error ? r.data.error : ZH.invUnknown))
+          }
+        } catch (e) {
+          setNote(ZH.invPurgeFailed + '：' + String(e && e.message ? e.message : e))
+        } finally {
+          setBusy(false)
+          setOrphanConfirming(false)
         }
       }
 
@@ -930,6 +969,24 @@ window.__ModuleLoader__.load({
       }
 
       if (!data) return wrap(h('div', { className: 'ac-row-desc' }, note || ZH.invScanning))
+
+      /* 孤儿投影小节（2026-11-11）：有缓存、无活体——任何列表都不显示，这里是它们
+         唯一能被看见的地方。登记表异常（ok!==true）时照样渲染：判定不依赖登记表。 */
+      const orphanList = Array.isArray(data.orphanProjections) ? data.orphanProjections : []
+      const orphanCount = data.orphanCount ?? orphanList.length
+      const orphanSection = orphanCount > 0 ? h('div', { className: 'ac-report' },
+        h('div', null, h('b', null, `${ZH.invOrphanTitle}：${orphanCount} 个（${data.orphanKB ?? 0} KB）`)),
+        h('div', { className: 'ac-row-desc' }, ZH.invOrphanDesc),
+        ...orphanList.slice(0, 20).map((o) => h('div', { key: o.id, style: { fontFamily: 'monospace' } },
+          `${String(o.id).slice(0, 26)}  ${o.sizeKB}KB  ${o.mtime}（${o.ageMinutes} 分钟前）`)),
+        orphanList.length > 20 ? h('div', { className: 'ac-row-desc' }, `（还有 ${orphanList.length - 20} 条没列出，清理是一起清的）`) : null,
+        h('div', { className: 'ac-row' },
+          h('div', { className: 'ac-row-desc', style: { flex: 1 } }, orphanConfirming ? ZH.invOrphanConfirm.replace('{count}', String(orphanCount)) : ''),
+          orphanConfirming
+            ? h('button', { className: 'ac-btn', disabled: busy, onClick: () => void purgeOrphans() }, ZH.invOrphanConfirm.replace('{count}', String(orphanCount)))
+            : h('button', { className: 'ac-btn', disabled: busy, onClick: () => setOrphanConfirming(true) }, ZH.invOrphanClean),
+          orphanConfirming ? h('button', { className: 'ac-btn', onClick: () => setOrphanConfirming(false) }, ZH.invCancel) : null)) : null
+
       if (data.ok !== true) {
         /* 保险拦下（登记表疑似异常）：讲清「为什么没删 / 共多少条 / 怎么强行清」，不再只丢一句错。 */
         const ids = Array.isArray(data.anomalyIds) ? data.anomalyIds : []
@@ -943,6 +1000,7 @@ window.__ModuleLoader__.load({
               : null),
           forceRow,
           blockedBlock,
+          orphanSection,
           h('div', { className: 'ac-row-desc' }, note || ZH.invNote))
       }
 
@@ -990,6 +1048,7 @@ window.__ModuleLoader__.load({
           confirming ? h('button', { className: 'ac-btn', onClick: () => setConfirming(false) }, ZH.invCancel) : null))
 
       return wrap(summary, anomalyNote, familyNote, forceRow, actionRow, ...rows, more, blockedBlock, reasonBlock,
+        orphanSection,
         h('div', { className: 'ac-row-desc' }, note || ZH.invNote))
     }
 

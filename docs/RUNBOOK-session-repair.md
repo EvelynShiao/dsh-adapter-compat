@@ -199,6 +199,14 @@ Session.fromRestore(SessionId(headerRow.id), decoded, headerRow, inh, 'detached'
 // 7. 终验：再读 F 过一遍校验器
 ```
 
+> **孤儿投影巡检（2026-11-11 起已进面板）**：第 6 步只覆盖「本插件自己删的会话」——宿主原生删除、
+> session-kit、true-delete、复活链中间品删活体时都不会清 projcache，孤儿（有投影、无活体）就此积攒。
+> 现在设置页「不可见会话」面板会反向列出它们（GET /invisible 带 orphanProjections，判定只看盘上
+> 活体文件、独立于登记表健康度），POST /invisible/purge 带 `purgeOrphanProjections:true` 即清——
+> age≥5 分钟防新建竞态，移入 `session_projcache/orphans-backup-<ts>/` 备份先行，确认无误后可整目录删。
+> 2026-11-11 首次手工清理：17 个孤儿（含「新的大肥鱼」三个同标题分身），备份在
+> `.dsh\work\1\ofm-investigate\projcache-ghost-backup-20261111-1643\`。
+
 多帧 zstd 写法（保持宿主格式：**头一帧、事件一帧**）：
 
 ```js

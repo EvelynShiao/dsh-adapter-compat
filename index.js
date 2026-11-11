@@ -3739,6 +3739,48 @@ export function scanInvisibleSessions(home = dshHomeDir(), options = {}) {
   }
 }
 
+/**
+ * 孤儿投影扫描（2026-11-11）：投影缓存里有、活体目录里没有的标题缓存条目。
+ *
+ * 背景：projcache 是本插件的私有标题缓存（宿主核心零引用、无淘汰机制），
+ * 删除方多元（宿主原生删除/session-kit/true-delete/复活链中间品）且大多不认识它
+ * ——谁删了活体不删投影，谁就留下一个永久孤儿。「不可见会话」的宇宙是活体目录，
+ * 孤儿投影没活体，永远进不了那边的清单，只能在这里反向清。
+ *
+ * 判定只看盘上活体文件，不依赖宿主登记表——登记表异常（workspace.json 读不到/
+ * 可见数为 0）时本扫描照常可信，与 scanInvisibleSessions 的保险闸互不牵连。
+ */
+export function scanOrphanProjections(home = dshHomeDir()) {
+  const projDir = `${home}/storages/session_projcache/sessions`
+  const live = sessionDirs(home)
+  let names = []
+  try { names = readdirSync(projDir) } catch {
+    return { ok: false, reason: '投影目录不存在（还没有任何标题缓存）', orphans: [], orphanCount: 0, orphanKB: 0 }
+  }
+  const out = []
+  let totalBytes = 0
+  for (const name of names) {
+    const m = /^session-([0-9a-f-]{36})\.json$/.exec(name)
+    if (!m) continue
+    const sid = `session-${m[1]}`
+    if (live.has(sid)) continue
+    let sizeBytes = 0
+    let mtimeMs = 0
+    try { const st = statSync(`${projDir}/${name}`); sizeBytes = st.size; mtimeMs = st.mtimeMs } catch { continue }
+    totalBytes += sizeBytes
+    out.push({
+      id: sid,
+      sizeKB: +(sizeBytes / 1024).toFixed(1),
+      sizeBytes,
+      mtimeMs,
+      mtime: new Date(mtimeMs).toISOString().slice(0, 16).replace('T', ' '),
+      ageMinutes: Math.round((Date.now() - mtimeMs) / 60000),
+    })
+  }
+  out.sort((a, b) => b.sizeBytes - a.sizeBytes)
+  return { ok: true, orphans: out, orphanCount: out.length, orphanKB: +(totalBytes / 1024).toFixed(1) }
+}
+
 /* ── F线（2026-10-24）：子代理对话管理 ──────────────────────────
    用户定位：subagent 会话（workflow/subagent 工具派生的子任务）对他「无意义/不可见」
    ——侧栏从不显示、任务完成后就是死数据。权威判据 = 头帧 origin==='subagent'
@@ -3861,7 +3903,19 @@ export function installInvisibleRoute(ctx, config = {}) {
           const url = new URL(req.url, 'http://127.0.0.1')
           const force = url.searchParams.get('force') === '1'
           const withFamily = url.searchParams.get('family') !== '0'
-          return reply(res, 200, { ok: true, value: scanInvisibleSessions(dshHomeDir(), { force, withFamily }) })
+          /* 孤儿投影段（2026-11-11）独立于登记表健康度：登记表异常时 sessions 清单会被
+             保险闸吞掉，但孤儿投影的判定只看盘上活体文件，照常给出、照常可清。 */
+          const scan = scanInvisibleSessions(dshHomeDir(), { force, withFamily })
+          const orphans = scanOrphanProjections(dshHomeDir())
+          return reply(res, 200, {
+            ok: true,
+            value: {
+              ...scan,
+              orphanProjections: orphans.orphans ?? [],
+              orphanCount: orphans.orphanCount ?? 0,
+              orphanKB: orphans.orphanKB ?? 0,
+            },
+          })
         } catch (e) { return reply(res, 500, { ok: false, error: String(e?.message ?? e) }) }
       },
     })
@@ -3882,6 +3936,60 @@ export function installInvisibleRoute(ctx, config = {}) {
              仍然硬拒绝：登记表里可见/归档的会话、正在使用的当前会话。 */
           const force = parsed?.force === true
           const home = dshHomeDir()
+          /* ── 孤儿投影清理（2026-11-11）：只碰「有投影、无活体」的标题缓存条目，
+             与下面的会话本体删除互不掺和——不走 guardDeletion（那是会话本体语义），
+             不受登记表健康度影响（判定只看盘上活体文件）。备份先行：rename 进
+             orphans-backup-<ts>/（确认无误后可整目录手工删）。age≥5min 防新建竞态：
+             极端时序下投影先写、活体目录后见，太新的不动。 */
+          if (parsed.purgeOrphanProjections === true) {
+            const oscan = scanOrphanProjections(home)
+            if (oscan.ok !== true) {
+              return reply(res, 200, { ok: true, purgeOrphanProjections: true, dryRun: parsed.write !== true, purgedCount: 0, purgedKB: 0, backupDir: null, note: oscan.reason })
+            }
+            const minAge = Number.isFinite(parsed.minAgeMinutes) ? parsed.minAgeMinutes : 5
+            const now = Date.now()
+            const fresh = oscan.orphans.filter((o) => now - o.mtimeMs < minAge * 60000)
+            const targets = parsed.write === true
+              ? oscan.orphans.filter((o) => now - o.mtimeMs >= minAge * 60000)
+              : oscan.orphans
+            if (parsed.write !== true) {
+              return reply(res, 200, {
+                ok: true,
+                purgeOrphanProjections: true,
+                dryRun: true,
+                planned: targets.map((o) => ({ id: o.id, sizeKB: o.sizeKB })),
+                skippedFresh: fresh.map((o) => ({ id: o.id, reason: 'too-fresh', ageMinutes: o.ageMinutes })),
+                purgedCount: 0,
+                purgedKB: 0,
+                backupDir: null,
+              })
+            }
+            const backupDir = `${home}/storages/session_projcache/orphans-backup-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`
+            mkdirSync(backupDir, { recursive: true })
+            const results = []
+            let purgedKB = 0
+            for (const o of targets) {
+              try {
+                renameSync(`${home}/storages/session_projcache/sessions/${o.id}.json`, `${backupDir}/${o.id}.json`)
+                purgedKB += o.sizeKB
+                results.push({ id: o.id, status: 'purged', sizeKB: o.sizeKB })
+              } catch (e) {
+                results.push({ id: o.id, status: 'failed', error: String(e?.message ?? e) })
+              }
+            }
+            const purgedCount = results.filter((r) => r.status === 'purged').length
+            appendCompatLog(`orphan-projection purge: moved ${purgedCount}/${oscan.orphanCount} → ${backupDir}${fresh.length ? ` (skipped fresh ${fresh.length})` : ''}`)
+            return reply(res, 200, {
+              ok: true,
+              purgeOrphanProjections: true,
+              dryRun: false,
+              results,
+              purgedCount,
+              purgedKB: +purgedKB.toFixed(1),
+              backupDir,
+              skippedFresh: fresh.map((o) => ({ id: o.id, reason: 'too-fresh', ageMinutes: o.ageMinutes })),
+            })
+          }
           const scan = scanInvisibleSessions(home, { force, withFamily: true })
           if (scan.ok !== true) {
             return reply(res, 409, {
