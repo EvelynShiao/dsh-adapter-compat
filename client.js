@@ -599,6 +599,37 @@ window.__ModuleLoader__.load({
       return out
     }
 
+    /* 组员选择器：空组检测用（某组一个成员都数不出来 → 行自动隐藏）。
+       foldFiles 特判=regionArea 直接孩子。名单与折叠 CSS 的隐藏名单保持同源。 */
+    const SIDEFOLD_MEMBERS = {
+      foldTop: ['.hHd-Xa_newSession', '.hHd-Xa_panelList', '[data-dsk-foreign="top"]'],
+      foldFiles: [],
+      foldCost: ['.cm-footer-stack', '[data-dsk-foreign="cost"]'],
+      foldSettings: ['.dsh-session-kit-sidebar-row', '.hHd-Xa_settingsArea', '[data-dsk-foreign="settings"]'],
+    }
+
+    /* 空组检测（2026-11-12 Evelyn 加需求：组员全没了行就别死守）：
+       展开态要求组员「可见」；折叠态只要求组员「存在」——折叠时组员正被自己的
+       CSS 藏着，按可见性会误判成空组、把行也藏掉，就再也展不开了。 */
+    function sidefoldHasContent(key, root) {
+      const folded = sidefoldState[key] === true
+      const isShown = (el) => (folded ? true : el.getBoundingClientRect().height > 0)
+      if (key === 'foldFiles') {
+        const region = root.querySelector('.hHd-Xa_regionArea')
+        if (!region) return false
+        for (const el of region.children) {
+          if (el.nodeType === 1 && isShown(el)) return true
+        }
+        return false
+      }
+      for (const sel of SIDEFOLD_MEMBERS[key]) {
+        for (const el of root.querySelectorAll(sel)) {
+          if (isShown(el)) return true
+        }
+      }
+      return false
+    }
+
     function ensureSidefoldStyle() {
       let el = document.querySelector(`style[data-plugin="${SIDEFOLD_STYLE_ID}"]`)
       if (!el) {
@@ -682,16 +713,31 @@ window.__ModuleLoader__.load({
           const rFiles = rows[1]
           const rCost = rows[2]
           const rSettings = rows[3]
+          /* 空组自动隐行（2026-11-12 Evelyn：组员全没了就别死守，尤其费用组——
+             余额块是外来插件给的，插件一关行就悬空指着空气）。
+             组员回来（MutationObserver/ResizeObserver 触发重算）行自动回来。 */
+          const showTop = sidefoldHasContent('foldTop', root)
+          const showFiles = sidefoldHasContent('foldFiles', root)
+          const showCost = sidefoldHasContent('foldCost', root)
+          const showSettings = sidefoldHasContent('foldSettings', root)
+          rTop.style.display = showTop ? '' : 'none'
+          rFiles.style.display = showFiles ? '' : 'none'
+          rCost.style.display = showCost ? '' : 'none'
+          rSettings.style.display = showSettings ? '' : 'none'
           /* 顶部：行1 = logoRow 下缘（找不到 logoRow 就贴 root 顶）；行2 = regionArea 顶+4
              （贴文件夹头顶，配合基础 padding 34），折叠组1 后 region 上移、由 +30 钳制防叠
-             （配合 foldTop 态 padding 60）。 */
+             （配合 foldTop 态 padding 60）；行1 空组隐藏时钳制不生效。 */
           const topAnchor = logo ? logo.getBoundingClientRect().bottom : rootRect.top
-          placeRow(rTop, left, topAnchor + 4, width)
-          const filesAnchor = region ? region.getBoundingClientRect().top : topAnchor + 30
-          placeRow(rFiles, left, Math.max(filesAnchor + 4, topAnchor + 30), width)
+          if (showTop) placeRow(rTop, left, topAnchor + 4, width)
+          if (showFiles) {
+            const filesAnchor = region ? region.getBoundingClientRect().top : topAnchor + 30
+            const floorTop = showTop ? topAnchor + 30 : filesAnchor + 4
+            placeRow(rFiles, left, Math.max(filesAnchor + 4, floorTop), width)
+          }
           /* 底部：行3 = 费用可见时余额头顶（faTop+2，padding 32 让位），费用缺席/被折时
              贴行4（行4-30，padding 64 连排区）；行4 = 第一可见入口行头顶（余额 margin-bottom
-             30 让位区），缺席回退链：余额块底 → 设置区头顶 → faTop+34。全部钳 root 底缘内。 */
+             30 让位区），缺席回退链：余额块底 → 设置区头顶 → faTop+34。全部钳 root 底缘内。
+             任一行空组隐藏时，相邻行的钳制自动失效。 */
           const foot = root.querySelector('.hHd-Xa_footerActions') ?? root.querySelector('.hHd-Xa_footArea')
           const footTop = foot ? foot.getBoundingClientRect().top : rootRect.bottom - 62
           const cmStack = root.querySelector('.cm-footer-stack')
@@ -702,16 +748,22 @@ window.__ModuleLoader__.load({
           }
           const settingsArea = root.querySelector('.hHd-Xa_settingsArea')
           const settingsVisible = settingsArea && settingsArea.getBoundingClientRect().height > 0
-          let rSettingsTop
-          if (firstEntry) rSettingsTop = firstEntry.getBoundingClientRect().top - 28
-          else if (cmVisible) rSettingsTop = cmStack.getBoundingClientRect().bottom + 2
-          else if (settingsVisible) rSettingsTop = settingsArea.getBoundingClientRect().top - 28
-          else rSettingsTop = footTop + 34
-          rSettingsTop = Math.min(rSettingsTop, rootRect.bottom - 26 - 2)
-          rSettingsTop = Math.max(rSettingsTop, footTop + 32)
-          const rCostTop = cmVisible ? footTop + 2 : Math.min(footTop + 2, rSettingsTop - 30)
-          placeRow(rSettings, left, rSettingsTop, width)
-          placeRow(rCost, left, rCostTop, width)
+          let rSettingsTop = null
+          if (showSettings) {
+            if (firstEntry) rSettingsTop = firstEntry.getBoundingClientRect().top - 28
+            else if (cmVisible) rSettingsTop = cmStack.getBoundingClientRect().bottom + 2
+            else if (settingsVisible) rSettingsTop = settingsArea.getBoundingClientRect().top - 28
+            else rSettingsTop = footTop + 34
+            rSettingsTop = Math.min(rSettingsTop, rootRect.bottom - 26 - 2)
+            rSettingsTop = Math.max(rSettingsTop, footTop + 32)
+            placeRow(rSettings, left, rSettingsTop, width)
+          }
+          if (showCost) {
+            const rCostTop = cmVisible || rSettingsTop === null
+              ? footTop + 2
+              : Math.min(footTop + 2, rSettingsTop - 30)
+            placeRow(rCost, left, rCostTop, width)
+          }
         } catch {
           /* 定位失败下一轮重试 */
         }
@@ -1980,7 +2032,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            marker: 'adapter-client-9999.9.43-sidefold',
+            marker: 'adapter-client-9999.9.45-sidefold',
             nested: nestedExitActive,
             fallback: typeof standaloneExitDispose === 'function',
             skExtraEntries,
