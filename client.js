@@ -23,7 +23,7 @@ window.__ModuleLoader__.load({
     const { createElement: h, useState, useEffect, useCallback, useRef } = React
 
     const NS = 'adapter-compat'
-    const inject = ['slots']
+    const inject = ['slots', 'locale']
     const LIST_ROUTE = '/dsh-adapter-compat/slim-list'
     const MOVE_ROUTE = '/dsh-adapter-compat/move-session'
     /* 侧栏排序（2026-10-11）：顺序真源在宿主 workspace.json，三条路由都只读写宿主 registry。 */
@@ -35,7 +35,7 @@ window.__ModuleLoader__.load({
     /* 官方侧栏 view store 的持久化键（手动顺序存在这里；写它 = 界面活体重排）。 */
     const VIEW_KEY = 'dsh.workspace.view.v5'
 
-    /* 文案写死中文：这是 Evelyn 的私人插件，不值得为单用户铺 locale。 */
+    /* 文案走宿主 locale 服务（2026-11-12 用户要求英文界面全英）：ZH/EN 双字典，缺失键回落中文。 */
     const ZH = {
       nav: '会话搬家',
       desc: '把一条会话从当前工作区搬到另一个工作区（数据全在本机）',
@@ -133,7 +133,7 @@ window.__ModuleLoader__.load({
       invCleanTitle: '只处理「文件存在但侧栏看不见」的会话',
       invRefresh: '刷新',
       invScanning: '正在扫描…',
-      invReadFailed: '读取失败',
+      invReadFailed: '读取失败$',
       invScanUnavailable: '扫描不可用',
       invClean: '一键清理不可见会话',
       invCleanForce: '强制清理不可见会话',
@@ -146,7 +146,7 @@ window.__ModuleLoader__.load({
       subDesc: 'workflow/子代理工具派生的子任务会话——侧栏从不显示，任务完成后就是死数据',
       subCleanTitle: '只处理 origin=subagent 的会话（自动跳过正在运行的）',
       subScanning: '正在扫描…',
-      subReadFailed: '读取失败',
+      subReadFailed: '读取失败$',
       subEmpty: '没有子代理会话——干净',
       subSummary: '子代理会话 {count} 条 · 共 {mb} MB',
       subLiveNote: '（{count} 条正在运行，会跳过）',
@@ -191,7 +191,7 @@ window.__ModuleLoader__.load({
       invOrphanConfirm: '确认移入备份（{count} 条）',
       invOrphanDone: '已移入备份 {count} 条（{kb} KB）→ {dir}',
       invOrphanTooFresh: '{count} 条太新（<5 分钟）跳过，防新建竞态',
-      invUnknown: '未知',
+      invUnknown: '未知$',
       /* 会话日志修复分区文案（2026-10-13） */
       healNav: '会话日志修复',
       healMain: '清理与体检',
@@ -246,6 +246,289 @@ window.__ModuleLoader__.load({
       handle: '拖我排序',
       toTop: '上移',
       toBottom: '下移',
+      exitNever: 'never · 不走网页（压缩请求直接拒绝）',
+      exitAuto: 'auto · 超过阈值才打包 .txt（推荐）',
+      exitAlways: 'always · 一律打包 .txt 上传',
+      foldTop: '上方设置',
+      foldFiles: '文件',
+      foldCost: '费用',
+      foldSettings: '下方设置',
+      unknownReason: '未知原因',
+      unknown: '未知',
+      stateExpand: '展开',
+      stateCollapse: '折叠',
+      expandAllNote: '四组全部展开，恢复默认侧边栏',
+      runBtn: '执行',
+      loadingPrefs: '读取设置…',
+      on: '开启',
+      off: '关闭',
+      ldwIndependentDesc: '独立值，仅 LDW 车道生效；与上方全局开关互不影响',
+      ldwFollowLabel: 'LDW 车道开关跟随全局',
+      ldwFollowDesc: '默认跟随全局开关（压缩出口/协议对 LDW 车道同样生效）；点成「独立设置中」后，下方键改用 LDW 段自己的值',
+      followGlobal: '跟随全局',
+      followIndependent: '独立设置中',
+      saving: '保存中…',
+      verStatsDesc: '分叉=复制父会话历史，这里按家族统计体积',
+      statizing: '正在统计…',
+      rootTag: '根',
+      branchTag: '分叉',
+      orphanTag: '·孤',
+      cleanOld: '清理旧版本',
+      savedNextBoot: '已保存 · 下次开机生效',
+      okSuffix: '完成',
+      failedSuffix: '失败',
+      running: '执行中…',
+      healBrokenNote: '（断流/附件加载失败留下的残缺；发送前扫会兜底，也可点下面按钮根治到盘上）',
+      healRejectNote: '（发给 DeepSeek 官方 API 会整轮拒收；出口守卫会替换成占位，也可点下面按钮根治到盘上）',
+      unitSec: '秒',
+      unitSecOnce: '秒（0 = 只在启动跑一次）',
+      ungrouped: '(未分组)',
+    }
+
+    /* EN 字典：与 ZH 逐键对齐；触发词示例（中文名标注、KB/NL 句式）按功能语义保留中文原文。 */
+    const EN = {
+      nav: 'Move sessions',
+      desc: 'Move a session from the current workspace to another one (all data stays local)',
+      open: 'Open',
+      loading: 'Loading session list…',
+      loadFailed: 'Failed to load',
+      retry: 'Retry',
+      close: 'Close',
+      target: 'Target workspace',
+      targetPlaceholder: 'Pick the workspace to move to',
+      move: 'Move',
+      moving: 'Moving…',
+      done: 'Moved to "{target}"',
+      current: 'Current',
+      sessionsIn: '{count} sessions',
+      empty: 'No sessions yet',
+      errLive: 'This session is running — stop it before moving',
+      errNotFound: 'Session or target workspace not found (may have been deleted)',
+      errOther: 'Move failed',
+      orderNav: 'Sidebar ordering',
+      exitNav: 'Compaction exit / NL protocol / version pager',
+      exitDesc: 'Switches for the comp-summary .txt exit, KB/general NL protocol and other LDW-lane switches (written to the config.ldw section), the title prefix, and the visibility of the "version pager" button (takes effect immediately)',
+      directThresholdLabel: '.txt direct-send threshold (global)',
+      directThresholdDesc: 'The API channel never attaches files (HTTP JSON straight through); this value is for display and future compatibility only. The LDW side uses it to decide when large inputs go as .txt',
+      txtChunkLabel: 'Attachment chunk size (LDW)',
+      txtChunkDesc: 'Max bytes per .txt part; the LDW side splits large attachments into partN-ofM chunks and uploads them one by one. LDW lane only (writes the config.ldw section); the API channel sends HTTP JSON without attachments (user decision: the global entry always shows everything in full)',
+      chatOnlyLabel: 'Chat-only mode (LDW)',
+      chatOnlyDesc: 'On: the LDW web lane strips the tool catalog (the model receives no tools = pure chat). LDW lane only (writes config.ldw); the API channel follows the global baseline and is unaffected. Compaction/title requests are unaffected',
+      zhToolNamesLabel: 'Chinese tool names (LDW)',
+      zhToolNamesDesc: 'On: each LDW tool catalog entry carries a "（中文名：XX，两个名字等价）" note so the model can say tool names in Chinese (e.g. "我要用工具 读取文件"); the translation layer maps them back to the real names. LDW lane only (writes config.ldw). Independent switch, default off',
+      kbLabel: 'KB natural-language protocol (LDW)',
+      kbDesc: 'On: on the LDW lane, phrases like "我要调动第一层/第二层知识库，搜索xx" get translated into real retrieval calls; when "general NL" is off, the LDW tool catalog keeps only KB tools (knowledge series + archive search) and drops the rest. Button priority (top to bottom): chat-only > KB > general NL. LDW lane only (writes config.ldw). Off: the phrase is treated as plain text and the catalog is not trimmed',
+      nlToolLabel: 'Natural-language tool calls (LDW)',
+      nlToolDesc: 'On: on the LDW lane, "我要用工具 <tool name>, params {...}" also gets translated into a real call — dynamic mapping (names looked up from the current turn catalog, so tools can come and go without code changes); when "KB NL" is explicitly off, the LDW catalog drops KB tools and keeps the rest (KB > general priority). LDW lane only (writes config.ldw). Default off (conservative)',
+      titlePrefixLabel: 'LDW title prefix',
+      titlePrefixDesc: 'On: machine-generated session titles carry an "LDW " prefix on the LDW web lane (prefix-based cleanup relies on it); off: as-is',
+      pagerLabel: '"Version pager" button',
+      pagerDesc: 'The version pager that appears under messages for forked/edited conversations (provided by dsh-easyrewrite)',
+      pagerHidden: 'Hidden',
+      pagerShown: 'Visible',
+      renderFxLabel: 'Long-session scroll optimization',
+      renderFxDesc: 'Off-screen messages skip layout and paint (content-visibility) so long sessions scroll smoother; the timeline is unaffected. Default off; click save after changing',
+      renderFxOn: 'Enabled',
+      renderFxOff: 'Disabled',
+      modeLabel: 'Compaction .txt exit',
+      modeDesc: 'When a compaction summary (/compact) is too large, the full text is packed into a .txt attachment for the web side',
+      thresholdLabel: 'Direct-send threshold (chars)',
+      thresholdDesc: 'In auto mode, inputs below this value go straight into the input box; larger ones are packed as .txt',
+      exitNote: 'Takes effect on save — no restart needed',
+      save: 'Save',
+      cadNav: 'Scan & calibration frequency',
+      cadDesc: 'Controls when to scan and how often — the defaults match the long-standing behavior of this plugin',
+      cadChangeTitle: 'After session-file changes (incl. dsh-sync writes):',
+      cadRescan: 'Title warm-up + list rescan',
+      cadRescanDesc: 'After changes settle, backfill title projections and refresh the session list; off = only at boot',
+      cadPurge: 'True-delete scan',
+      cadPurgeDesc: 'Runs one idempotent tombstone cleanup after changes; turn off to skip the full scan',
+      cadHead: 'Head-guard scan',
+      cadHeadDesc: 'Checks for "headless sessions" after changes; synced-in files most often lack heads',
+      cadDebounce: 'Change settle time',
+      cadDebounceDesc: 'Lower = more responsive but more IO; files still being written never trigger (waits for a stable fingerprint)',
+      cadPoll: 'Fallback poll interval',
+      cadPollDesc: 'Safety-net check for when fs.watch misses events (normally unused)',
+      cadBootTitle: 'Automatically at boot:',
+      cadBootWarm: 'Boot-time title warm-up (12s / 60s rounds)',
+      cadBootWarmDesc: 'So sidebar titles display normally as soon as possible after start',
+      cadBootHead: 'Boot-time head guard (4s / 25s prefilter + 45s deep scan)',
+      cadBootHeadDesc: 'The deep scan reads and verifies whole files — the heaviest IO; turning it off visibly reduces startup load',
+      cadBootTrueDelete: 'Boot-time true-delete sweep (1.2s / 2.5s / 5s / 30s windows)',
+      cadBootTrueDeleteDesc: 'Cleans tombstones before sessions get activated as live; off = only the after-change scan',
+      cadCalTitle: 'Context-pressure calibration (contextPressure):',
+      cadCal: 'Auto calibration',
+      cadCalDesc: 'Fixes drift like "shows 10% left yet reports over 1M"; disabling does not affect chats — the displayed value may just drift',
+      cadCalInterval: 'Periodic retry interval',
+      cadCalIntervalDesc: '0 = only around startup (the long-standing behavior)',
+      cadManualNote: 'Manual triggers (unaffected by the switches above):',
+      cadManualCal: 'Calibrate now',
+      cadManualWarm: 'Rescan titles now',
+      cadRestartHint: '⚠️ Switches and frequencies are read once at plugin start — restart DSH after changing; the two manual buttons work anytime.',
+      verNav: 'Version families & disk usage',
+      verDesc: 'Forked sessions copy the parent history; this lists the size of each version family so you can clean old versions on demand',
+      verGuard: 'Old versions protected (no auto true-delete)',
+      verGuardDesc: 'Switching versions marks the other branch with a tombstone; true-delete skips these family members by default — bookkeeping only, no cutting',
+      verNote: 'Cleanup is a true delete (no copies kept); running sessions are skipped',
+      invNav: 'Invisible-session cleanup',
+      invDesc: 'Sessions the sidebar cannot show (files on disk, absent from the host registry) — under the "if you can see it, keep it" rule these are leftovers',
+      invSweepNote: 'Automatic sweeping (boot + every 10 min) requires explicit opt-in; default off, to avoid deleting just-forked sessions that are not registered yet',
+      invNote: 'Deletes are true deletes (no copies kept); running sessions are skipped',
+      invCleanTitle: 'Only handle sessions that exist on disk but are invisible in the sidebar',
+      invRefresh: 'Refresh',
+      invScanning: 'Scanning…',
+      invReadFailed: 'Failed to load',
+      invScanUnavailable: 'Scan unavailable',
+      invClean: 'Clean invisible sessions',
+      invCleanForce: 'Force-clean invisible sessions',
+      invConfirm: 'Confirm deleting {count} sessions',
+      invConfirmForce: 'Confirm force-deleting {count} sessions',
+      invCancel: 'Cancel',
+      invNoTitle: '(untitled)',
+      subNav: 'Subagent-session cleanup',
+      subDesc: 'Sessions spawned via workflow/subagent tools — never shown in the sidebar, dead weight once the task finishes',
+      subCleanTitle: 'Only handle origin=subagent sessions (running ones are auto-skipped)',
+      subScanning: 'Scanning…',
+      subReadFailed: 'Failed to load',
+      subEmpty: 'No subagent sessions — clean',
+      subSummary: '{count} subagent sessions · {mb} MB total',
+      subLiveNote: '({count} running, will be skipped)',
+      subClean: 'Clean subagent sessions',
+      subConfirm: 'Confirm deleting {count} subagent sessions',
+      subFreed: 'Deleted {count} · freed {mb} MB',
+      subPurgeFailed: 'Cleanup failed',
+      subNote: 'True delete is irreversible (auto-backed-up to backup-true-delete-subagent first); running sessions are skipped',
+      asNav: 'Auto slimming',
+      asDesc: 'At boot, automatically slim old turns of large sessions (wipe reasoning streams/tool outputs, keep structure). Default off',
+      asToggle: 'Auto-slim at boot',
+      asToggleDesc: 'When on, 90s after each start: sessions that are not running and ≥1MB get slimmed (full verify/backup/rollback gates)',
+      asKeep: 'Keep recent turns',
+      asKeepDesc: 'The most recent N turns keep their full text; only older ones get slimmed (0 = all)',
+      asDigest: 'Digest placeholder',
+      asDigestDesc: 'The placeholder carries "first two lines + char count" so the AI can tell what used to be there when reading old context; off = plain "[content cleared]"',
+      asMin: 'Event-count threshold',
+      asMinDesc: 'Sessions with fewer events are untouched (protects small sessions)',
+      asNote: 'Manual slimming still lives in the slimming panel under Sessions & Prompts; click save — takes effect next boot',
+      invFamilyTag: 'family',
+      invPathLabel: 'Directory',
+      invFamilyNote: '{count} of these are version-family members: untouched by default (still needed for version switching); tick force-clean below to include them',
+      invAnomalyOn: '⚠️ Registry looks anomalous: this list was judged from on-disk files — double-check before deleting',
+      invForceLabel: 'I confirm, force-clean (family members included / guards skipped)',
+      invForceDesc: 'Ticking enables: ① clean version-family members too; ② allow listing and cleanup even when the registry looks anomalous. True delete is irreversible; after ticking you still press Confirm once more.',
+      invForceOn: 'Force mode',
+      invSkippedTitle: 'Not deleted because of guards ({count}):',
+      invReasonFamily: 'Version-family member (still needed for version switching)',
+      invReasonAnomaly: 'Registry looks anomalous',
+      invReasonBulk: 'Exceeds the per-run delete cap (bulk guard)',
+      invReasonVisible: 'Visible in the sidebar (hard red line, never deleted)',
+      invReasonSelf: 'This is the very session in use right now',
+      invReasonLive: 'Session is running',
+      invReasonNotFound: 'File no longer on disk',
+      invReasonFailed: 'Delete errored',
+      invFreed: 'Deleted {count}, freed {mb} MB',
+      invPurgeFailed: 'Cleanup failed',
+      invOrphanTitle: 'Orphan projections (cached, no session file)',
+      invOrphanDesc: 'Ghosts left behind when the deleter did not clean the title cache — no list ever shows them, only this panel. Cleanup = move into the backup dir (session_projcache/orphans-backup-*); once verified you can delete that directory by hand.',
+      invOrphanClean: 'Clean orphan projections',
+      invOrphanConfirm: 'Confirm moving to backup ({count})',
+      invOrphanDone: 'Moved {count} to backup ({kb} KB) → {dir}',
+      invOrphanTooFresh: '{count} too fresh (<5 min), skipped to avoid a create race',
+      invUnknown: 'Unknown',
+      healNav: 'Session log repair',
+      healMain: 'Cleanup & checkup',
+      healMainDesc: 'Three switches, save options, full checkup and repair results (collapsed by default)',
+      healDesc: 'Cleans broken tool results and dead attachments out of session logs (left by interrupted streams/load failures/lost attachment objects); auto-backup before repair',
+      healBoot: 'Scan at boot',
+      healBootDesc: 'One scan+repair 15s after startup (no timers, nothing resident)',
+      healSend: 'Scan before send',
+      healSendDesc: 'Before sending, repairs empty tool results/broken blocks in the payload in memory (zero disk IO)',
+      healSendWarn: 'When off, DeepSeek may again reject broken payloads',
+      healSkip: 'Skip unchanged conversations',
+      healSkipDesc: 'Skips conversations whose file fingerprint is unchanged since the last check (stat only, no reads)',
+      healSave: 'Save options',
+      healSaved: 'Saved',
+      healSaveFail: 'Save failed',
+      healCheck: 'Full checkup',
+      healChecking: 'Checking…',
+      healRepair: 'Repair found issues',
+      healRepairing: 'Repairing…',
+      healClean: 'All session logs are structurally sound — nothing to repair',
+      orderIntro: 'Drag the ⠿ handle (or long-press the row) to reorder; ↑↓ are the safe fallback. The order is written straight into the host workspace.json (workspace global.workspaceIds / session sessionIds), not just the page. Running sessions cannot be reordered.',
+      orderTabSession: 'Session manager',
+      orderTabWorkspace: 'Workspace manager',
+      orderHintSession: 'Expanded per workspace; drag session rows to reorder within a workspace (all expanded by default).',
+      orderHintWorkspace: 'Drag workspace rows to reorder workspaces; once expanded you can also drag their sessions (collapsed by default).',
+      orderExpandAll: 'Expand all',
+      orderCollapseAll: 'Collapse all',
+      sidefoldNav: 'Sidebar sections',
+      sidefoldDesc: 'Fold triangles for the four sidebar groups (top settings/files/cost/bottom settings) plus full-hide switches for the three entries. Fold state survives refresh; content other plugins inject into the sidebar is auto-grouped by position into "top settings" or "bottom settings"',
+      sidefoldGroupLabel: 'Four-group folding',
+      sidefoldExpandAll: 'Expand all',
+      sidefoldStateFolded: 'Folded',
+      sidefoldStateOpen: 'Open',
+      sidefoldReadFail: 'Failed to load — you can retry',
+      sidefoldSaved: 'Saved · effective immediately',
+      sidefoldSaveFail: 'Save failed: ',
+      entriesLabel: 'Fully hide the three entries (session-kit)',
+      entriesDesc: 'When off, the entries disappear from the sidebar (unlike folding: folding keeps the title row, hiding leaves nothing). Restore = turn them back on here; the settings page is always reachable',
+      entryMemory: 'Memory entry',
+      entryTask: 'Tasks entry',
+      entryArchive: 'Archive entry',
+      entryShown: 'Visible',
+      entryHidden: 'Hidden',
+      orderRefresh: 'Reload',
+      orderLoading: 'Loading order…',
+      orderEmpty: 'No workspaces at all',
+      orderSessions: '{count} sessions',
+      orderSaved: 'Order written',
+      orderFailed: 'Reorder failed',
+      orderReadFailed: 'Failed to load order',
+      handle: 'Drag to sort',
+      toTop: 'Move up',
+      toBottom: 'Move down',
+      exitNever: 'never · never web-bound (compaction requests are rejected outright)',
+      exitAuto: 'auto · pack as .txt only past the threshold (recommended)',
+      exitAlways: 'always · always pack as .txt upload',
+      foldTop: 'Top settings',
+      foldFiles: 'Files',
+      foldCost: 'Cost',
+      foldSettings: 'Bottom settings',
+      unknownReason: 'unknown reason',
+      unknown: 'unknown',
+      stateExpand: 'Expand',
+      stateCollapse: 'Collapse',
+      expandAllNote: 'Expand all four groups, restoring the default sidebar',
+      runBtn: 'Run',
+      loadingPrefs: 'Loading settings…',
+      on: 'On',
+      off: 'Off',
+      ldwIndependentDesc: 'Independent values, effective on the LDW lane only; does not touch the global switches above',
+      ldwFollowLabel: 'LDW lane switches follow global',
+      ldwFollowDesc: 'By default the LDW lane follows the global switches (compaction exit / protocols apply to LDW too); switch to "independent" and the keys below use the LDW-section values instead',
+      followGlobal: 'Follow global',
+      followIndependent: 'Independent',
+      saving: 'Saving…',
+      verStatsDesc: 'Fork = a copy of the parent history; sizes are tallied per family here',
+      statizing: 'Tallying…',
+      rootTag: 'root',
+      branchTag: 'fork',
+      orphanTag: '·orphan',
+      cleanOld: 'Clean old versions',
+      savedNextBoot: 'Saved · takes effect next boot',
+      okSuffix: 'done',
+      failedSuffix: 'failed',
+      running: 'Running…',
+      healBrokenNote: '(broken bits left by interrupted streams / attachment load failures; the pre-send scan patches them in memory, or use the button below to repair on disk)',
+      healRejectNote: '(the DeepSeek official API would reject the whole turn; the exit guard replaces them with placeholders, or use the button below to repair on disk)',
+      unitSec: 's',
+      unitSecOnce: 's (0 = only around startup)',
+      ungrouped: '(ungrouped)',
+    }
+
+    let t = (key, vars) => {
+      let out = ZH[key] ?? key
+      if (vars) for (const [k, v] of Object.entries(vars)) out = out.split('{' + k + '}').join(String(v))
+      return out
     }
 
     const style = `
@@ -315,9 +598,9 @@ window.__ModuleLoader__.load({
     }
 
     const friendlyError = (message) => {
-      if (/live/i.test(message)) return ZH.errLive
-      if (/not found/i.test(message)) return ZH.errNotFound
-      return ZH.errOther + '：' + message
+      if (/live/i.test(message)) return t('errLive')
+      if (/not found/i.test(message)) return t('errNotFound')
+      return t('errOther') + '：' + message
     }
 
     function MoveDialog({ onClose }) {
@@ -351,7 +634,7 @@ window.__ModuleLoader__.load({
           })
           const out = await res.json().catch(() => ({}))
           if (!res.ok || out?.ok !== true) throw new Error(String(out?.error ?? ('HTTP ' + res.status)))
-          setNotice({ ok: true, text: ZH.done.replace('{target}', target) })
+          setNotice({ ok: true, text: t('done').replace('{target}', target) })
           await load()
         } catch (e) {
           setNotice({ ok: false, text: friendlyError(String(e?.message ?? e)) })
@@ -365,28 +648,28 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'ac-overlay', onClick: (e) => { if (e.target === e.currentTarget) onClose() } },
         h('div', { className: 'ac-modal' },
           h('div', { className: 'ac-modal-head' },
-            h('div', { className: 'ac-modal-title' }, ZH.nav),
-            h('button', { className: 'ac-btn', onClick: onClose }, ZH.close)),
+            h('div', { className: 'ac-modal-title' }, t('nav')),
+            h('button', { className: 'ac-btn', onClick: onClose }, t('close'))),
           h('div', { className: 'ac-modal-body' },
             h('div', null,
-              h('div', { className: 'ac-session-hint', style: { marginBottom: 4 } }, ZH.target),
+              h('div', { className: 'ac-session-hint', style: { marginBottom: 4 } }, t('target')),
               h('select', {
                 className: 'ac-select',
                 value: target,
                 onChange: (e) => setTarget(e.currentTarget.value),
               },
-              h('option', { value: '' }, ZH.targetPlaceholder),
-              workspaceTitles.map((t) => h('option', { key: t, value: t }, t)))),
+              h('option', { value: '' }, t('targetPlaceholder')),
+              workspaceTitles.map((name) => h('option', { key: name, value: name }, name === '(未分组)' ? t('ungrouped') : name)))),
             notice ? h('div', { className: 'ac-notice ' + (notice.ok ? 'ac-notice-ok' : 'ac-notice-err') }, notice.text) : null,
-            groups === null && !error ? h('div', { className: 'ac-empty' }, ZH.loading) : null,
+            groups === null && !error ? h('div', { className: 'ac-empty' }, t('loading')) : null,
             error ? h('div', { className: 'ac-notice ac-notice-err' },
-              ZH.loadFailed + '：' + error + ' ',
-              h('button', { className: 'ac-btn', style: { marginLeft: 8 }, onClick: () => void load() }, ZH.retry)) : null,
-            (groups ?? []).length === 0 && !error && groups !== null ? h('div', { className: 'ac-empty' }, ZH.empty) : null,
+              t('loadFailed') + ': ' + error + ' ',
+              h('button', { className: 'ac-btn', style: { marginLeft: 8 }, onClick: () => void load() }, t('retry'))) : null,
+            (groups ?? []).length === 0 && !error && groups !== null ? h('div', { className: 'ac-empty' }, t('empty')) : null,
             (groups ?? []).map((group) =>
               h('div', { key: group.workspaceTitle },
                 h('div', { className: 'ac-group-title' },
-                  group.workspaceTitle + ' · ' + ZH.sessionsIn.replace('{count}', String(group.sessions.length))),
+                  (group.workspaceTitle === '(未分组)' ? t('ungrouped') : group.workspaceTitle) + ' · ' + t('sessionsIn').replace('{count}', String(group.sessions.length))),
                 group.sessions.map((session) =>
                   h('div', { key: session.id, className: 'ac-session' },
                     h('div', { style: { minWidth: 0, flex: 1 } },
@@ -396,9 +679,9 @@ window.__ModuleLoader__.load({
                       className: 'ac-btn ac-btn-primary',
                       disabled: !target || busyId !== '',
                       onClick: () => void move(session.id),
-                    }, busyId === session.id ? ZH.moving : ZH.move)))))),
+                    }, busyId === session.id ? t('moving') : t('move'))))))),
           h('div', { className: 'ac-modal-foot' },
-            h('button', { className: 'ac-btn', onClick: onClose }, ZH.close)))
+            h('button', { className: 'ac-btn', onClick: onClose }, t('close'))))
       )
     }
 
@@ -416,9 +699,9 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'ac-settings' },
         h('div', { className: 'ac-row' },
           h('div', null,
-            h('div', { className: 'ac-row-title' }, ZH.nav),
-            h('div', { className: 'ac-row-desc' }, ZH.desc)),
-          h('button', { className: 'ac-btn', onClick: () => setOpen(true) }, ZH.open)),
+            h('div', { className: 'ac-row-title' }, t('nav')),
+            h('div', { className: 'ac-row-desc' }, t('desc'))),
+          h('button', { className: 'ac-btn', onClick: () => setOpen(true) }, t('open'))),
         open ? h(MoveDialog, {
           onClose: () => setOpen(false),
         }) : null)
@@ -455,10 +738,11 @@ window.__ModuleLoader__.load({
     /** session-kit 在「会话与提示词」分区里声明的子插槽（见它对 settings.section 的 children 表）。 */
     const SK_EXTRA = 'dsh-session-kit.settings.extra'
     const PAGER_SELECTOR = '[data-dsh-easyrewrite="version-pager"]'
+    /** 模式 → 字典键（渲染期经 t() 出词，语言切换即时生效；勿在此处直接存文案）。 */
     const EXIT_MODE_LABELS = {
-      never: 'never · 不走网页（压缩请求直接拒绝）',
-      auto: 'auto · 超过阈值才打包 .txt（推荐）',
-      always: 'always · 一律打包 .txt 上传',
+      never: 'exitNever',
+      auto: 'exitAuto',
+      always: 'exitAlways',
     }
 
     /** 按偏好显示/隐藏版本分页器（幂等：重复调用只更新同一个 style 节点）。 */
@@ -549,10 +833,10 @@ window.__ModuleLoader__.load({
 
     /* 四组：fold 键（=存储键=html data 键）与行名。行序=浮层里的固定槽位。 */
     const SIDEFOLD_GROUPS = [
-      { key: 'foldTop', label: '上方设置' },
-      { key: 'foldFiles', label: '文件' },
-      { key: 'foldCost', label: '费用' },
-      { key: 'foldSettings', label: '下方设置' },
+      { key: 'foldTop', label: 'foldTop' },
+      { key: 'foldFiles', label: 'foldFiles' },
+      { key: 'foldCost', label: 'foldCost' },
+      { key: 'foldSettings', label: 'foldSettings' },
     ]
 
     const SIDEFOLD_CSS = [
@@ -931,9 +1215,9 @@ window.__ModuleLoader__.load({
             sidefoldState = v
             sidefoldApplyState()
             paintSidefoldRows()
-            setNote(ZH.sidefoldSaved)
-          } else setNote(ZH.sidefoldSaveFail + String(r.data && r.data.error ? r.data.error : '未知原因'))
-        } catch (e) { setNote(ZH.sidefoldSaveFail + String(e && e.message ? e.message : e)) }
+            setNote(t('sidefoldSaved'))
+          } else setNote(t('sidefoldSaveFail') + String(r.data && r.data.error ? r.data.error : t('unknownReason')))
+        } catch (e) { setNote(t('sidefoldSaveFail') + String(e && e.message ? e.message : e)) }
         finally { setBusy(false) }
       }
 
@@ -947,46 +1231,46 @@ window.__ModuleLoader__.load({
           if (r.ok && r.data && (r.data.ok || r.data.memoryVisible !== undefined)) {
             const v = r.data.value ?? r.data
             setEntries({ memory: v.memoryVisible !== false, task: v.taskVisible !== false, archive: v.archiveVisible !== false })
-            setNote(ZH.sidefoldSaved)
-          } else setNote(ZH.sidefoldSaveFail + String(r.data && r.data.error ? r.data.error : '未知原因'))
-        } catch (e) { setNote(ZH.sidefoldSaveFail + String(e && e.message ? e.message : e)) }
+            setNote(t('sidefoldSaved'))
+          } else setNote(t('sidefoldSaveFail') + String(r.data && r.data.error ? r.data.error : t('unknownReason')))
+        } catch (e) { setNote(t('sidefoldSaveFail') + String(e && e.message ? e.message : e)) }
         finally { setBusy(false) }
       }
 
-      const wrap = (kids) => h(Fold, { title: ZH.sidefoldNav, desc: ZH.sidefoldDesc }, ...kids)
-      if (!groups) return wrap([h('div', { className: 'ac-row-desc' }, ZH.sidefoldReadFail)])
+      const wrap = (kids) => h(Fold, { title: t('sidefoldNav'), desc: t('sidefoldDesc') }, ...kids)
+      if (!groups) return wrap([h('div', { className: 'ac-row-desc' }, t('sidefoldReadFail'))])
 
       const groupRows = SIDEFOLD_GROUPS.map((g) => h('div', { className: 'ac-row', key: g.key },
         h('div', null,
           h('div', { className: 'ac-row-title' }, `▸ ${g.label}`),
-          h('div', { className: 'ac-row-desc' }, groups[g.key] ? ZH.sidefoldStateFolded : ZH.sidefoldStateOpen)),
+          h('div', { className: 'ac-row-desc' }, groups[g.key] ? t('sidefoldStateFolded') : t('sidefoldStateOpen'))),
         h('button', {
           className: 'ac-btn', disabled: busy,
           onClick: () => saveGroups({ ...groups, [g.key]: !groups[g.key] }),
-        }, groups[g.key] ? '展开' : '折叠')))
+        }, groups[g.key] ? t('stateExpand') : t('stateCollapse'))))
 
       const expandAllRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.sidefoldExpandAll),
-          h('div', { className: 'ac-row-desc' }, '四组全部展开，恢复默认侧边栏')),
+          h('div', { className: 'ac-row-title' }, t('sidefoldExpandAll')),
+          h('div', { className: 'ac-row-desc' }, t('expandAllNote'))),
         h('button', {
           className: 'ac-btn', disabled: busy,
           onClick: () => saveGroups({ foldTop: false, foldFiles: false, foldCost: false, foldSettings: false }),
-        }, '执行'))
+        }, t('runBtn')))
 
       const entryRow = (key, label) => h('div', { className: 'ac-row', key },
         h('div', { className: 'ac-row-title' }, label),
         h('button', {
           className: 'ac-btn', disabled: busy || !entries,
           onClick: () => saveEntries({ ...entries, [key]: !(entries?.[key] !== false) }),
-        }, entries ? (entries[key] !== false ? ZH.entryShown : ZH.entryHidden) : '…'))
+        }, entries ? (entries[key] !== false ? t('entryShown') : t('entryHidden')) : '…'))
 
       const entriesBlock = h('div', null,
-        h('div', { className: 'ac-row-title', style: { margin: '10px 2px 6px' } }, ZH.entriesLabel),
-        h('div', { className: 'ac-row-desc', style: { margin: '0 2px 8px' } }, ZH.entriesDesc),
-        entryRow('memory', ZH.entryMemory),
-        entryRow('task', ZH.entryTask),
-        entryRow('archive', ZH.entryArchive))
+        h('div', { className: 'ac-row-title', style: { margin: '10px 2px 6px' } }, t('entriesLabel')),
+        h('div', { className: 'ac-row-desc', style: { margin: '0 2px 8px' } }, t('entriesDesc')),
+        entryRow('memory', t('entryMemory')),
+        entryRow('task', t('entryTask')),
+        entryRow('archive', t('entryArchive')))
 
       return wrap([
         ...groupRows,
@@ -1009,8 +1293,8 @@ window.__ModuleLoader__.load({
             setPrefs(r.data.value)
             applyPagerHidden(r.data.value.hideVersionPager !== false)
             applyRenderFx(r.data.value.renderFx === true)
-          } else setNote('读取失败，可重试')
-        }).catch(() => { if (!dead) setNote('读取失败，可重试') })
+          } else setNote(t('sidefoldReadFail'))
+        }).catch(() => { if (!dead) setNote(t('sidefoldReadFail')) })
         return () => { dead = true }
       }, [])
 
@@ -1059,10 +1343,10 @@ window.__ModuleLoader__.load({
             setPrefs(v)
             applyPagerHidden(v.hideVersionPager !== false)
             applyRenderFx(v.renderFx === true)
-            setNote('已保存 · 即时生效')
-          } else setNote('保存失败：' + String(r.data && r.data.error ? r.data.error : '未知原因'))
+            setNote(t('sidefoldSaved'))
+          } else setNote(t('sidefoldSaveFail') + String(r.data && r.data.error ? r.data.error : t('unknownReason')))
         } catch (e) {
-          setNote('保存失败：' + String(e && e.message ? e.message : e))
+          setNote(t('sidefoldSaveFail') + String(e && e.message ? e.message : e))
         } finally {
           setBusy(false)
         }
@@ -1071,46 +1355,46 @@ window.__ModuleLoader__.load({
       /* 折叠项（2026-10-16 用户要求「每个大项加折叠、默认折叠」）：
          外层 Fold 提供标题与展开按钮，内容才是真正的控件。
          好处：在「会话与提示词」里它一定以**一行可见标题**出现，不会被误认为「没做进来」。 */
-      const wrap = (kids) => h(Fold, { title: ZH.exitNav, desc: ZH.exitDesc }, ...kids)
+      const wrap = (kids) => h(Fold, { title: t('exitNav'), desc: t('exitDesc') }, ...kids)
 
       if (!prefs) {
-        return wrap([h('div', { className: 'ac-row-desc' }, '读取设置…')])
+        return wrap([h('div', { className: 'ac-row-desc' }, t('loadingPrefs'))])
       }
 
       const pagerRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.pagerLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.pagerDesc)),
+          h('div', { className: 'ac-row-title' }, t('pagerLabel')),
+          h('div', { className: 'ac-row-desc' }, t('pagerDesc'))),
         h('button', {
           className: 'ac-btn',
           onClick: () => setPrefs((p) => ({ ...p, hideVersionPager: p.hideVersionPager !== true })),
-        }, prefs.hideVersionPager !== true ? ZH.pagerShown : ZH.pagerHidden))
+        }, prefs.hideVersionPager !== true ? t('pagerShown') : t('pagerHidden')))
 
       /* [B线 2026-10-24] 消息流懒渲染开关（默认关）：开了以后屏幕外的消息跳过布局绘制，
          长会话滚动更顺；Timeline 时间轴不受影响（独立渲染层）。 */
       const renderFxRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.renderFxLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.renderFxDesc)),
+          h('div', { className: 'ac-row-title' }, t('renderFxLabel')),
+          h('div', { className: 'ac-row-desc' }, t('renderFxDesc'))),
         h('button', {
           className: 'ac-btn',
           onClick: () => setPrefs((p) => ({ ...p, renderFx: p.renderFx !== true })),
-        }, prefs.renderFx === true ? ZH.renderFxOn : ZH.renderFxOff))
+        }, prefs.renderFx === true ? t('renderFxOn') : t('renderFxOff')))
 
       const modeRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.modeLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.modeDesc)),
+          h('div', { className: 'ac-row-title' }, t('modeLabel')),
+          h('div', { className: 'ac-row-desc' }, t('modeDesc'))),
         h('select', {
           className: 'ac-btn',
           value: prefs.compactionFileMode,
           onChange: (e) => setPrefs((p) => ({ ...p, compactionFileMode: e.target.value })),
-        }, ...Object.keys(EXIT_MODE_LABELS).map((k) => h('option', { key: k, value: k }, EXIT_MODE_LABELS[k]))))
+        }, ...Object.keys(EXIT_MODE_LABELS).map((k) => h('option', { key: k, value: k }, t(EXIT_MODE_LABELS[k])))))
 
       const thresholdRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.thresholdLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.thresholdDesc)),
+          h('div', { className: 'ac-row-title' }, t('thresholdLabel')),
+          h('div', { className: 'ac-row-desc' }, t('thresholdDesc'))),
         h('input', {
           className: 'ac-btn',
           type: 'number',
@@ -1123,20 +1407,20 @@ window.__ModuleLoader__.load({
 
       const kbRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.kbLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.kbDesc)),
+          h('div', { className: 'ac-row-title' }, t('kbLabel')),
+          h('div', { className: 'ac-row-desc' }, t('kbDesc'))),
         h('button', {
           className: 'ac-btn',
           onClick: () => setPrefs((p) => ({ ...p, kbProtocol: p.kbProtocol !== false ? false : true })),
-        }, prefs.kbProtocol !== false ? '开启' : '关闭'))
+        }, prefs.kbProtocol !== false ? t('on') : t('off')))
 
       /** 全局 .txt 三件套（2026-10-21 用户定案「不管实际用不用都要弄上」）——
        *  directSendThresholdChars / txtChunkBytes / chatOnly（纯聊天）。
        *  全局侧写 webin config 同源（全局真源=顶层；LDW 车道默认跟随全局，独立需开「LDW 车道独立设置」）。 */
       const directThresholdRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.directThresholdLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.directThresholdDesc)),
+          h('div', { className: 'ac-row-title' }, t('directThresholdLabel')),
+          h('div', { className: 'ac-row-desc' }, t('directThresholdDesc'))),
         h('input', {
           className: 'ac-btn',
           type: 'number', min: 0, step: 1000, style: { width: '140px' },
@@ -1145,8 +1429,8 @@ window.__ModuleLoader__.load({
         }))
       const txtChunkRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.txtChunkLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.txtChunkDesc)),
+          h('div', { className: 'ac-row-title' }, t('txtChunkLabel')),
+          h('div', { className: 'ac-row-desc' }, t('txtChunkDesc'))),
         h('input', {
           className: 'ac-btn',
           type: 'number', min: 0, step: 10240, style: { width: '140px' },
@@ -1155,47 +1439,47 @@ window.__ModuleLoader__.load({
         }))
       const chatOnlyRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.chatOnlyLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.chatOnlyDesc)),
+          h('div', { className: 'ac-row-title' }, t('chatOnlyLabel')),
+          h('div', { className: 'ac-row-desc' }, t('chatOnlyDesc'))),
         h('button', {
           className: 'ac-btn',
           onClick: () => setPrefs((p) => ({ ...p, chatOnly: p.chatOnly !== true })),
-        }, prefs.chatOnly === true ? '开启' : '关闭'))
+        }, prefs.chatOnly === true ? t('on') : t('off')))
 
       /* 中文工具名（2026-10-24 用户点名「调用时用汉字代替不要漏名字」）：
          独立开关——开启后 API 请求的工具目录带中文名标注，模型说中文工具名也能翻回真名。 */
       const zhRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.zhToolNamesLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.zhToolNamesDesc)),
+          h('div', { className: 'ac-row-title' }, t('zhToolNamesLabel')),
+          h('div', { className: 'ac-row-desc' }, t('zhToolNamesDesc'))),
         h('button', {
           className: 'ac-btn',
           onClick: () => setPrefs((p) => ({ ...p, zhToolNames: p.zhToolNames === true ? false : true })),
-        }, prefs.zhToolNames === true ? '开启' : '关闭'))
+        }, prefs.zhToolNames === true ? t('on') : t('off')))
 
       const nlRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.nlToolLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.nlToolDesc)),
+          h('div', { className: 'ac-row-title' }, t('nlToolLabel')),
+          h('div', { className: 'ac-row-desc' }, t('nlToolDesc'))),
         h('button', {
           className: 'ac-btn',
           onClick: () => setPrefs((p) => ({ ...p, nlToolProtocol: p.nlToolProtocol === true ? false : true })),
-        }, prefs.nlToolProtocol === true ? '开启' : '关闭'))
+        }, prefs.nlToolProtocol === true ? t('on') : t('off')))
 
       /* LDW 独立模式（2026-11-12）：跟随全局/独立设置。独立时渲染五键编辑行
          （写 config.ldw 段，仅 LDW 车道读）；跟随模式不渲染（保存时后端清段内五键）。 */
       const ldwToggleRow = (key, label) => h('div', { className: 'ac-row' },
         h('div', null,
           h('div', { className: 'ac-row-title' }, 'LDW·' + label),
-          h('div', { className: 'ac-row-desc' }, '独立值，仅 LDW 车道生效；与上方全局开关互不影响')),
+          h('div', { className: 'ac-row-desc' }, t('ldwIndependentDesc'))),
         h('button', {
           className: 'ac-btn',
           onClick: () => setPrefs((p) => ({ ...p, ldwCustom: { ...p.ldwCustom, [key]: !(p.ldwCustom?.[key] === true) } })),
-        }, prefs.ldwCustom?.[key] === true ? '开启' : '关闭'))
+        }, prefs.ldwCustom?.[key] === true ? t('on') : t('off')))
       const ldwNumberRow = (key, label, step) => h('div', { className: 'ac-row' },
         h('div', null,
           h('div', { className: 'ac-row-title' }, 'LDW·' + label),
-          h('div', { className: 'ac-row-desc' }, '独立值，仅 LDW 车道生效；与上方全局开关互不影响')),
+          h('div', { className: 'ac-row-desc' }, t('ldwIndependentDesc'))),
         h('input', {
           className: 'ac-btn',
           type: 'number', min: 0, step, style: { width: '140px' },
@@ -1204,31 +1488,31 @@ window.__ModuleLoader__.load({
         }))
       const ldwFollowRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.ldwFollowLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.ldwFollowDesc)),
+          h('div', { className: 'ac-row-title' }, t('ldwFollowLabel')),
+          h('div', { className: 'ac-row-desc' }, t('ldwFollowDesc'))),
         h('button', {
           className: 'ac-btn',
           onClick: () => setPrefs((p) => ({ ...p, ldwFollowGlobal: p.ldwFollowGlobal === false })),
-        }, prefs.ldwFollowGlobal === false ? '独立设置中' : '跟随全局'))
+        }, prefs.ldwFollowGlobal === false ? t('followIndependent') : t('followGlobal')))
       const ldwRows = prefs.ldwFollowGlobal === false ? [
-        ldwToggleRow('chatOnly', ZH.chatOnlyLabel),
-        ldwToggleRow('zhToolNames', ZH.zhToolNamesLabel),
-        ldwToggleRow('kbProtocol', ZH.kbLabel),
-        ldwToggleRow('nlToolProtocol', ZH.nlToolLabel),
-        ldwNumberRow('txtChunkBytes', ZH.txtChunkLabel, 10240),
+        ldwToggleRow('chatOnly', t('chatOnlyLabel')),
+        ldwToggleRow('zhToolNames', t('zhToolNamesLabel')),
+        ldwToggleRow('kbProtocol', t('kbLabel')),
+        ldwToggleRow('nlToolProtocol', t('nlToolLabel')),
+        ldwNumberRow('txtChunkBytes', t('txtChunkLabel'), 10240),
       ] : []
       const titleRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.titlePrefixLabel),
-          h('div', { className: 'ac-row-desc' }, ZH.titlePrefixDesc)),
+          h('div', { className: 'ac-row-title' }, t('titlePrefixLabel')),
+          h('div', { className: 'ac-row-desc' }, t('titlePrefixDesc'))),
         h('button', {
           className: 'ac-btn',
           onClick: () => setPrefs((p) => ({ ...p, titlePrefix: p.titlePrefix !== false ? false : true })),
-        }, prefs.titlePrefix !== false ? '开启' : '关闭'))
+        }, prefs.titlePrefix !== false ? t('on') : t('off')))
 
       const foot = h('div', { className: 'ac-row' },
-        h('div', { className: 'ac-row-desc' }, note || ZH.exitNote),
-        h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? '保存中…' : ZH.save))
+        h('div', { className: 'ac-row-desc' }, note || t('exitNote')),
+        h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? t('saving') : t('save')))
 
       return wrap([pagerRow, renderFxRow, modeRow, thresholdRow, directThresholdRow, txtChunkRow, chatOnlyRow, zhRow, kbRow, nlRow, ldwFollowRow, ...ldwRows, titleRow, foot])
     }
@@ -1253,8 +1537,8 @@ window.__ModuleLoader__.load({
         try {
           const r = await fetchJson(VERSIONS)
           if (r.ok && r.data && r.data.value) setData(r.data.value)
-          else setNote('读取失败')
-        } catch { setNote('读取失败') }
+          else setNote(t('loadFailed'))
+        } catch { setNote(t('loadFailed')) }
       }, [])
 
       useEffect(() => { void load() }, [load])
@@ -1273,9 +1557,9 @@ window.__ModuleLoader__.load({
             const refused = (r.data.results || []).filter((x) => x.status === 'live-refused').length
             setNote(`已释放 ${freed} MB${refused > 0 ? `（${refused} 条正在运行，跳过）` : ''}`)
             await load()
-          } else setNote('清理失败：' + String(r.data && r.data.error ? r.data.error : '未知'))
+          } else setNote(t('invPurgeFailed') + ': ' + String(r.data && r.data.error ? r.data.error : t('unknown')))
         } catch (e) {
-          setNote('清理失败：' + String(e && e.message ? e.message : e))
+          setNote(t('invPurgeFailed') + ': ' + String(e && e.message ? e.message : e))
         } finally {
           setBusy('')
           setConfirmId('')
@@ -1283,12 +1567,12 @@ window.__ModuleLoader__.load({
       }
 
       const head = h('div', { className: 'ac-row' },
-        h('div', { className: 'ac-row-desc' }, '分叉=复制父会话历史，这里按家族统计体积'),
-        h('button', { className: 'ac-btn', onClick: () => void load() }, '刷新'))
+        h('div', { className: 'ac-row-desc' }, t('verStatsDesc')),
+        h('button', { className: 'ac-btn', onClick: () => void load() }, t('invRefresh')))
 
       if (!data) {
         return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } }, head,
-          h('div', { className: 'ac-row-desc' }, note || '正在统计…'))
+          h('div', { className: 'ac-row-desc' }, note || t('statizing')))
       }
 
       const summary = h('div', { className: 'ac-row' },
@@ -1297,15 +1581,15 @@ window.__ModuleLoader__.load({
 
       const protection = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.verGuard),
-          h('div', { className: 'ac-row-desc' }, ZH.verGuardDesc)))
+          h('div', { className: 'ac-row-title' }, t('verGuard')),
+          h('div', { className: 'ac-row-desc' }, t('verGuardDesc'))))
 
       const famRows = data.families.slice(0, 12).map((fam) => {
         const forks = fam.members.filter((m) => m.isFork)
         /* 2026-10-23 用户要求：成员行显示标题（后端已补 m.title：projcache →
            session/title → 首条用户消息前 24 字兜底），认得出是谁。 */
         const members = fam.members.map((m) => h('div', { key: m.id, className: 'ac-row-desc', style: { fontFamily: 'monospace' } },
-          `${m.title ? `「${m.title}」` : ''}${m.id.slice(0, 26)}  ${m.sizeMB}MB  ${m.isRoot ? '根' : '分叉'}${m.orphanFork ? '·孤' : ''}  ${m.mtime}`))
+          `${m.title ? `"${m.title}"` : ''}${m.id.slice(0, 26)}  ${m.sizeMB}MB  ${m.isRoot ? t('rootTag') : t('branchTag')}${m.orphanFork ? ' ' + t('orphanTag') : ''}  ${m.mtime}`))
         const actions = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
           h('span', { className: 'ac-row-desc' }, `${fam.sizeMB}MB`),
           confirmId === fam.root
@@ -1314,8 +1598,8 @@ window.__ModuleLoader__.load({
                 className: 'ac-btn',
                 disabled: busy !== '' || forks.length === 0,
                 onClick: () => setConfirmId(fam.root),
-              }, '清理旧版本'),
-          confirmId === fam.root ? h('button', { className: 'ac-btn', onClick: () => setConfirmId('') }, '取消') : null)
+              }, t('cleanOld')),
+          confirmId === fam.root ? h('button', { className: 'ac-btn', onClick: () => setConfirmId('') }, t('invCancel')) : null)
         return h('div', { key: fam.root, style: { borderTop: '1px solid var(--dsw-alias-border-subtle, #3333)', paddingTop: '6px' } },
           h('div', { className: 'ac-row' },
             h('div', null,
@@ -1326,7 +1610,7 @@ window.__ModuleLoader__.load({
       })
 
       const foot = h('div', { className: 'ac-row' },
-        h('div', { className: 'ac-row-desc' }, note || ZH.verNote))
+        h('div', { className: 'ac-row-desc' }, note || t('verNote')))
 
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
         head, summary, protection, ...famRows, foot)
@@ -1361,7 +1645,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'ac-row-title', style: { cursor: 'pointer' }, onClick: () => setOpen((v) => !v) },
             `${open ? '▾' : '▸'} ${title}`),
           desc ? h('div', { className: 'ac-row-desc' }, desc) : null),
-        h('button', { className: 'ac-btn', onClick: () => setOpen((v) => !v) }, open ? '收起' : '展开')),
+        h('button', { className: 'ac-btn', onClick: () => setOpen((v) => !v) }, open ? t('stateCollapse') : t('stateExpand'))),
       open ? children : null)
     }
 
@@ -1384,8 +1668,8 @@ window.__ModuleLoader__.load({
           /* force=1：登记表疑似异常时后端也肯把清单给出来（只给看，删还得再点一次确认）。 */
           const r = await fetchJson(INVISIBLE + (force ? '?force=1' : ''))
           if (r.ok && r.data && r.data.value) setData(r.data.value)
-          else setNote(ZH.invReadFailed)
-        } catch { setNote(ZH.invReadFailed) }
+          else setNote(t('invReadFailed'))
+        } catch { setNote(t('invReadFailed')) }
       }, [force])
 
       useEffect(() => { void load() }, [load])
@@ -1406,17 +1690,17 @@ window.__ModuleLoader__.load({
           })
           if (r.ok && r.data && r.data.ok) {
             setSkipped(Array.isArray(r.data.skipped) ? r.data.skipped : [])
-            const base = ZH.invFreed.replace('{count}', String(r.data.deletedCount ?? 0)).replace('{mb}', String(r.data.freedMB ?? 0))
+            const base = t('invFreed').replace('{count}', String(r.data.deletedCount ?? 0)).replace('{mb}', String(r.data.freedMB ?? 0))
             /* 后端补的说明（如「全部被保险跳过：勾选强制才会删」）附在后面，别丢。 */
             setNote(r.data.note ? `${base} · ${String(r.data.note)}` : base)
             await load()
           } else {
             /* 保险拦下：把结构化原因摆出来 —— 「是保险挡的，不是坏了」。 */
             if (Array.isArray(r.data && r.data.blocked)) setBlocked(r.data.blocked)
-            setNote(ZH.invPurgeFailed + '：' + String(r.data && r.data.error ? r.data.error : ZH.invUnknown))
+            setNote(t('invPurgeFailed') + '：' + String(r.data && r.data.error ? r.data.error : t('invUnknown')))
           }
         } catch (e) {
-          setNote(ZH.invPurgeFailed + '：' + String(e && e.message ? e.message : e))
+          setNote(t('invPurgeFailed') + '：' + String(e && e.message ? e.message : e))
         } finally {
           setBusy(false)
           setConfirming(false)
@@ -1435,20 +1719,20 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ purgeOrphanProjections: true, write: true }),
           })
           if (r.ok && r.data && r.data.ok) {
-            let msg = ZH.invOrphanDone
+            let msg = t('invOrphanDone')
               .replace('{count}', String(r.data.purgedCount ?? 0))
               .replace('{kb}', String(r.data.purgedKB ?? 0))
               .replace('{dir}', String(r.data.backupDir ?? '-'))
             if (Array.isArray(r.data.skippedFresh) && r.data.skippedFresh.length > 0) {
-              msg += ' · ' + ZH.invOrphanTooFresh.replace('{count}', String(r.data.skippedFresh.length))
+              msg += ' · ' + t('invOrphanTooFresh').replace('{count}', String(r.data.skippedFresh.length))
             }
             setNote(msg)
             await load()
           } else {
-            setNote(ZH.invPurgeFailed + '：' + String(r.data && r.data.error ? r.data.error : ZH.invUnknown))
+            setNote(t('invPurgeFailed') + '：' + String(r.data && r.data.error ? r.data.error : t('invUnknown')))
           }
         } catch (e) {
-          setNote(ZH.invPurgeFailed + '：' + String(e && e.message ? e.message : e))
+          setNote(t('invPurgeFailed') + '：' + String(e && e.message ? e.message : e))
         } finally {
           setBusy(false)
           setOrphanConfirming(false)
@@ -1457,22 +1741,22 @@ window.__ModuleLoader__.load({
 
       /** 保险原因 → 人话（前后端共用同一套 reason 字符串）。 */
       const reasonText = (reason) => ({
-        'family-protected': ZH.invReasonFamily,
-        'registry-anomaly': ZH.invReasonAnomaly,
-        'bulk-limit': ZH.invReasonBulk,
-        'visible-refused': ZH.invReasonVisible,
-        'self-session': ZH.invReasonSelf,
-        'live-refused': ZH.invReasonLive,
-        'not-found': ZH.invReasonNotFound,
-        failed: ZH.invReasonFailed,
+        'family-protected': t('invReasonFamily'),
+        'registry-anomaly': t('invReasonAnomaly'),
+        'bulk-limit': t('invReasonBulk'),
+        'visible-refused': t('invReasonVisible'),
+        'self-session': t('invReasonSelf'),
+        'live-refused': t('invReasonLive'),
+        'not-found': t('invReasonNotFound'),
+        failed: t('invReasonFailed'),
       })[reason] ?? String(reason)
 
       const wrap = (...kids) => h('div', {
         style: { display: 'flex', flexDirection: 'column', gap: '8px' },
       },
       h('div', { className: 'ac-row' },
-        h('div', { className: 'ac-row-desc' }, ZH.invCleanTitle),
-        h('button', { className: 'ac-btn', onClick: () => void load() }, ZH.invRefresh)),
+        h('div', { className: 'ac-row-desc' }, t('invCleanTitle')),
+        h('button', { className: 'ac-btn', onClick: () => void load() }, t('invRefresh'))),
       ...kids)
 
       /* 强制开关：默认不勾；勾了会重新拉一次清单（登记表异常时也看得见）。 */
@@ -1484,18 +1768,18 @@ window.__ModuleLoader__.load({
             onChange: () => { setConfirming(false); setForce((v) => !v) },
           }),
           h('span', null,
-            h('div', { className: 'ac-row-title', style: { display: 'inline' } }, ZH.invForceLabel),
-            h('div', { className: 'ac-row-desc' }, ZH.invForceDesc))),
-        force ? h('span', { className: 'ac-hint-warn' }, ZH.invForceOn) : null)
+            h('div', { className: 'ac-row-title', style: { display: 'inline' } }, t('invForceLabel')),
+            h('div', { className: 'ac-row-desc' }, t('invForceDesc')))),
+        force ? h('span', { className: 'ac-hint-warn' }, t('invForceOn')) : null)
 
       /* 被保险挡下的原因清单（skipped = 动手时逐条挡的；blocked = 整批拒绝时挡的）。 */
       let reasonBlock = null
       if (skipped.length > 0) {
         reasonBlock = h('div', { className: 'ac-report' },
-          h('div', null, h('b', null, ZH.invSkippedTitle.replace('{count}', String(skipped.length)))),
+          h('div', null, h('b', null, t('invSkippedTitle').replace('{count}', String(skipped.length)))),
           ...skipped.slice(0, 30).map((x, i) => h('div', { key: String(x.id ?? i) + i },
             `${x.title ? x.title : (x.id ? String(x.id).slice(0, 8) : '')}` +
-            `${x.sizeMB ? ' · ' + x.sizeMB + 'MB' : ''} —— ${(x.reasons || []).map(reasonText).join('、')}${x.note ? '：' + x.note : ''}`)))
+            `${x.sizeMB ? ' · ' + x.sizeMB + 'MB' : ''} —— ${(x.reasons || []).map(reasonText).join('; ')}${x.note ? ': ' + x.note : ''}`)))
       }
       let blockedBlock = null
       if (blocked.length > 0) {
@@ -1503,38 +1787,38 @@ window.__ModuleLoader__.load({
           ...blocked.map((b, i) => h('div', { key: String(b.reason) + i, style: { marginBottom: '4px' } },
             h('div', null,
               h('b', null, `${reasonText(b.reason)} × ${b.count ?? 0}`),
-              b.limit ? `（一次最多 ${b.limit} 条）` : ''),
+              b.limit ? ` (max ${b.limit} per run)` : ''),
             b.ids && b.ids.length
               ? h('div', { style: { fontFamily: 'monospace' } }, b.ids.slice(0, 8).map((x) => String(x).slice(0, 8)).join(' ') + (b.ids.length > 8 ? ' …' : ''))
               : null)))
       }
 
-      if (!data) return wrap(h('div', { className: 'ac-row-desc' }, note || ZH.invScanning))
+      if (!data) return wrap(h('div', { className: 'ac-row-desc' }, note || t('invScanning')))
 
       /* 孤儿投影小节（2026-11-11）：有缓存、无活体——任何列表都不显示，这里是它们
          唯一能被看见的地方。登记表异常（ok!==true）时照样渲染：判定不依赖登记表。 */
       const orphanList = Array.isArray(data.orphanProjections) ? data.orphanProjections : []
       const orphanCount = data.orphanCount ?? orphanList.length
       const orphanSection = orphanCount > 0 ? h('div', { className: 'ac-report' },
-        h('div', null, h('b', null, `${ZH.invOrphanTitle}：${orphanCount} 个（${data.orphanKB ?? 0} KB）`)),
-        h('div', { className: 'ac-row-desc' }, ZH.invOrphanDesc),
+        h('div', null, h('b', null, `${t('invOrphanTitle')}：${orphanCount} 个（${data.orphanKB ?? 0} KB）`)),
+        h('div', { className: 'ac-row-desc' }, t('invOrphanDesc')),
         ...orphanList.slice(0, 20).map((o) => h('div', { key: o.id, style: { fontFamily: 'monospace' } },
           `${String(o.id).slice(0, 26)}  ${o.sizeKB}KB  ${o.mtime}（${o.ageMinutes} 分钟前）`)),
         orphanList.length > 20 ? h('div', { className: 'ac-row-desc' }, `（还有 ${orphanList.length - 20} 条没列出，清理是一起清的）`) : null,
         h('div', { className: 'ac-row' },
-          h('div', { className: 'ac-row-desc', style: { flex: 1 } }, orphanConfirming ? ZH.invOrphanConfirm.replace('{count}', String(orphanCount)) : ''),
+          h('div', { className: 'ac-row-desc', style: { flex: 1 } }, orphanConfirming ? t('invOrphanConfirm').replace('{count}', String(orphanCount)) : ''),
           orphanConfirming
-            ? h('button', { className: 'ac-btn', disabled: busy, onClick: () => void purgeOrphans() }, ZH.invOrphanConfirm.replace('{count}', String(orphanCount)))
-            : h('button', { className: 'ac-btn', disabled: busy, onClick: () => setOrphanConfirming(true) }, ZH.invOrphanClean),
-          orphanConfirming ? h('button', { className: 'ac-btn', onClick: () => setOrphanConfirming(false) }, ZH.invCancel) : null)) : null
+            ? h('button', { className: 'ac-btn', disabled: busy, onClick: () => void purgeOrphans() }, t('invOrphanConfirm').replace('{count}', String(orphanCount)))
+            : h('button', { className: 'ac-btn', disabled: busy, onClick: () => setOrphanConfirming(true) }, t('invOrphanClean')),
+          orphanConfirming ? h('button', { className: 'ac-btn', onClick: () => setOrphanConfirming(false) }, t('invCancel')) : null)) : null
 
       if (data.ok !== true) {
         /* 保险拦下（登记表疑似异常）：讲清「为什么没删 / 共多少条 / 怎么强行清」，不再只丢一句错。 */
         const ids = Array.isArray(data.anomalyIds) ? data.anomalyIds : []
         return wrap(
-          h('div', { className: 'ac-hint-warn' }, data.reason || ZH.invScanUnavailable),
+          h('div', { className: 'ac-hint-warn' }, data.reason || t('invScanUnavailable')),
           h('div', { className: 'ac-report' },
-            h('div', null, h('b', null, ZH.invSkippedTitle.replace('{count}', String(data.anomalyCount ?? ids.length)))),
+            h('div', null, h('b', null, t('invSkippedTitle').replace('{count}', String(data.anomalyCount ?? ids.length)))),
             h('div', null, reasonText('registry-anomaly')),
             ids.length
               ? h('div', { style: { fontFamily: 'monospace' } }, ids.slice(0, 8).map((x) => String(x).slice(0, 8)).join(' ') + (ids.length > 8 ? ' …' : ''))
@@ -1542,7 +1826,7 @@ window.__ModuleLoader__.load({
           forceRow,
           blockedBlock,
           orphanSection,
-          h('div', { className: 'ac-row-desc' }, note || ZH.invNote))
+          h('div', { className: 'ac-row-desc' }, note || t('invNote')))
       }
 
       const familyCount = data.familyCount ?? 0
@@ -1556,12 +1840,12 @@ window.__ModuleLoader__.load({
 
       const rows = data.sessions.slice(0, 50).map((s) => h('div', { key: s.id, className: 'ac-session' },
         h('div', { style: { minWidth: 0, flex: 1 } },
-          h('div', { className: 'ac-session-name' }, (s.title || ZH.invNoTitle) + (s.family ? ` · ${ZH.invFamilyTag}` : '')),
+          h('div', { className: 'ac-session-name' }, (s.title || t('invNoTitle')) + (s.family ? ` · ${t('invFamilyTag')}` : '')),
           h('div', { className: 'ac-session-hint', style: { fontFamily: 'monospace' } },
             `${String(s.id).slice(0, 26)}  ${s.sizeMB}MB  ${s.mtime}（${s.ageMinutes} 分钟前）`),
           s.workspaceKey
             ? h('div', { className: 'ac-session-hint', style: { fontFamily: 'monospace' } },
-                `${ZH.invPathLabel}：${String(s.workspaceKey).slice(0, 60)}`)
+                `${t('invPathLabel')}：${String(s.workspaceKey).slice(0, 60)}`)
             : null)))
 
       const more = data.sessions.length > rows.length
@@ -1569,28 +1853,28 @@ window.__ModuleLoader__.load({
         : null
 
       const familyNote = familyCount > 0
-        ? h('div', { className: 'ac-hint-warn' }, ZH.invFamilyNote.replace('{count}', String(familyCount)))
+        ? h('div', { className: 'ac-hint-warn' }, t('invFamilyNote').replace('{count}', String(familyCount)))
         : null
 
       const anomalyNote = data.registryAnomaly === true
-        ? h('div', { className: 'ac-hint-warn' }, ZH.invAnomalyOn)
+        ? h('div', { className: 'ac-hint-warn' }, t('invAnomalyOn'))
         : null
 
       const actionRow = h('div', { className: 'ac-row' },
-        h('div', { className: 'ac-row-desc' }, ZH.invSweepNote),
+        h('div', { className: 'ac-row-desc' }, t('invSweepNote')),
         h('div', { style: { display: 'flex', gap: '8px' } },
           data.sessions.length === 0
             ? null
             : (confirming
               ? h('button', { className: 'ac-btn', disabled: busy, onClick: () => void purge() },
-                  (force ? ZH.invConfirmForce : ZH.invConfirm).replace('{count}', String(targetCount)))
+                  (force ? t('invConfirmForce') : t('invConfirm')).replace('{count}', String(targetCount)))
               : h('button', { className: 'ac-btn', disabled: busy || (targetCount === 0 && data.sessions.length > 0), onClick: () => setConfirming(true) },
-                  force ? ZH.invCleanForce : ZH.invClean)),
-          confirming ? h('button', { className: 'ac-btn', onClick: () => setConfirming(false) }, ZH.invCancel) : null))
+                  force ? t('invCleanForce') : t('invClean'))),
+          confirming ? h('button', { className: 'ac-btn', onClick: () => setConfirming(false) }, t('invCancel')) : null))
 
       return wrap(summary, anomalyNote, familyNote, forceRow, actionRow, ...rows, more, blockedBlock, reasonBlock,
         orphanSection,
-        h('div', { className: 'ac-row-desc' }, note || ZH.invNote))
+        h('div', { className: 'ac-row-desc' }, note || t('invNote')))
     }
 
     /* ── F线：子代理对话管理（2026-10-24）────────────────────────
@@ -1610,8 +1894,8 @@ window.__ModuleLoader__.load({
         try {
           const r = await fetchJson(SUBAGENT)
           if (r.ok && r.data && r.data.value) setData(r.data.value)
-          else setNote(ZH.subReadFailed)
-        } catch { setNote(ZH.subReadFailed) }
+          else setNote(t('subReadFailed'))
+        } catch { setNote(t('subReadFailed')) }
       }, [])
 
       useEffect(() => { void load() }, [load])
@@ -1628,12 +1912,12 @@ window.__ModuleLoader__.load({
           })
           if (r.ok && r.data && r.data.ok) {
             const refused = (r.data.results || []).filter((x) => x.status !== 'deleted' && x.status !== 'not-found').length
-            setNote(ZH.subFreed.replace('{count}', String(r.data.deletedCount ?? 0)).replace('{mb}', String(r.data.freedMB ?? 0))
+            setNote(t('subFreed').replace('{count}', String(r.data.deletedCount ?? 0)).replace('{mb}', String(r.data.freedMB ?? 0))
               + (refused > 0 ? `（${refused} 条被拒，见结果）` : ''))
             await load()
-          } else setNote(ZH.subPurgeFailed + '：' + String(r.data && r.data.error ? r.data.error : ZH.invUnknown))
+          } else setNote(t('subPurgeFailed') + '：' + String(r.data && r.data.error ? r.data.error : t('invUnknown')))
         } catch (e) {
-          setNote(ZH.subPurgeFailed + '：' + String(e && e.message ? e.message : e))
+          setNote(t('subPurgeFailed') + '：' + String(e && e.message ? e.message : e))
         } finally {
           setBusy(false)
           setConfirming(false)
@@ -1642,39 +1926,39 @@ window.__ModuleLoader__.load({
 
       const wrap = (...kids) => h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
         h('div', { className: 'ac-row' },
-          h('div', { className: 'ac-row-desc' }, ZH.subCleanTitle),
-          h('button', { className: 'ac-btn', onClick: () => void load() }, ZH.invRefresh)),
+          h('div', { className: 'ac-row-desc' }, t('subCleanTitle')),
+          h('button', { className: 'ac-btn', onClick: () => void load() }, t('invRefresh'))),
         ...kids)
 
-      if (!data) return wrap(h('div', { className: 'ac-row-desc' }, note || ZH.subScanning))
+      if (!data) return wrap(h('div', { className: 'ac-row-desc' }, note || t('subScanning')))
 
       const liveCount = (data.sessions ?? []).filter((s) => s.live).length
       const dead = (data.sessions ?? []).filter((s) => !s.live)
 
       const rows = dead.slice(0, 30).map((s) => h('div', { key: s.id, className: 'ac-session' },
         h('div', { style: { minWidth: 0, flex: 1 } },
-          h('div', { className: 'ac-session-name' }, s.title ? `「${s.title}」` : ZH.invNoTitle),
+          h('div', { className: 'ac-session-name' }, s.title ? `「${s.title}」` : t('invNoTitle')),
           h('div', { className: 'ac-session-hint', style: { fontFamily: 'monospace' } },
             `${String(s.id).slice(0, 26)}  ${s.sizeMB}MB  ${s.mtime}  depth=${s.depth ?? '?'}`))))
 
       const actionRow = h('div', { className: 'ac-row' },
         h('div', { className: 'ac-row-desc' },
           data.count === 0
-            ? ZH.subEmpty
-            : ZH.subSummary.replace('{count}', String(data.count)).replace('{mb}', String(data.totalMB))
-              + (liveCount > 0 ? ZH.subLiveNote.replace('{count}', String(liveCount)) : '')),
+            ? t('subEmpty')
+            : t('subSummary').replace('{count}', String(data.count)).replace('{mb}', String(data.totalMB))
+              + (liveCount > 0 ? t('subLiveNote').replace('{count}', String(liveCount)) : '')),
         h('div', { style: { display: 'flex', gap: '8px' } },
           dead.length === 0
             ? null
             : (confirming
               ? h('button', { className: 'ac-btn', disabled: busy, onClick: () => void purge() },
-                  ZH.subConfirm.replace('{count}', String(dead.length)))
-              : h('button', { className: 'ac-btn', disabled: busy, onClick: () => setConfirming(true) }, ZH.subClean)),
-          confirming ? h('button', { className: 'ac-btn', onClick: () => setConfirming(false) }, ZH.invCancel) : null))
+                  t('subConfirm').replace('{count}', String(dead.length)))
+              : h('button', { className: 'ac-btn', disabled: busy, onClick: () => setConfirming(true) }, t('subClean'))),
+          confirming ? h('button', { className: 'ac-btn', onClick: () => setConfirming(false) }, t('invCancel')) : null))
 
       return wrap(actionRow, ...rows,
         data.count > 30 ? h('div', { className: 'ac-row-desc' }, `…共 ${data.count} 条` ) : null,
-        h('div', { className: 'ac-row-desc' }, note || ZH.subNote))
+        h('div', { className: 'ac-row-desc' }, note || t('subNote')))
     }
 
     /* ── A线：自动瘦身设置（2026-10-24，默认关）─────────────────────
@@ -1695,8 +1979,8 @@ window.__ModuleLoader__.load({
         try {
           const r = await fetchJson(SLIM_OPTS)
           if (r.ok && r.data && r.data.options) setOpts(r.data.options)
-          else setNote('读取失败')
-        } catch { setNote('读取失败') }
+          else setNote(t('loadFailed'))
+        } catch { setNote(t('loadFailed')) }
       }, [])
 
       useEffect(() => { void load() }, [load])
@@ -1716,26 +2000,26 @@ window.__ModuleLoader__.load({
               minEvents: Math.max(100, Number(opts.minEvents) || 2000),
             }),
           })
-          if (r.ok && r.data && r.data.options) { setOpts(r.data.options); setNote('已保存 · 下次开机生效') }
-          else setNote('保存失败：' + String(r.data && r.data.error ? r.data.error : '未知原因'))
-        } catch (e) { setNote('保存失败：' + String(e && e.message ? e.message : e)) }
+          if (r.ok && r.data && r.data.options) { setOpts(r.data.options); setNote(t('savedNextBoot')) }
+          else setNote(t('sidefoldSaveFail') + String(r.data && r.data.error ? r.data.error : t('unknownReason')))
+        } catch (e) { setNote(t('sidefoldSaveFail') + String(e && e.message ? e.message : e)) }
         finally { setBusy(false) }
       }
 
-      if (!opts) return h('div', { className: 'ac-row-desc' }, note || '读取设置…')
+      if (!opts) return h('div', { className: 'ac-row-desc' }, note || t('loadingPrefs'))
 
       const toggle = (key) => () => setOpts((p) => ({ ...p, [key]: p[key] !== true }))
 
       const autoRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.asToggle),
-          h('div', { className: 'ac-row-desc' }, ZH.asToggleDesc)),
-        h('button', { className: 'ac-btn', onClick: toggle('autoSlim') }, opts.autoSlim === true ? '已开启' : '已关闭'))
+          h('div', { className: 'ac-row-title' }, t('asToggle')),
+          h('div', { className: 'ac-row-desc' }, t('asToggleDesc'))),
+        h('button', { className: 'ac-btn', onClick: toggle('autoSlim') }, opts.autoSlim === true ? t('renderFxOn') : t('renderFxOff')))
 
       const keepRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.asKeep),
-          h('div', { className: 'ac-row-desc' }, ZH.asKeepDesc)),
+          h('div', { className: 'ac-row-title' }, t('asKeep')),
+          h('div', { className: 'ac-row-desc' }, t('asKeepDesc'))),
         h('input', {
           className: 'ac-btn', type: 'number', min: 0, max: 500, step: 1, style: { width: '100px' },
           value: String(opts.keepTurns ?? 10),
@@ -1744,14 +2028,14 @@ window.__ModuleLoader__.load({
 
       const digestRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.asDigest),
-          h('div', { className: 'ac-row-desc' }, ZH.asDigestDesc)),
-        h('button', { className: 'ac-btn', onClick: toggle('digest') }, opts.digest !== false ? '已开启' : '已关闭'))
+          h('div', { className: 'ac-row-title' }, t('asDigest')),
+          h('div', { className: 'ac-row-desc' }, t('asDigestDesc'))),
+        h('button', { className: 'ac-btn', onClick: toggle('digest') }, opts.digest !== false ? t('renderFxOn') : t('renderFxOff')))
 
       const minRow = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.asMin),
-          h('div', { className: 'ac-row-desc' }, ZH.asMinDesc)),
+          h('div', { className: 'ac-row-title' }, t('asMin')),
+          h('div', { className: 'ac-row-desc' }, t('asMinDesc'))),
         h('input', {
           className: 'ac-btn', type: 'number', min: 100, max: 100000, step: 100, style: { width: '110px' },
           value: String(opts.minEvents ?? 2000),
@@ -1761,8 +2045,8 @@ window.__ModuleLoader__.load({
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
         autoRow, keepRow, digestRow, minRow,
         h('div', { className: 'ac-row' },
-          h('div', { className: 'ac-row-desc' }, note || ZH.asNote),
-          h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? '保存中…' : '保存')))
+          h('div', { className: 'ac-row-desc' }, note || t('asNote')),
+          h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? t('saving') : t('save'))))
     }
 
     function HealSection() {      const [opts, setOpts] = useState({ bootScan: false, sendScan: false, skipUnchanged: false })
@@ -1859,26 +2143,26 @@ window.__ModuleLoader__.load({
           setManualNote('')
           try {
             const r = await fetchJson(route, { method: 'POST' })
-            setManualNote(r.ok && r.data && r.data.ok ? `${label}：完成` : `${label}失败：${String(r.data && r.data.error ? r.data.error : '未知')}`)
+            setManualNote(r.ok && r.data && r.data.ok ? `${label}：完成` : `${label}失败：${String(r.data && r.data.error ? r.data.error : t('unknown'))}`)
           } catch (e) {
             setManualNote(`${label}失败：${String(e && e.message ? e.message : e)}`)
           } finally {
             setManualBusy('')
           }
         },
-      }, manualBusy === key ? '执行中…' : label)
+      }, manualBusy === key ? t('running') : label)
 
       const head = h('div', { className: 'ac-row' },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, ZH.healNav),
-          h('div', { className: 'ac-row-desc' }, ZH.healDesc)))
+          h('div', { className: 'ac-row-title' }, t('healNav')),
+          h('div', { className: 'ac-row-desc' }, t('healDesc'))))
 
       const buttons = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
         h('button', { className: 'ac-btn ac-btn-primary', disabled: saving, onClick: save },
-          saving ? '保存中…' : (saved === 'ok' ? ZH.healSaved : ZH.healSave)),
-        saved === 'fail' ? h('span', { className: 'ac-hint-warn' }, ZH.healSaveFail) : null,
+          saving ? t('saving') : (saved === 'ok' ? t('healSaved') : t('healSave'))),
+        saved === 'fail' ? h('span', { className: 'ac-hint-warn' }, t('healSaveFail')) : null,
         h('button', { className: 'ac-btn', disabled: checking, onClick: check },
-          checking ? ZH.healChecking : ZH.healCheck))
+          checking ? t('healChecking') : t('healCheck')))
 
       let reportBlock = null
       if (report) {
@@ -1887,20 +2171,20 @@ window.__ModuleLoader__.load({
         if (report.unreadable && report.unreadable.length) kids.push(h('div', null, `读取失败 ${report.unreadable.length} 个`))
         if (report.withBlanks > 0) {
           kids.push(h('div', null, h('b', null, `${report.withBlanks} 个会话共 ${report.totalBlanks} 条空工具结果`)))
-          kids.push(h('div', null, '（断流/附件加载失败留下的残缺；发送前扫会兜底，也可点下面按钮根治到盘上）'))
+          kids.push(h('div', null, t('healBrokenNote')))
         }
         /* 失效附件（9999.9.38）：以前完全不查，所以「所有对话正常」是假阴性 ——
            结构完好、字节已不在磁盘上的图片块会让官方 DeepSeek 整轮拒收。 */
         if (report.totalDeadAttachments > 0) {
           kids.push(h('div', null, h('b', null, `${report.withDeadAttachments} 个会话共 ${report.totalDeadAttachments} 个失效附件（图片/文件已不在磁盘上）`)))
-          kids.push(h('div', null, '（发给 DeepSeek 官方 API 会整轮拒收；出口守卫会替换成占位，也可点下面按钮根治到盘上）'))
+          kids.push(h('div', null, t('healRejectNote')))
         }
         if (report.withBlanks > 0 || report.totalDeadAttachments > 0) {
           kids.push(h('div', { style: { marginTop: '6px' } },
             h('button', { className: 'ac-btn ac-btn-primary', disabled: fixing, onClick: fix },
-              fixing ? ZH.healRepairing : ZH.healRepair)))
+              fixing ? t('healRepairing') : t('healRepair'))))
         } else {
-          kids.push(h('div', null, ZH.healClean))
+          kids.push(h('div', null, t('healClean')))
         }
         reportBlock = h('div', { className: 'ac-report' }, ...kids)
       }
@@ -1921,46 +2205,58 @@ window.__ModuleLoader__.load({
       const body = loaded
         ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
             /* 2026-10-16 用户要求：本分区里**每个大项**都折叠、默认收起（点标题或右侧按钮展开）。 */
-            h(Fold, { key: 'main', title: ZH.healMain, desc: ZH.healMainDesc },
-              checkRow('bootScan', ZH.healBoot, ZH.healBootDesc),
-              checkRow('sendScan', ZH.healSend, ZH.healSendDesc, opts.sendScan ? null : ZH.healSendWarn),
-              checkRow('skipUnchanged', ZH.healSkip, ZH.healSkipDesc),
+            h(Fold, { key: 'main', title: t('healMain'), desc: t('healMainDesc') },
+              checkRow('bootScan', t('healBoot'), t('healBootDesc')),
+              checkRow('sendScan', t('healSend'), t('healSendDesc'), opts.sendScan ? null : t('healSendWarn')),
+              checkRow('skipUnchanged', t('healSkip'), t('healSkipDesc')),
               buttons,
               reportBlock,
               fixBlock),
             /* A线（2026-10-24）：自动瘦身（默认关）。设置存 adapter-compat-slim.json，
                与 heal-options 解耦；手动瘦身照旧走会话与提示词里的瘦身面板。 */
-            h(Fold, { key: 'autoslim', title: ZH.asNav, desc: ZH.asDesc }, h(AutoSlimBlock)),
+            h(Fold, { key: 'autoslim', title: t('asNav'), desc: t('asDesc') }, h(AutoSlimBlock)),
             /* 2026-10-16 用户要求：扫描频率/自动扫描/校准频率都做成开关，手动校准也要有。 */
-            h(Fold, { key: 'cadence', title: ZH.cadNav, desc: ZH.cadDesc },
-              h('div', { className: 'ac-row-desc' }, ZH.cadChangeTitle),
-              checkRow('changeRescan', ZH.cadRescan, ZH.cadRescanDesc),
-              checkRow('changePurge', ZH.cadPurge, ZH.cadPurgeDesc),
-              checkRow('changeHeadGuard', ZH.cadHead, ZH.cadHeadDesc),
-              numRow('watchDebounceMs', ZH.cadDebounce, ZH.cadDebounceDesc, { min: 0.2, max: 600, unit: '秒', scale: 1000 }),
-              numRow('watchPollMs', ZH.cadPoll, ZH.cadPollDesc, { min: 5, max: 3600, unit: '秒', scale: 1000 }),
-              h('div', { className: 'ac-row-desc', style: { marginTop: '6px' } }, ZH.cadBootTitle),
-              checkRow('bootTitleWarm', ZH.cadBootWarm, ZH.cadBootWarmDesc),
-              checkRow('bootHeadGuard', ZH.cadBootHead, ZH.cadBootHeadDesc),
-              checkRow('bootTrueDelete', ZH.cadBootTrueDelete, ZH.cadBootTrueDeleteDesc),
-              h('div', { className: 'ac-row-desc', style: { marginTop: '6px' } }, ZH.cadCalTitle),
-              checkRow('pressureCalibration', ZH.cadCal, ZH.cadCalDesc),
-              numRow('pressureCalibrationIntervalMs', ZH.cadCalInterval, ZH.cadCalIntervalDesc, { min: 0, max: 3600, unit: '秒（0 = 只在启动跑一次）', scale: 1000 }),
+            h(Fold, { key: 'cadence', title: t('cadNav'), desc: t('cadDesc') },
+              h('div', { className: 'ac-row-desc' }, t('cadChangeTitle')),
+              checkRow('changeRescan', t('cadRescan'), t('cadRescanDesc')),
+              checkRow('changePurge', t('cadPurge'), t('cadPurgeDesc')),
+              checkRow('changeHeadGuard', t('cadHead'), t('cadHeadDesc')),
+              numRow('watchDebounceMs', t('cadDebounce'), t('cadDebounceDesc'), { min: 0.2, max: 600, unit: t('unitSec'), scale: 1000 }),
+              numRow('watchPollMs', t('cadPoll'), t('cadPollDesc'), { min: 5, max: 3600, unit: t('unitSec'), scale: 1000 }),
+              h('div', { className: 'ac-row-desc', style: { marginTop: '6px' } }, t('cadBootTitle')),
+              checkRow('bootTitleWarm', t('cadBootWarm'), t('cadBootWarmDesc')),
+              checkRow('bootHeadGuard', t('cadBootHead'), t('cadBootHeadDesc')),
+              checkRow('bootTrueDelete', t('cadBootTrueDelete'), t('cadBootTrueDeleteDesc')),
+              h('div', { className: 'ac-row-desc', style: { marginTop: '6px' } }, t('cadCalTitle')),
+              checkRow('pressureCalibration', t('cadCal'), t('cadCalDesc')),
+              numRow('pressureCalibrationIntervalMs', t('cadCalInterval'), t('cadCalIntervalDesc'), { min: 0, max: 3600, unit: t('unitSecOnce'), scale: 1000 }),
               h('div', { className: 'ac-row' },
-                h('div', { className: 'ac-row-desc' }, ZH.cadManualNote),
+                h('div', { className: 'ac-row-desc' }, t('cadManualNote')),
                 h('div', { style: { display: 'flex', gap: '8px' } },
-                  manualBtn('/dsh-adapter-compat/calibrate-now', ZH.cadManualCal, 'cal'),
-                  manualBtn('/dsh-adapter-compat/warm-now', ZH.cadManualWarm, 'warm'))),
-              h('div', { className: 'ac-row-desc' }, manualNote || ZH.cadRestartHint)),
-            h(Fold, { key: 'inv', title: ZH.invNav, desc: ZH.invDesc }, h(InvisibleBlock)),
-            h(Fold, { key: 'sub', title: ZH.subNav, desc: ZH.subDesc }, h(SubagentBlock)),
-            h(Fold, { key: 'ver', title: ZH.verNav, desc: ZH.verDesc }, h(VersionsBlock)))
-        : h('div', { className: 'ac-row-desc' }, '加载选项…')
+                  manualBtn('/dsh-adapter-compat/calibrate-now', t('cadManualCal'), 'cal'),
+                  manualBtn('/dsh-adapter-compat/warm-now', t('cadManualWarm'), 'warm'))),
+              h('div', { className: 'ac-row-desc' }, manualNote || t('cadRestartHint'))),
+            h(Fold, { key: 'inv', title: t('invNav'), desc: t('invDesc') }, h(InvisibleBlock)),
+            h(Fold, { key: 'sub', title: t('subNav'), desc: t('subDesc') }, h(SubagentBlock)),
+            h(Fold, { key: 'ver', title: t('verNav'), desc: t('verDesc') }, h(VersionsBlock)))
+        : h('div', { className: 'ac-row-desc' }, t('loadingPrefs'))
 
       return h('div', { className: 'ac-settings' }, head, body)
     }
 
     function apply(ctx) {
+      /* 2026-11-12 i18n：注册宿主 locale（zh/en），语言切换由宿主重渲染生效；locale 服务缺席时回落中文。 */
+      try {
+        ctx.effect(() => ctx.locale && ctx.locale.register && ctx.locale.register(NS, { zh: ZH, en: EN }), `${NS}: dictionaries`)
+        const bound = ctx.locale && typeof ctx.locale.bind === 'function' ? ctx.locale.bind(NS) : null
+        if (bound) {
+          t = (key, vars) => {
+            let out = bound(key) || ZH[key] || key
+            if (vars) for (const [k, v] of Object.entries(vars)) out = out.split('{' + k + '}').join(String(v))
+            return out
+          }
+        }
+      } catch { /* locale 缺席回落中文 */ }
       /* 2026-10-11 夜：本插件的「侧栏排序」设置分区已**退役** ——
          用户定案排序改在 dsh-session-kit 的两个面板里（工作区管理 / 会话搬家（批量））。
          本插件的 order.js 三条路由**保留**，现在只作为 session-kit 的后端。 */
@@ -1976,7 +2272,8 @@ window.__ModuleLoader__.load({
           name: 'settings.section',
           id: `${NS}-heal`,
           order: 37,
-          label: ZH.healNav,
+          locale: NS,
+          label: () => t('healNav'),
         }, HealSection)), `${NS}: heal section`)
       } catch {
         /* 注册失败不影响插件其余部分 */
@@ -2027,7 +2324,8 @@ window.__ModuleLoader__.load({
             name: 'settings.section',
             id: `${NS}-exit-standalone`,
             order: 36,
-            label: ZH.exitNav,
+            locale: NS,
+            label: () => t('exitNav'),
           }, ExitSection)
           standaloneExitDispose = dispose
           return dispose
@@ -2079,7 +2377,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            marker: 'adapter-client-9999.9.46-globalsrc',
+            marker: 'adapter-client-9999.9.47-i18n',
             nested: nestedExitActive,
             fallback: typeof standaloneExitDispose === 'function',
             skExtraEntries,
