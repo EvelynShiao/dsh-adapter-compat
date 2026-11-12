@@ -154,7 +154,10 @@ export function writeSidebarGroups(patch, home = dshHomeDir()) {
 }
 
 /**
- * 装两条路由（GET 读 / POST 写）。webServer 不可用时返回 false，不影响插件其余部分。
+ * 装一条路由（GET 读 / POST 写，handler 内按 method 分发）。webServer 不可用时返回 false，不影响插件其余部分。
+ * 2026-11-12 修复：宿主 webserver 拒绝同路径 exact 重复注册（日志实锤
+ * "webserver: duplicate exact route"）——原先 GET/POST 各注册一条 → POST 注册失败、
+ * 落盘永远 405。改为单条注册内部分发（与 session-kit /sidebar-entries 同款套路）。
  * @param {object} ctx - cordis 上下文。
  * @param {{sidebarGroupsRoute?:boolean}} config - sidebarGroupsRoute:false 可整层关掉。
  * @returns {boolean} 是否装上了。
@@ -175,33 +178,29 @@ export function installSidebarFoldRoute(ctx, config = {}) {
         /* ignore */
       }
     }
-    const route = (method, run) => {
-      web.register({
-        kind: 'exact',
-        path: READ_PATH,
-        handler: async (req, res) => {
-          if (req.method !== method) return reply(res, 405, { ok: false, error: 'method-not-allowed' })
-          try {
-            const value = await run(req)
-            return reply(res, 200, { ok: true, value })
-          } catch (error) {
-            const status = statusOf(error)
-            const message = String(error?.message ?? error)
-            foldLog(`route FAILED(${status}) ${method} ${READ_PATH}: ${message.slice(0, 200)}`)
-            return reply(res, status, { ok: false, error: message })
+    web.register({
+      kind: 'exact',
+      path: READ_PATH,
+      handler: async (req, res) => {
+        if (req.method !== 'GET' && req.method !== 'POST') {
+          return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+        }
+        try {
+          if (req.method === 'POST') {
+            const result = writeSidebarGroups(await readJsonBody(req))
+            if (!result.ok) throw fail('BAD_REQUEST', result.error ?? 'invalid')
+            return reply(res, 200, { ok: true, value: result.value })
           }
-        },
-      })
-      foldLog(`route registered ${method} ${READ_PATH}`)
-    }
-
-    route('GET', async () => readSidebarGroups())
-    route('POST', async (req) => {
-      const body = await readJsonBody(req)
-      const result = writeSidebarGroups(body)
-      if (!result.ok) throw fail('BAD_REQUEST', result.error ?? 'invalid')
-      return result.value
+          return reply(res, 200, { ok: true, value: readSidebarGroups() })
+        } catch (error) {
+          const status = statusOf(error)
+          const message = String(error?.message ?? error)
+          foldLog(`route FAILED(${status}) ${req.method} ${READ_PATH}: ${message.slice(0, 200)}`)
+          return reply(res, status, { ok: false, error: message })
+        }
+      },
     })
+    foldLog(`route registered GET+POST ${READ_PATH}`)
 
     return true
   } catch (error) {
