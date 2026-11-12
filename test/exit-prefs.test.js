@@ -93,66 +93,70 @@ test('原子写：不残留 .tmp 文件', () => {
   assert.deepEqual(leftovers, [])
 })
 
-test('2026-11-08 LDW 改绑：UI 开关写 ldw 段；API 通道（读顶层）不受影响；写后缓存仍失效', () => {
+test('2026-11-12 全局真源：UI 五键写顶层，API 车道同步生效，ldw 段不被 UI 碰', () => {
   const home = tempHome()
-  seedWebinConfig(home, { kbProtocol: false, nlToolProtocol: false, chatOnly: false, zhToolNames: false })
+  seedWebinConfig(home, { kbProtocol: false, nlToolProtocol: false, chatOnly: false, zhToolNames: false, ldw: { replyTimeoutMs: 1800000 } })
   // 预热：把顶层 kb=false 读进模块级 healOptionsCache（2s TTL）
   const before = readHealOptions(home)
   assert.equal(before.kbProtocol, false)
-  assert.equal(before.kbTrim, false)
   // 走 exit-prefs 真实写路径改 kb=true
   const r = writeExitPrefs({ kbProtocol: true }, home)
   assert.equal(r.ok, true)
   assert.equal(r.changed.webin, true)
-  // UI/LDW 侧（readExitPrefs = ldw 段 ?? 顶层）立即读到新值
+  // UI 读回 = 全局值
   assert.equal(readExitPrefs(home).kbProtocol, true)
-  // 落盘位置：ldw 段；顶层键不被 UI 碰（地盘分离）
+  // 落盘位置：顶层键（全局真源）；ldw 段（运行参数地盘）不被 UI 碰
   const doc = JSON.parse(readFileSync(webinConfigPath(home), 'utf8'))
-  assert.equal(doc.ldw.kbProtocol, true)
-  assert.equal(doc.kbProtocol, false)
-  // API 通道（mergeWebinSwitches 读顶层）不受 UI 开关影响——LDW 专属段只喂 ldwCfg()
+  assert.equal(doc.kbProtocol, true)
+  assert.deepEqual(doc.ldw, { replyTimeoutMs: 1800000 })
+  // API 车道（mergeWebinSwitches 只读顶层）同步生效——这就是「全局开关对全局生效」
   const after = readHealOptions(home)
-  assert.equal(after.kbProtocol, false)
-  assert.equal(after.kbTrim, false)
-  // 反向：改回 false 也写 ldw 段（显式布尔，不让顶层兜底污染 UI 态）
-  assert.equal(writeExitPrefs({ kbProtocol: false }, home).ok, true)
-  assert.equal(readExitPrefs(home).kbProtocol, false)
-  const doc2 = JSON.parse(readFileSync(webinConfigPath(home), 'utf8'))
-  assert.equal(doc2.ldw.kbProtocol, false)
-  assert.equal(doc2.kbProtocol, false)
+  assert.equal(after.kbProtocol, true)
+  assert.equal(after.kbTrim, true)
 })
 
-test('LDW 改绑 GET 回落：ldw 段缺键时回落顶层；ldw 段烂数值不透传', () => {
+test('2026-11-12 地盘隔离：ldw 段独立值不影响 API 车道（回滚 ec93f9e 实证）', () => {
   const home = tempHome()
-  // ldw 段只有 chatOnly，其余键缺省 → 回落顶层归一值（顶层显式给值，避开缺省语义）
-  seedWebinConfig(home, { chatOnly: false, kbProtocol: false, nlToolProtocol: false, zhToolNames: false, txtChunkBytes: 10000, ldw: { chatOnly: true } })
+  // ldw 段带独立 true，顶层 false —— API 车道必须只认顶层
+  seedWebinConfig(home, { chatOnly: false, kbProtocol: false, zhToolNames: false, nlToolProtocol: false, ldw: { followGlobal: false, chatOnly: true, kbProtocol: true } })
+  const api = readHealOptions(home)
+  assert.equal(api.chatOnly, false)
+  assert.equal(api.kbProtocol, false)
+  assert.equal(api.kbTrim, false)
+  // UI 显示的仍是全局值（独立值只在 ldwCustom 里回显）
   const p = readExitPrefs(home)
-  assert.equal(p.chatOnly, true)            // ldw 段在场
-  assert.equal(p.zhToolNames, false)        // ldw 缺 → 顶层 false
-  assert.equal(p.kbProtocol, false)         // ldw 缺 → 顶层显式 false
-  assert.equal(p.txtChunkBytes, 10000)      // ldw 缺 → 顶层 10000
-  // ldw 段垃圾 txtChunkBytes（字符串/负数）→ 回落顶层
-  seedWebinConfig(home, { txtChunkBytes: 10000, ldw: { txtChunkBytes: 'big' } })
-  assert.equal(readExitPrefs(home).txtChunkBytes, 10000)
-  // ldw 段合法覆盖
-  seedWebinConfig(home, { txtChunkBytes: 10000, ldw: { txtChunkBytes: 4096 } })
-  assert.equal(readExitPrefs(home).txtChunkBytes, 4096)
+  assert.equal(p.chatOnly, false)
+  assert.equal(p.ldwFollowGlobal, false)
+  assert.equal(p.ldwCustom.chatOnly, true)
+  assert.equal(p.ldwCustom.kbProtocol, true)
 })
 
-test('LDW 改绑五键齐写：保存一次五键全部落 ldw 段（显式布尔），顶层原样', () => {
+test('LDW 独立模式：ldwCustom 落段+followGlobal=false；切回跟随清段内五键（replyTimeoutMs 保留）', () => {
   const home = tempHome()
-  seedWebinConfig(home, { sendDelayMinMs: 2000, chatOnly: false, txtChunkBytes: 409600 })
-  const r = writeExitPrefs({ chatOnly: true, zhToolNames: true, nlToolProtocol: true, kbProtocol: false, txtChunkBytes: 8192 }, home)
+  seedWebinConfig(home, { chatOnly: false, txtChunkBytes: 409600, sendDelayMinMs: 2000, ldw: { replyTimeoutMs: 1800000 } })
+  // 切独立 + 写独立值（浅合并：未给的键回显全局值落成显式布尔）
+  const r = writeExitPrefs({ ldwFollowGlobal: false, ldwCustom: { chatOnly: true, kbProtocol: false, txtChunkBytes: 10000 } }, home)
   assert.equal(r.ok, true)
-  const doc = JSON.parse(readFileSync(webinConfigPath(home), 'utf8'))
-  assert.deepEqual(doc.ldw, { kbProtocol: false, nlToolProtocol: true, txtChunkBytes: 8192, chatOnly: true, zhToolNames: true })
-  assert.equal(doc.chatOnly, false)         // 顶层保持
-  assert.equal(doc.txtChunkBytes, 409600)   // 顶层保持
-  assert.equal(doc.sendDelayMinMs, 2000)    // 其它键不丢
+  let doc = JSON.parse(readFileSync(webinConfigPath(home), 'utf8'))
+  assert.equal(doc.ldw.followGlobal, false)
+  assert.equal(doc.ldw.chatOnly, true)
+  assert.equal(doc.ldw.kbProtocol, false)
+  assert.equal(doc.ldw.txtChunkBytes, 10000)
+  assert.equal(doc.ldw.replyTimeoutMs, 1800000)   // 运行参数保留
+  assert.equal(doc.chatOnly, false)               // 顶层不被独立值污染
+  assert.equal(doc.sendDelayMinMs, 2000)          // 其它键不丢
   const p = readExitPrefs(home)
-  assert.equal(p.chatOnly, true)
-  assert.equal(p.zhToolNames, true)
-  assert.equal(p.nlToolProtocol, true)
-  assert.equal(p.kbProtocol, false)
-  assert.equal(p.txtChunkBytes, 8192)
+  assert.equal(p.ldwFollowGlobal, false)
+  assert.equal(p.ldwCustom.chatOnly, true)
+  assert.equal(p.ldwCustom.zhToolNames, false)    // 段内未设 → 回显全局
+  // 非法独立值拒绝且不落盘
+  assert.equal(writeExitPrefs({ ldwCustom: { txtChunkBytes: -1 } }, home).ok, false)
+  assert.equal(writeExitPrefs({ ldwFollowGlobal: 'yes' }, home).ok, false)
+  assert.equal(readExitPrefs(home).ldwFollowGlobal, false)
+  // 切回跟随：段内五键+followGlobal 清空，replyTimeoutMs 保留，LDW 回落顶层=全局
+  assert.equal(writeExitPrefs({ ldwFollowGlobal: true }, home).ok, true)
+  doc = JSON.parse(readFileSync(webinConfigPath(home), 'utf8'))
+  assert.deepEqual(doc.ldw, { replyTimeoutMs: 1800000 })
+  assert.equal(readExitPrefs(home).ldwFollowGlobal, true)
 })
+

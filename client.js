@@ -1040,6 +1040,18 @@ window.__ModuleLoader__.load({
               chatOnly: prefs.chatOnly === true,
               /** 中文工具名（2026-10-24）：同源 webin config。 */
               zhToolNames: prefs.zhToolNames === true,
+              /** LDW 独立模式（2026-11-12）：跟随=后端清 ldw 段五键；独立=ldwCustom 落段。
+               *  跟随模式不发 ldwCustom——避免把回显的全局值写进独立段攒残留。 */
+              ldwFollowGlobal: prefs.ldwFollowGlobal !== false,
+              ...(prefs.ldwFollowGlobal === false ? {
+                ldwCustom: {
+                  chatOnly: prefs.ldwCustom?.chatOnly === true,
+                  zhToolNames: prefs.ldwCustom?.zhToolNames === true,
+                  kbProtocol: prefs.ldwCustom?.kbProtocol === true,
+                  nlToolProtocol: prefs.ldwCustom?.nlToolProtocol === true,
+                  txtChunkBytes: Math.max(0, Number(prefs.ldwCustom?.txtChunkBytes) || 0),
+                },
+              } : {}),
             }),
           })
           if (r.ok && r.data && r.data.ok) {
@@ -1120,7 +1132,7 @@ window.__ModuleLoader__.load({
 
       /** 全局 .txt 三件套（2026-10-21 用户定案「不管实际用不用都要弄上」）——
        *  directSendThresholdChars / txtChunkBytes / chatOnly（纯聊天）。
-       *  全局侧写 webin config 同源（LDW 优先生效，除非 LDW 侧点跟随全局）。 */
+       *  全局侧写 webin config 同源（全局真源=顶层；LDW 车道默认跟随全局，独立需开「LDW 车道独立设置」）。 */
       const directThresholdRow = h('div', { className: 'ac-row' },
         h('div', null,
           h('div', { className: 'ac-row-title' }, ZH.directThresholdLabel),
@@ -1170,6 +1182,41 @@ window.__ModuleLoader__.load({
           onClick: () => setPrefs((p) => ({ ...p, nlToolProtocol: p.nlToolProtocol === true ? false : true })),
         }, prefs.nlToolProtocol === true ? '开启' : '关闭'))
 
+      /* LDW 独立模式（2026-11-12）：跟随全局/独立设置。独立时渲染五键编辑行
+         （写 config.ldw 段，仅 LDW 车道读）；跟随模式不渲染（保存时后端清段内五键）。 */
+      const ldwToggleRow = (key, label) => h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, 'LDW·' + label),
+          h('div', { className: 'ac-row-desc' }, '独立值，仅 LDW 车道生效；与上方全局开关互不影响')),
+        h('button', {
+          className: 'ac-btn',
+          onClick: () => setPrefs((p) => ({ ...p, ldwCustom: { ...p.ldwCustom, [key]: !(p.ldwCustom?.[key] === true) } })),
+        }, prefs.ldwCustom?.[key] === true ? '开启' : '关闭'))
+      const ldwNumberRow = (key, label, step) => h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, 'LDW·' + label),
+          h('div', { className: 'ac-row-desc' }, '独立值，仅 LDW 车道生效；与上方全局开关互不影响')),
+        h('input', {
+          className: 'ac-btn',
+          type: 'number', min: 0, step, style: { width: '140px' },
+          value: String(prefs.ldwCustom?.[key] ?? 0),
+          onChange: (e) => setPrefs((p) => ({ ...p, ldwCustom: { ...p.ldwCustom, [key]: Math.max(0, Number(String(e.target.value).replace(/\D/g, '')) || 0) } })),
+        }))
+      const ldwFollowRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, ZH.ldwFollowLabel),
+          h('div', { className: 'ac-row-desc' }, ZH.ldwFollowDesc)),
+        h('button', {
+          className: 'ac-btn',
+          onClick: () => setPrefs((p) => ({ ...p, ldwFollowGlobal: p.ldwFollowGlobal === false })),
+        }, prefs.ldwFollowGlobal === false ? '独立设置中' : '跟随全局'))
+      const ldwRows = prefs.ldwFollowGlobal === false ? [
+        ldwToggleRow('chatOnly', ZH.chatOnlyLabel),
+        ldwToggleRow('zhToolNames', ZH.zhToolNamesLabel),
+        ldwToggleRow('kbProtocol', ZH.kbLabel),
+        ldwToggleRow('nlToolProtocol', ZH.nlToolLabel),
+        ldwNumberRow('txtChunkBytes', ZH.txtChunkLabel, 10240),
+      ] : []
       const titleRow = h('div', { className: 'ac-row' },
         h('div', null,
           h('div', { className: 'ac-row-title' }, ZH.titlePrefixLabel),
@@ -1183,7 +1230,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'ac-row-desc' }, note || ZH.exitNote),
         h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? '保存中…' : ZH.save))
 
-      return wrap([pagerRow, renderFxRow, modeRow, thresholdRow, directThresholdRow, txtChunkRow, chatOnlyRow, zhRow, kbRow, nlRow, titleRow, foot])
+      return wrap([pagerRow, renderFxRow, modeRow, thresholdRow, directThresholdRow, txtChunkRow, chatOnlyRow, zhRow, kbRow, nlRow, ldwFollowRow, ...ldwRows, titleRow, foot])
     }
 
     /* ── 版本家族与磁盘占用（9999.9.25）──────────────────────────
@@ -2032,7 +2079,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            marker: 'adapter-client-9999.9.45-sidefold',
+            marker: 'adapter-client-9999.9.46-globalsrc',
             nested: nestedExitActive,
             fallback: typeof standaloneExitDispose === 'function',
             skExtraEntries,

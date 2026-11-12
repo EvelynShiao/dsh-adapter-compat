@@ -2818,16 +2818,18 @@ function mergeWebinSwitches(value, home) {
   try {
     const webin = JSON.parse(readFileSync(webinConfigPath(home), 'utf8'))
     if (webin !== null && typeof webin === 'object') {
-      const ldw = webin.ldw && typeof webin.ldw === 'object' ? webin.ldw : {}
-      // 优先读 ldw 段（UI/Runner 写入处），回落顶层键（旧版兼容/基线）
-      value.chatOnly = ldw.chatOnly === true || webin.chatOnly === true
-      value.zhToolNames = ldw.zhToolNames === true || webin.zhToolNames === true
-      value.kbProtocol = (ldw.kbProtocol !== undefined ? ldw.kbProtocol : webin.kbProtocol) !== false
-      value.nlToolProtocol = ldw.nlToolProtocol === true || webin.nlToolProtocol === true
-      const effKb = value.kbProtocol
-      const effNl = value.nlToolProtocol
-      value.kbTrim = effKb === true && effNl !== true
-      value.noKbTrim = effNl === true && effKb !== true
+      /* [2026-11-12 回滚 ec93f9e] API 车道只读顶层全局键——webin.ldw 段（含独立值
+         followGlobal=false 时的五键）是 LDW 车道专属，永不影响 API 车道。
+         2026-11-06 铁律「测 LDW 别动全局」回归 + 2026-11-12 Evelyn 定案
+         「全局的开关对全局生效」：顶层键=全局真源，本函数只认顶层。
+         kbTrim/noKbTrim 用 webin 原始值推导（undefined 不满足条件 ⇒ 缺省不裁，
+         防「kb 缺省=true」把默认态模型工具全丢——原版 10-24 语义原样保留）。 */
+      value.chatOnly = webin.chatOnly === true
+      value.zhToolNames = webin.zhToolNames === true
+      value.kbProtocol = webin.kbProtocol !== false
+      value.nlToolProtocol = webin.nlToolProtocol === true
+      value.kbTrim = webin.kbProtocol === true && webin.nlToolProtocol !== true
+      value.noKbTrim = webin.nlToolProtocol === true && webin.kbProtocol === false
     }
   } catch { /* webin config 不存在/损坏：保持原值（kbTrim/noKbTrim 未定义 ⇒ 不裁） */ }
   return value
@@ -3133,12 +3135,13 @@ export function readExitPrefs(home = dshHomeDir()) {
   const mode = COMPACT_EXIT_MODES.includes(webin.compactionFileMode) ? webin.compactionFileMode : COMPACT_EXIT_DEFAULTS.compactionFileMode
   const rawThreshold = Number(webin.compactionFileThresholdChars)
   const threshold = Number.isFinite(rawThreshold) && rawThreshold > 0 ? Math.round(rawThreshold) : COMPACT_EXIT_DEFAULTS.compactionFileThresholdChars
-  /* [2026-11-08 LDW 面板改绑] 五键真源 = webin.ldw 段（LDW 专属地盘，d382070 的 UI 补全）：
-     ldw 段键 ?? 回落顶层键 —— 与 LDW 车道 ldwCfg() 同一语义，UI 显示 = LDW 实际生效值。
-     非布尔垃圾值一律当缺省（回落顶层），不让烂数据透传进 UI。 */
+  /* [2026-11-12 全局真源恢复] 五键真源 = webin 顶层键（全局开关，UI 显示 = 全局实际值）。
+     历史：2026-11-08 曾改绑 webin.ldw 段（3f9fd2a「地盘分离」），2026-11-10 读取侧又改成
+     ldw 优先/或（ec93f9e）——把全局开关的真源让给了 LDW 专属段，Evelyn 定性「功亏一篑」。
+     新定案（2026-11-12）：全局开关对全局生效（API 车道 + LDW 车道默认都吃顶层键）；
+     LDW 要独立必须显式 ldw.followGlobal=false（独立值存 ldw 段五键，仅 LDW 车道读，
+     见 dsh-webin-edge-driver ldwCfg()）。 */
   const ldw = (webin.ldw !== null && typeof webin.ldw === 'object') ? webin.ldw : {}
-  const ldwBool = (v, fallback) => (typeof v === 'boolean' ? v : fallback)
-  const ldwTxt = Number(ldw.txtChunkBytes)
   return {
     compactionFileMode: mode,
     compactionFileThresholdChars: threshold,
@@ -3146,21 +3149,30 @@ export function readExitPrefs(home = dshHomeDir()) {
     /* [B线 2026-10-24] 消息流懒渲染开关：默认关（用户刚被闪退惊过，不替他做默认决定）。
      *  开启后客户端给消息项注入 content-visibility:auto，屏幕外跳过布局绘制。 */
     renderFx: own.renderFx === true,
-    /* 知识库自然语言协议（2026-10-19；2026-11-08 改绑 ldw 段）：ldw.kbProtocol ?? 顶层。 */
-    kbProtocol: ldwBool(ldw.kbProtocol, webin.kbProtocol !== false),
-    /* 自然语言工具调用（通用，2026-10-19；2026-11-08 改绑 ldw 段）：默认关（保守）。 */
-    nlToolProtocol: ldwBool(ldw.nlToolProtocol, webin.nlToolProtocol === true),
-    /* 标题 LDW 前缀（2026-10-19）：默认开。不在 ldw 白名单（车道标题逻辑读顶层），保持绑顶层。 */
+    /* 知识库自然语言协议（2026-10-19；2026-11-12 回归全局真源：读顶层）。 */
+    kbProtocol: webin.kbProtocol !== false,
+    /* 自然语言工具调用（2026-10-19；2026-11-12 回归全局真源：读顶层）。默认关（保守）。 */
+    nlToolProtocol: webin.nlToolProtocol === true,
+    /* 标题 LDW 前缀（2026-10-19）：默认开。 */
     titlePrefix: webin.titlePrefix !== false,
-    /* 全局 .txt 三件套（2026-10-21 用户定案「都要弄上」）：directSendThresholdChars 不在
-     *  ldw 白名单，保持绑顶层；txtChunkBytes 2026-11-08 改绑 ldw 段（ldw 段优先，回落顶层）。 */
+    /* 全局 .txt 三件套（2026-10-21 用户定案「都要弄上」）。 */
     directSendThresholdChars: Number(webin.directSendThresholdChars) > 0 ? Math.round(Number(webin.directSendThresholdChars)) : 6000,
-    txtChunkBytes: Number.isFinite(ldwTxt) && ldwTxt > 0 ? Math.round(ldwTxt)
-      : (Number(webin.txtChunkBytes) > 0 ? Math.round(Number(webin.txtChunkBytes)) : 409600),
-    /* 纯聊天（2026-10-20；2026-11-08 改绑 ldw 段）：仅 LDW 车道。 */
-    chatOnly: ldwBool(ldw.chatOnly, webin.chatOnly === true),
-    /* 中文工具名（2026-10-24 用户点名；2026-11-08 改绑 ldw 段）：仅 LDW 车道，默认关。 */
-    zhToolNames: ldwBool(ldw.zhToolNames, webin.zhToolNames === true),
+    txtChunkBytes: Number(webin.txtChunkBytes) > 0 ? Math.round(Number(webin.txtChunkBytes)) : 409600,
+    /* 纯聊天（2026-10-20；2026-11-12 回归全局真源：读顶层）。 */
+    chatOnly: webin.chatOnly === true,
+    /* 中文工具名（2026-10-24 用户点名；2026-11-12 回归全局真源：读顶层）。默认关。 */
+    zhToolNames: webin.zhToolNames === true,
+    /* LDW 独立模式：followGlobal 缺省 true = 跟随全局（上面五键就是 LDW 实际生效值）。 */
+    ldwFollowGlobal: ldw.followGlobal !== false,
+    /* LDW 独立值（followGlobal=false 时 LDW 车道真正使用；段内未设键回显全局值作编辑起点）。 */
+    ldwCustom: {
+      chatOnly: typeof ldw.chatOnly === 'boolean' ? ldw.chatOnly : webin.chatOnly === true,
+      zhToolNames: typeof ldw.zhToolNames === 'boolean' ? ldw.zhToolNames : webin.zhToolNames === true,
+      kbProtocol: typeof ldw.kbProtocol === 'boolean' ? ldw.kbProtocol : webin.kbProtocol !== false,
+      nlToolProtocol: typeof ldw.nlToolProtocol === 'boolean' ? ldw.nlToolProtocol : webin.nlToolProtocol === true,
+      txtChunkBytes: Number(ldw.txtChunkBytes) > 0 ? Math.round(Number(ldw.txtChunkBytes))
+        : (Number(webin.txtChunkBytes) > 0 ? Math.round(Number(webin.txtChunkBytes)) : 409600),
+    },
   }
 }
 
@@ -3226,6 +3238,44 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
     if (typeof patch.zhToolNames !== 'boolean') errors.push('zhToolNames 应为布尔')
     else if (patch.zhToolNames !== next.zhToolNames) { next.zhToolNames = patch.zhToolNames; touchWebin = true }
   }
+  /* LDW 独立模式（2026-11-12）：true=跟随全局（写入端同时清掉 ldw 段五键——段里只留
+     replyTimeoutMs 等运行参数，「跟随」的不变量由写盘保证，防残留幽灵覆盖）；
+     false=独立（ldwCustom 五键浅合并落 ldw 段，仅 LDW 车道读）。 */
+  if (patch?.ldwFollowGlobal !== undefined) {
+    if (typeof patch.ldwFollowGlobal !== 'boolean') errors.push('ldwFollowGlobal 应为布尔')
+    else if (patch.ldwFollowGlobal !== next.ldwFollowGlobal) { next.ldwFollowGlobal = patch.ldwFollowGlobal; touchWebin = true }
+  }
+  let patchLdwCustom = null
+  if (patch?.ldwCustom !== undefined) {
+    if (patch.ldwCustom === null || typeof patch.ldwCustom !== 'object' || Array.isArray(patch.ldwCustom)) {
+      errors.push('ldwCustom 应为对象')
+    } else {
+      patchLdwCustom = {}
+      if (patch.ldwCustom.chatOnly !== undefined) {
+        if (typeof patch.ldwCustom.chatOnly !== 'boolean') errors.push('ldwCustom.chatOnly 应为布尔')
+        else patchLdwCustom.chatOnly = patch.ldwCustom.chatOnly
+      }
+      if (patch.ldwCustom.zhToolNames !== undefined) {
+        if (typeof patch.ldwCustom.zhToolNames !== 'boolean') errors.push('ldwCustom.zhToolNames 应为布尔')
+        else patchLdwCustom.zhToolNames = patch.ldwCustom.zhToolNames
+      }
+      if (patch.ldwCustom.kbProtocol !== undefined) {
+        if (typeof patch.ldwCustom.kbProtocol !== 'boolean') errors.push('ldwCustom.kbProtocol 应为布尔')
+        else patchLdwCustom.kbProtocol = patch.ldwCustom.kbProtocol
+      }
+      if (patch.ldwCustom.nlToolProtocol !== undefined) {
+        if (typeof patch.ldwCustom.nlToolProtocol !== 'boolean') errors.push('ldwCustom.nlToolProtocol 应为布尔')
+        else patchLdwCustom.nlToolProtocol = patch.ldwCustom.nlToolProtocol
+      }
+      if (patch.ldwCustom.txtChunkBytes !== undefined) {
+        const n = Number(patch.ldwCustom.txtChunkBytes)
+        if (!Number.isFinite(n) || n < 0) errors.push('ldwCustom.txtChunkBytes 应为非负数')
+        else patchLdwCustom.txtChunkBytes = Math.round(n)
+      }
+      if (Object.keys(patchLdwCustom).length > 0) touchWebin = true
+      next.ldwCustom = { ...next.ldwCustom, ...patchLdwCustom }
+    }
+  }
   if (errors.length > 0) return { ok: false, error: errors.join('；') }
 
   try {
@@ -3237,16 +3287,24 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
       webin.compactionFileThresholdChars = next.compactionFileThresholdChars
       webin.titlePrefix = next.titlePrefix
       webin.directSendThresholdChars = next.directSendThresholdChars
-      /* [2026-11-08 LDW 面板改绑] 五键（kb/nl/txtChunk/chatOnly/zh）写 ldw 段——
-         LDW 专属地盘，不再碰顶层键。车道侧 ldwCfg()（ldw ?? 顶层）吃 UI 开关；
-         API 通道 mergeWebinSwitches 读顶层，回归基线行为（地盘分离：顶层=全局，ldw=LDW）。
-         顶层若残留旧值也不再被 UI 更新（历史值保持原样，不清除——少写少险）。 */
+      /* [2026-11-12 全局真源恢复] 五键写回顶层键（全局开关对全局生效：API 车道
+      mergeWebinSwitches 与 LDW 车道 ldwCfg() 默认都吃顶层）。ldw 段只承载独立模式：
+      followGlobal=false 时写独立五键；跟随（true/缺省）时清掉段内五键（保留
+      replyTimeoutMs 等运行参数）——LDW 车道回落顶层=全局。历史改绑 3f9fd2a/ec93f9e
+      的「ldw 优先」语义就此作废。 */
+      webin.chatOnly = next.chatOnly === true
+      webin.zhToolNames = next.zhToolNames === true
+      webin.kbProtocol = next.kbProtocol === true
+      webin.nlToolProtocol = next.nlToolProtocol === true
+      webin.txtChunkBytes = next.txtChunkBytes
       const ldw = (webin.ldw !== null && typeof webin.ldw === 'object') ? webin.ldw : {}
-      ldw.kbProtocol = next.kbProtocol === true
-      ldw.nlToolProtocol = next.nlToolProtocol === true
-      ldw.txtChunkBytes = next.txtChunkBytes
-      ldw.chatOnly = next.chatOnly === true
-      ldw.zhToolNames = next.zhToolNames === true
+      if (next.ldwFollowGlobal === false) {
+        ldw.followGlobal = false
+        for (const [k, v] of Object.entries(next.ldwCustom)) ldw[k] = v
+      } else {
+        delete ldw.followGlobal
+        for (const k of ['chatOnly', 'zhToolNames', 'kbProtocol', 'nlToolProtocol', 'txtChunkBytes']) delete ldw[k]
+      }
       webin.ldw = ldw
       writeJsonAtomic(webinPath, webin)
       /* [2026-10-30 重测 4.E 竞态修复] 写完 webin config 必须立刻失效 healOptionsCache：
