@@ -3,3 +3,8 @@
 - insert:
     - id: adapter-compat
       name: dsh-adapter-compat
+      config:
+        trueDelete: false
+        headGuard: false
+        titleWarm: true
+        sweepInvisible: false
