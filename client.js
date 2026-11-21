@@ -831,12 +831,15 @@ window.__ModuleLoader__.load({
       'dsh-session-kit', 'dsh-adapter-compat', 'cm-', 'VOzbGW_',
     ]
 
-    /* 四组：fold 键（=存储键=html data 键）与行名。行序=浮层里的固定槽位。 */
+    /* 四组：fold 键（=存储键=html data 键=翻译键）。行序=浮层里的固定槽位。
+       行名一律 t(key)（2026-11-22 修「按钮只有英文没有中文」——原先 label 直接
+       写死 'foldTop' 等字面量没走 i18n；ZH/EN 字典里 foldTop/foldFiles/foldCost/
+       foldSettings 四键早就齐了，只是调用侧没用）。 */
     const SIDEFOLD_GROUPS = [
-      { key: 'foldTop', label: 'foldTop' },
-      { key: 'foldFiles', label: 'foldFiles' },
-      { key: 'foldCost', label: 'foldCost' },
-      { key: 'foldSettings', label: 'foldSettings' },
+      { key: 'foldTop' },
+      { key: 'foldFiles' },
+      { key: 'foldCost' },
+      { key: 'foldSettings' },
     ]
 
     const SIDEFOLD_CSS = [
@@ -876,6 +879,30 @@ window.__ModuleLoader__.load({
     let sidefoldState = { foldTop: false, foldFiles: false, foldCost: false, foldSettings: false }
     let sidefoldSaveTimer = 0
     let sidefoldRaf = 0
+    /* 观察器持有：root 被 React 整体重建时旧观察随旧节点失效，
+       reobserveSidefoldRoot 发现换人就重新 observe（observe 会替换旧 target）。 */
+    let sidefoldMO = null
+    let sidefoldObservedRoot = null
+
+    function observeSidefoldRoot(root) {
+      try {
+        if (!sidefoldMO) {
+          sidefoldMO = new MutationObserver(() => {
+            try { markSidefoldForeign() } catch { /* ignore */ }
+            syncSidefoldRows()
+          })
+        }
+        /* attributes 也要听：入口显隐（style/class/hidden 切换）不改 childList，
+           但会改变可见内容集合，行位置必须跟随重算。 */
+        sidefoldMO.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'hidden'] })
+        sidefoldObservedRoot = root
+      } catch { /* ignore */ }
+    }
+
+    function reobserveSidefoldRoot(root) {
+      if (sidefoldObservedRoot === root) return
+      observeSidefoldRoot(root)
+    }
 
     function sidefoldNormalize(raw) {
       const out = {}
@@ -929,17 +956,19 @@ window.__ModuleLoader__.load({
       if (layer) return layer
       layer = document.createElement('div')
       layer.id = SIDEFOLD_LAYER_ID
-      /* z=1099：必须低于宿主弹层（「视图选项」菜单 z=1100）。10900 时代菜单下半部
-         条目被折叠行吞点击——真点「隐藏已归档」实测翻转 foldSettings+菜单关闭
-         （2026-11-21 CDP 实证）。折叠行浮在让位空条内、不与侧栏内容重叠，
-         无需高于弹层；仍高于 OFM scrim(1000)。 */
-      layer.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:1099;'
+      /* 2026-11-22 Evelyn 定案「行要和折叠对象同图层，随侧边栏一起」：
+         不再挂 body 顶层（fixed z=1099 时代：设置页 overlay z=1000 盖不住它，
+         无头 CDP 实测 4/4 行在设置页上仍可命中）。改为 absolute 挂进侧边栏 root
+         内部——z=1 只求盖过侧栏普通流内容，任何宿主弹层（z≥1000）自然盖住行；
+         root 卸载/收成轨道（宽 55px）时行随 DOM 一起消失。
+         坐标系：absolute 相对最近定位祖先（layer.offsetParent，实测=pI_x6G_frame
+         position:relative），sync 里统一用 offsetParent rect 换算。 */
+      layer.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;z-index:1;'
       for (const g of SIDEFOLD_GROUPS) {
         const row = document.createElement('div')
         row.className = 'dsh-adapter-compat-sidefold-row'
         row.dataset.foldKey = g.key
         const label = document.createElement('span')
-        label.textContent = g.label
         const caret = document.createElement('span')
         caret.className = 'dsh-adapter-compat-sidefold-caret'
         caret.textContent = '>'
@@ -947,14 +976,36 @@ window.__ModuleLoader__.load({
         row.addEventListener('click', () => toggleSidefoldGroup(g.key))
         layer.appendChild(row)
       }
-      document.body.appendChild(layer)
+      /* 优先挂侧边栏 root（同图层）；root 尚未渲染时先挂 body 过渡，
+         等 root 出现后由 sync/轮询兜底挪进去。 */
+      const root = document.querySelector('.hHd-Xa_root')
+      ;(root ?? document.body).appendChild(layer)
+      refreshSidefoldLabels()
       return layer
+    }
+
+    /* 行名刷新：t() 调用期求值（启动时已绑定宿主 locale），语言切换靠
+       MutationObserver→sync 触达；带缓存——值相同不写 DOM，防 MO 自触发回环。 */
+    const sidefoldLabelCache = new Map()
+    function refreshSidefoldLabels() {
+      const layer = document.getElementById(SIDEFOLD_LAYER_ID)
+      if (!layer) return
+      for (const row of layer.children) {
+        const key = row.dataset.foldKey
+        const label = row.firstChild
+        if (!key || !label) continue
+        const text = t(key)
+        if (sidefoldLabelCache.get(key) === text) continue
+        sidefoldLabelCache.set(key, text)
+        label.textContent = text
+      }
     }
 
     /* 折叠态 >（右指，天然大于号）/ 展开态旋转 90° 指下。 */
     function paintSidefoldRows() {
       const layer = document.getElementById(SIDEFOLD_LAYER_ID)
       if (!layer) return
+      refreshSidefoldLabels()
       for (const row of layer.children) {
         const folded = sidefoldState[row.dataset.foldKey] === true
         const caret = row.querySelector('.dsh-adapter-compat-sidefold-caret')
@@ -984,6 +1035,12 @@ window.__ModuleLoader__.load({
           if (!layer) return
           const root = document.querySelector('.hHd-Xa_root')
           if (!root) { layer.style.display = 'none'; document.documentElement.dataset.dskSidefold = '0'; return }
+          /* 同图层挂载（2026-11-22）：行层必须是 root 的孩子。root 被 React 整体
+             重建或 layer 被挪走时在这里兜底重挂（MO 观察 target 也随之换新）。 */
+          if (layer.parentElement !== root) {
+            try { root.appendChild(layer) } catch { /* ignore */ }
+            reobserveSidefoldRoot(root)
+          }
           const rootRect = root.getBoundingClientRect()
           if (rootRect.width < 100) {
             layer.style.display = 'none'
@@ -992,9 +1049,15 @@ window.__ModuleLoader__.load({
           }
           layer.style.display = ''
           document.documentElement.dataset.dskSidefold = '1'
+          /* 行坐标系：layer 是 absolute（相对最近定位祖先），不是 fixed——
+             fixed 时代实测的视口坐标全部减去 offsetParent 左上角再落位。 */
+          const hostEl = layer.offsetParent instanceof Element ? layer.offsetParent : null
+          const hostRect = hostEl ? hostEl.getBoundingClientRect() : null
+          const ox = hostRect ? hostRect.left : 0
+          const oy = hostRect ? hostRect.top : 0
           const logo = root.querySelector('.hHd-Xa_logoRow')
           const region = root.querySelector('.hHd-Xa_regionArea')
-          const left = rootRect.left + 10
+          const left = rootRect.left + 10 - ox
           const width = Math.max(80, rootRect.width - 20)
           const rows = layer.children
           const rTop = rows[0]
@@ -1016,11 +1079,11 @@ window.__ModuleLoader__.load({
              （贴文件夹头顶，配合基础 padding 34），折叠组1 后 region 上移、由 +30 钳制防叠
              （配合 foldTop 态 padding 60）；行1 空组隐藏时钳制不生效。 */
           const topAnchor = logo ? logo.getBoundingClientRect().bottom : rootRect.top
-          if (showTop) placeRow(rTop, left, topAnchor + 4, width)
+          if (showTop) placeRow(rTop, left, topAnchor + 4 - oy, width)
           if (showFiles) {
             const filesAnchor = region ? region.getBoundingClientRect().top : topAnchor + 30
             const floorTop = showTop ? topAnchor + 30 : filesAnchor + 4
-            placeRow(rFiles, left, Math.max(filesAnchor + 4, floorTop), width)
+            placeRow(rFiles, left, Math.max(filesAnchor + 4, floorTop) - oy, width)
           }
           /* 底部：行3 = 费用可见时余额头顶（faTop+2，padding 32 让位），费用缺席/被折时
              贴行4（行4-30，padding 64 连排区）；行4 = 第一可见入口行头顶（余额 margin-bottom
@@ -1044,14 +1107,15 @@ window.__ModuleLoader__.load({
             else rSettingsTop = footTop + 34
             rSettingsTop = Math.min(rSettingsTop, rootRect.bottom - 26 - 2)
             rSettingsTop = Math.max(rSettingsTop, footTop + 32)
-            placeRow(rSettings, left, rSettingsTop, width)
+            placeRow(rSettings, left, rSettingsTop - oy, width)
           }
           if (showCost) {
             const rCostTop = cmVisible || rSettingsTop === null
               ? footTop + 2
               : Math.min(footTop + 2, rSettingsTop - 30)
-            placeRow(rCost, left, rCostTop, width)
+            placeRow(rCost, left, rCostTop - oy, width)
           }
+          refreshSidefoldLabels()
         } catch {
           /* 定位失败下一轮重试 */
         }
@@ -1137,7 +1201,18 @@ window.__ModuleLoader__.load({
             if (inner.nodeType !== 1 || inner.classList.contains('dsh-session-kit-sidebar-row')) continue
             for (const deep of inner.children) {
               if (deep.nodeType !== 1 || deep.dataset.dskForeign || deep.classList.contains('dsh-session-kit-sidebar-row')) continue
-              if (typeof deep.className !== 'string' || deep.className.trim() === '') continue
+              if (typeof deep.className !== 'string' || deep.className.trim() === '') {
+                /* 无类名块（2026-11-22 修「导入会话折叠不了」）：宿主把「导入会话」
+                   按钮放在 footerActions 的无类名包装层里且 button 自身无 class——
+                   原逻辑对无类名一律跳过，导致它不属于任何组、四个折叠谁也收不走
+                   （无头 CDP 取证实锤：footArea>footerActions>无类名div>
+                   button[aria-label=导入会话]，root 内深度 4）。按 aria-label/title
+                   识别后归「下方设置」组（底部功能块语义；foldSettings 的隐藏 CSS
+                   与空组检测名单都吃 [data-dsk-foreign="settings"]，标记即生效）。 */
+                const sig = `${deep.getAttribute?.('aria-label') ?? ''} ${deep.getAttribute?.('title') ?? ''}`
+                if (/导入会话|import\s+session/iu.test(sig)) deep.dataset.dskForeign = 'settings'
+                continue
+              }
               /* footer 入口区里的非入口可见块（余额条等第三方块）→「费用」组：
                  跟随余额条的位置语义，费用折叠时一并收起。 */
               deep.dataset.dskForeign = 'cost'
@@ -1167,15 +1242,7 @@ window.__ModuleLoader__.load({
         if (!root) { if (tries > 60) clearInterval(waitRoot); return }
         clearInterval(waitRoot)
         try { markSidefoldForeign() } catch { /* ignore */ }
-        try {
-          const mo = new MutationObserver(() => {
-            try { markSidefoldForeign() } catch { /* ignore */ }
-            syncSidefoldRows()
-          })
-          /* attributes 也要听：入口显隐（style/class/hidden 切换）不改 childList，
-             但会改变可见内容集合，行位置必须跟随重算。 */
-          mo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'hidden'] })
-        } catch { /* ignore */ }
+        try { observeSidefoldRoot(root) } catch { /* ignore */ }
         try {
           const ro = new ResizeObserver(() => syncSidefoldRows())
           ro.observe(root)
@@ -1183,6 +1250,21 @@ window.__ModuleLoader__.load({
         try { window.addEventListener('resize', syncSidefoldRows) } catch { /* ignore */ }
         syncSidefoldRows()
       }, 500)
+      /* 兜底轮询（3s）：root 整体重建时 MutationObserver/ResizeObserver 都随旧节点
+         失效、没人再触发 sync——轮询发现 root 换人/layer 脱挂就重 observe+重挂+重算。
+         layer 现在挂在 root 内部，React 对陌生节点的清理随时可能发生，必须有自愈。 */
+      setInterval(() => {
+        try {
+          const r = document.querySelector('.hHd-Xa_root')
+          if (!r) return
+          const l = document.getElementById(SIDEFOLD_LAYER_ID)
+          if (l && l.parentElement === r && sidefoldObservedRoot === r) return
+          if (l && l.parentElement !== r) { try { r.appendChild(l) } catch { /* ignore */ } }
+          observeSidefoldRoot(r)
+          try { markSidefoldForeign() } catch { /* ignore */ }
+          syncSidefoldRows()
+        } catch { /* ignore */ }
+      }, 3000)
     }
 
     /* 设置 → 会话与提示词 → 侧边栏板块：四组状态 + 一键全展开 + 三入口彻底隐藏。 */
@@ -1246,7 +1328,7 @@ window.__ModuleLoader__.load({
 
       const groupRows = SIDEFOLD_GROUPS.map((g) => h('div', { className: 'ac-row', key: g.key },
         h('div', null,
-          h('div', { className: 'ac-row-title' }, `▸ ${g.label}`),
+          h('div', { className: 'ac-row-title' }, `▸ ${t(g.key)}`),
           h('div', { className: 'ac-row-desc' }, groups[g.key] ? t('sidefoldStateFolded') : t('sidefoldStateOpen'))),
         h('button', {
           className: 'ac-btn', disabled: busy,
