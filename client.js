@@ -929,7 +929,11 @@ window.__ModuleLoader__.load({
       if (layer) return layer
       layer = document.createElement('div')
       layer.id = SIDEFOLD_LAYER_ID
-      layer.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:10900;'
+      /* z=1099：必须低于宿主弹层（「视图选项」菜单 z=1100）。10900 时代菜单下半部
+         条目被折叠行吞点击——真点「隐藏已归档」实测翻转 foldSettings+菜单关闭
+         （2026-11-21 CDP 实证）。折叠行浮在让位空条内、不与侧栏内容重叠，
+         无需高于弹层；仍高于 OFM scrim(1000)。 */
+      layer.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:1099;'
       for (const g of SIDEFOLD_GROUPS) {
         const row = document.createElement('div')
         row.className = 'dsh-adapter-compat-sidefold-row'
@@ -2377,7 +2381,7 @@ window.__ModuleLoader__.load({
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            marker: 'adapter-client-9999.9.48-ldwglobal',
+            marker: 'adapter-client-9999.9.49-ldwglobal',
             nested: nestedExitActive,
             fallback: typeof standaloneExitDispose === 'function',
             skExtraEntries,
