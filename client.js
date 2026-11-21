@@ -867,7 +867,13 @@ window.__ModuleLoader__.load({
       'html[data-dsk-fold-cost="1"] [data-dsk-foreign="cost"] { display: none !important; }',
       'html[data-dsk-fold-settings="1"] .dsh-session-kit-sidebar-row,',
       'html[data-dsk-fold-settings="1"] .hHd-Xa_settingsArea,',
-      'html[data-dsk-fold-settings="1"] [data-dsk-foreign="settings"] { display: none !important; }',
+      'html[data-dsk-fold-settings="1"] [data-dsk-foreign="settings"],',
+      /* dsha-web-mobile 手机壳抽屉底部的「导出会话日志」行动作（2026-11-22 手机端
+         Evelyn 报「没折叠」）：仅手机端渲染（宽屏 media query 整体隐藏，PC 取证
+         不可见），壳侧每次启动被 APK 恢复内置版——归属只宜在插件侧按
+         data-mobile-nav 属性选择器收编，改壳会被冲掉。收容器 drawer-actions
+         （容器内只有这一个按钮），PC 端无该元素选择器不命中零副作用。 */
+      'html[data-dsk-fold-settings="1"] [data-mobile-nav="drawer-actions"] { display: none !important; }',
       /* 浮层行外观：加粗小字、次级色、hover 微亮；三角在文字右侧 */
       '.dsh-adapter-compat-sidefold-row { position: absolute; display: flex; align-items: center; justify-content: flex-start; gap: 6px; height: 26px; padding: 0 8px; border-radius: 8px; cursor: pointer; user-select: none; pointer-events: auto; font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-secondary, #9a9a9a); box-sizing: border-box; }',
       '.dsh-adapter-compat-sidefold-row:hover { background: var(--dsw-alias-bg-l2, rgba(128,128,128,.14)); color: var(--dsw-alias-label-primary, inherit); }',
@@ -916,7 +922,7 @@ window.__ModuleLoader__.load({
       foldTop: ['.hHd-Xa_newSession', '.hHd-Xa_panelList', '[data-dsk-foreign="top"]'],
       foldFiles: [],
       foldCost: ['.cm-footer-stack', '[data-dsk-foreign="cost"]'],
-      foldSettings: ['.dsh-session-kit-sidebar-row', '.hHd-Xa_settingsArea', '[data-dsk-foreign="settings"]'],
+      foldSettings: ['.dsh-session-kit-sidebar-row', '.hHd-Xa_settingsArea', '[data-dsk-foreign="settings"]', '[data-mobile-nav="drawer-actions"]'],
     }
 
     /* 空组检测（2026-11-12 Evelyn 加需求：组员全没了行就别死守）：
