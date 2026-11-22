@@ -1437,14 +1437,15 @@ export function installSessionWatch(ctx, options = {}) {
     state.busy = true
     const acts = []
     if (on.changeRescan !== false) acts.push('warm+rescan')
-    if (on.changePurge !== false) acts.push('purge')
+    if (on.changePurge !== false) acts.push('purge·stat增量')
     if (on.changeHeadGuard !== false) acts.push('head-guard')
     appendCompatLog(`sessions changed (${key}) -> ${acts.length > 0 ? acts.join(' + ') : '（动作全部关闭，仅记录）'}`, home)
     Promise.resolve()
       .then(() => (on.changeRescan !== false ? rescanAndWarm(ctx, options) : undefined))
       .catch(() => {})
-      // 目录变化 → 真删除扫描（line 854 注释本该有的调用点，此前丢失 → pending 永不重试）。
-      // purge 幂等，写盘会再触发一轮 watcher，收敛后自然停（多跑一轮空扫）。
+      // 目录变化 → 真删除扫描（2026-11-21 用户令「删除一瞬间 purge + 重启 purge」：
+      // stat 指纹增量，只读有变化的会话，全库扫已被消灭）。
+      // purge 幂等，写盘会再触发一轮 watcher，收敛后自然停（多跑一轮 stat 空扫，零解压）。
       .then(() => { try { if (on.changePurge !== false && typeof compatHooks.purge === 'function') compatHooks.purge() } catch { /* ignore */ } })
       // 目录变化同样可能是「外面下载/搬运进来一份无头会话」→ 补头守卫跟上
       .then(() => { try { if (on.changeHeadGuard !== false && typeof compatHooks.headGuard === 'function') compatHooks.headGuard() } catch { /* ignore */ } })
@@ -1614,10 +1615,19 @@ export async function purgeTombstones(ctx, options = {}) {
   const write = options.write === true
   const backupDir = home + '/' + TRUE_DELETE_BACKUP_DIR
   const ledger = readPendingLedger(home)
-  /* 审计用：扫描前记下每个会话的事件数，收尾时对账。
-     对不上的（没被本插件写过却变了）= 外部改动（同步下载 / 别的插件 / 手工拷贝），
-     记一行日志，避免再出现"莫名其妙就好了/坏了"。 */
-  const seenBefore = Object.assign({}, ledger.seen)
+  /* 【stat 指纹增量 · 2026-11-21 用户令「删除一瞬间 purge + 重启 purge，不许每条消息全量扫」】
+     旧「增量」只省写不省读：每次目录变化把全部会话各完整解压约 3 遍（redact 一遍、
+     live probe 一遍、收尾审计再一遍）——86 会话 ≈ 250 次 zstd 解压/条消息，手机卡的主因。
+     现在：statCache（Map<sid,"size:mtimeMs">）由调用方传入；本轮先 stat 全部会话（纯
+     statSync 零解压），指纹没变的整个跳过——墓碑只能来自写盘，文件没变就不可能有新墓碑。
+     pendingOnly / 定向 only 不传 statCache，保持全量语义；首次运行（缓存空）作基线全扫。 */
+  const statCache = options.statCache instanceof Map ? options.statCache : undefined
+  const useCache = statCache !== undefined
+  const entries = listSessionFiles(home)
+  const fpOf = (file) => { try { const st = statSync(file); return `${st.size}:${st.mtimeMs}` } catch { return null } }
+  const current = new Map()
+  if (useCache) for (const entry of entries) current.set(entry.id, fpOf(entry.file))
+  const externalChanged = new Set()
   const writtenIds = new Set()
   /* 只清「上一次扫描之后新增的」墓碑；首次运行把窗口起点设成现在，
      于是历史墓碑（很久以前删的）永远不会被动到。 */
@@ -1630,11 +1640,18 @@ export async function purgeTombstones(ctx, options = {}) {
      想真删走 /versions/purge（显式传 forceFamilies）。 */
   const protectFamilies = options.protectFamilies !== false
   const familyIds = protectFamilies ? versionFamilyIds(home) : new Set()
-  for (const entry of listSessionFiles(home)) {
+  for (const entry of entries) {
     if (options.only !== undefined && options.only !== entry.id) continue
     if (options.pendingOnly === true && !ledger.pending[entry.id]) continue   // 重试只碰待清项
+    const fp = current.get(entry.id)
+    if (useCache) {
+      if (fp === null) continue                     // stat 不到 = 文件刚消失，下轮再说
+      if (statCache.size > 0 && statCache.get(entry.id) === fp) continue  // stat 没变 = 不可能有新墓碑
+      if (statCache.size > 0) externalChanged.add(entry.id)  // 指纹变了：外部改动候选（收尾审计用）
+    }
     if (protectFamilies && familyIds.has(entry.id)) {
       /* 只记账、不落刀：这里的 skip 不写 pending（避免每次重试都重扫重试）。 */
+      if (useCache && fp !== null) statCache.set(entry.id, fp)
       results.push({ id: entry.id, status: 'family-protected' })
       continue
     }
@@ -1656,6 +1673,13 @@ export async function purgeTombstones(ctx, options = {}) {
         ledger.pending[entry.id] = { at: new Date().toISOString(), why: 'seq-gap', note: red.notes[0] }
         results.push(red)
         continue
+      }
+      /* stat 指纹（2026-11-21）：活体分支除 blocked 外本轮都已处理完毕，必须记指纹——
+         常开的活跃会话文件平时不再变，不记的话每条消息都会把它重新整读一遍，优化白做。
+         redact 写过盘的记新指纹，其余（clean / live-skipped）记原指纹。 */
+      if (useCache) {
+        const nf = red.status === 'redacted' ? fpOf(entry.file) : fp
+        if (nf !== null && nf !== undefined) statCache.set(entry.id, nf)
       }
       /* 2026-10-10 死锁修复：live 轻擦后必须保留 pending（待整轮切除）——
          此前 redact 成功即删台账 → 60s 重试认为完工 → 整轮切除永远排不上；
@@ -1683,27 +1707,24 @@ export async function purgeTombstones(ctx, options = {}) {
       /* 断口门拦下（2026-10-10 手机端缺口事故）：坏文件不动，台账亮红灯等人工修 */
       ledger.pending[entry.id] = { at: new Date().toISOString(), why: 'seq-gap', note: r.notes[0] }
     }
+    if (useCache) {
+      if (r.status === 'written') statCache.set(entry.id, fpOf(entry.file))   // 刚写过盘，记新指纹
+      else if (r.status !== 'failed' && r.status !== 'blocked' && fp !== null) statCache.set(entry.id, fp)
+      /* failed/blocked 不记指纹：下一轮（或开机窗）对原文件原样再试 */
+    }
     results.push(r)
     if (typeof options.onResult === 'function') {
       try { options.onResult(r) } catch { /* ignore */ }
     }
   }
-  /* 外部改动审计：把当前事件数与扫描前对比。 */
+  /* 外部改动审计（stat 版 · 2026-11-21）：旧版收尾把全部会话再完整解压一遍对账事件数
+     （又一次全量读）。现在零读盘：skip 阶段已把「指纹与上轮不同」的会话记进 externalChanged，
+     这里只剔除本插件自己写过的，剩下即外部落盘（同步下载 / 别的插件 / 手工拷贝）。 */
   try {
-    const seen = {}
-    const changed = []
-    for (const info of listSessionFiles(home)) {
-      let count = -1
-      try { count = readSession(info.file).events.length } catch { count = -1 }
-      seen[info.id] = count
-      const before = seenBefore[info.id]
-      if (typeof before === 'number' && before >= 0 && count >= 0 && before !== count && !writtenIds.has(info.id)) {
-        changed.push(info.id.slice(0, 18) + '(' + before + '->' + count + ')')
-      }
-    }
-    ledger.seen = seen
-    if (changed.length > 0) appendCompatLog('external-change detected: ' + changed.join(' '), home)
+    const changed = [...externalChanged].filter((id) => !writtenIds.has(id))
+    if (changed.length > 0) appendCompatLog('external-change detected: ' + changed.map((id) => id.slice(0, 18)).join(' '), home)
   } catch { /* 审计失败不影响清理 */ }
+  if (useCache) for (const id of [...statCache.keys()]) if (!current.has(id)) statCache.delete(id)   // 已消失的会话出缓存
   ledger.lastScanMs = Date.now()
   if (write) writePendingLedger(home, ledger)
   // 顺手清 Timeline 孤儿索引（文件已删的会话）——零墓碑第三条腿，幂等
@@ -1731,17 +1752,24 @@ export function installTrueDelete(ctx, config = {}) {
     )
   }
   /* sinceMs=0 → 全量积压清理（把所有能映射的墓碑都处理掉）。
-     钩子（目录变化）走增量：用台账里的 lastScanMs 只处理刚新增的。 */
+     钩子（目录变化）走增量：sinceMs 只认刚新增的墓碑，statCache 再把「文件没变」的
+     整个跳过（连解压都省）——2026-11-21 用户令，语义详见 purgeTombstones 头注。 */
   let inflight = false
+  /* stat 指纹缓存（2026-11-21 用户令「删除一瞬间 purge + 重启 purge」）：开机黄金窗与
+     目录钩子共享一份（开机第一窗全量建基线，此后一切增量）；台账重试（pendingOnly）
+     与 disposed 定向补扫（only）绕过缓存——活体转非活体的补刀必须原样重读。 */
+  const hookStatCache = new Map()
   const run = (tag, options = {}) => {
     if (inflight) return   // 防重入：目录钩子/定时器/开机可能交叠，绝不并发写盘
     inflight = true
+    const opts = { home, write: true, purgeRegenerate: config?.purgeRegenerate !== false, ...options }
+    if (options.pendingOnly !== true && options.only === undefined) opts.statCache = hookStatCache
     Promise.resolve()
       /* purgeRegenerate 默认**开**（2026-10-11 用户要求「全部真删除、不准留墓碑」）：
          带 regeneration 的墓碑（删除并重新生成）此前默认跳过 → 墓碑永远留在文件里。
          轮次推导已改用 surfaceOp 反推（见 purge.js turnOfSeq），不再采信会漂移的
          summary.turn，因此整轮切不会误伤用户还活着的轮次。显式 config.purgeRegenerate=false 可关回。 */
-      .then(() => purgeTombstones(ctx, { home, write: true, purgeRegenerate: config?.purgeRegenerate !== false, ...options }))
+      .then(() => purgeTombstones(ctx, opts))
       .then((r) => summarise(tag, r))
       .catch((e) => appendCompatLog('true-delete[' + tag + '] FAILED: ' + String(e?.message ?? e).slice(0, 160), home))
       .finally(() => { inflight = false })
@@ -1761,8 +1789,9 @@ export function installTrueDelete(ctx, config = {}) {
   } else {
     appendCompatLog('true-delete: 开机补清已关闭（设置页可开）')
   }
-  /* 触发时机收敛：开机两次 + 会话目录变化后一次（见 rescanAndWarm 的钩子）。
-     不再常驻轮询——用户明确要求「开机、下载后扫一下就差不多」。 */
+  /* 触发时机（2026-11-21 用户钦定语义）：开机黄金窗全量补清 + 目录变化后 stat 增量一次
+     （只读有变化的会话）+ agent 释放时定向一次 + 台账非空 60s 重试。
+     不再常驻轮询，更没有「每条消息全库扫」。 */
   compatHooks.purge = () => run('hook')
   /* 真删除写过的会话，立刻补一次头：切除最容易把 system 头拔掉（旧版会顺手删光全部
      system/message，见 true-delete.js 的系统头级联）。定向补扫，不做全盘读。 */
@@ -1842,7 +1871,9 @@ export async function guardProtectedHeads(ctx, options = {}) {
     out.scanned += 1
     if (isSessionLive(ctx, entry.id)) { out.liveSkipped += 1; continue }
     const fp = fpOf(entry)
-    if (useCache && deep && fp !== null && fingerprints[entry.id] === fp) {
+    /* 2026-11-21 用户令：浅扫同样吃缓存——此前只有深扫跳过，目录钩子每条消息
+       仍要全库连探（每个文件解前缀帧）。(size,mtime) 没变 = 头还是上次那个头，跳过安全。 */
+    if (useCache && fp !== null && fingerprints[entry.id] === fp) {
       out.cachedSkipped += 1
       dirtyFingerprints[entry.id] = fp /* 原样续期：写回时保留 */
       continue
@@ -2718,7 +2749,7 @@ const HEAL_STATE_FILE = 'adapter-compat-heal-state.json'
  * 布尔：
  *   bootScan / sendScan / skipUnchanged —— 会话日志修复三项（2026-10-13 定案）
  *   changeRescan  目录变化后自动「标题预热 + 重扫列表」（含 dsh-sync 落盘）
- *   changePurge   目录变化后跟一次真删除扫描
+ *   changePurge   目录变化后跟一次真删除扫描（stat 指纹增量：只读有变化的会话；全量只在开机黄金窗）
  *   changeHeadGuard 目录变化后跟一次头保护扫描
  *   bootTitleWarm 开机自动预热标题（12s 补一轮、60s 再补一轮）
  *   bootHeadGuard 开机自动头保护（4s/25s 预筛 + 45s 深扫）
