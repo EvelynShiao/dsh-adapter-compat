@@ -1629,11 +1629,14 @@ export async function purgeTombstones(ctx, options = {}) {
   if (useCache) for (const entry of entries) current.set(entry.id, fpOf(entry.file))
   const externalChanged = new Set()
   const writtenIds = new Set()
-  /* 只清「上一次扫描之后新增的」墓碑；首次运行把窗口起点设成现在，
-     于是历史墓碑（很久以前删的）永远不会被动到。 */
+  /* 只清「上一次扫描之后新增的」墓碑；**台账缺失/损坏时必须全量（sinceMs=0）**——
+     2026-11-22 实锤事故：台账文件不存在 → lastScanMs=undefined → sinceMs=Date.now()（现在），
+     用户当天删的十几个墓碑时间戳全部早于「现在」→ 被窗口永久过滤 → 永不写盘 →
+     台账永远不存在 → 死循环，删除功能形同虚设。首次运行/台账丢失必须全量清一遍并重建台账，
+     不能把已存在的墓碑当「过去」扔掉。 */
   const sinceMs = Number.isFinite(options.sinceMs)
     ? options.sinceMs
-    : (Number.isFinite(ledger.lastScanMs) ? ledger.lastScanMs : Date.now())
+    : (Number.isFinite(ledger.lastScanMs) ? ledger.lastScanMs : 0)
   const results = []
   /* 版本家族保护（2026-10-16）：分叉/版本切换出来的会话默认**不动刀**——
      切版本会往另一个分支写墓碑，真删会把那个版本的内容物理切除，用户就回不去了。
@@ -3137,6 +3140,86 @@ export function webinConfigPath(home = dshHomeDir()) {
   return `${home.replace(/[\\/]+$/u, '')}/webin/config.json`
 }
 
+/* ── 会话标题生成模型（2026-11-23 用户要求：标题模型设置进 exit 面板）────────
+ * 真源 = ~/.dsh/profiles/web/cordis.patch.yml 的 session-title-llm 条目
+ * （宿主官方插件 @deepseek-ai/dsh-session-title-first-prompt-llm 的 config：
+ *   provider/model 钉死标题请求走哪条车道；历史值 inai-deepseek）。
+ * 只读写块内 provider/model 两行，targetWords/timeoutMs 等其余键一概不动。
+ * 与 webin 启动自愈的关系：自愈只在「块整体缺失」时写回默认（inai-deepseek），
+ * 块在就不碰——本 UI 只改值不删块，两边无冲突。
+ * 生效时机：宿主插件 apply 时读 config → 改完需重启 DSH（UI 明确提示）。 */
+export function sessionTitlePatchPath(home = dshHomeDir()) {
+  return `${home.replace(/[\\/]+$/u, '')}/profiles/web/cordis.patch.yml`
+}
+/** YAML 值安全校验：字母数字与 . _ - /（覆盖 inai-deepseek / z-ai/glm-5.3-flash），拒换行冒号引号。 */
+function safeTitleModelValue(v) {
+  return typeof v === 'string' && /^[\w.\-/]+$/.test(v.trim()) ? v.trim() : null
+}
+/** 定位 session-title-llm 条目块行号区间 [start,end)（0 基，含 start 不含 end）；找不到返回 null。 */
+function locateTitleBlock(lines) {
+  const start = lines.findIndex((l) => /^\s*- id:\s*session-title-llm\s*$/.test(l))
+  if (start < 0) return null
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^\s*- id:/.test(lines[i])) { end = i; break }
+  }
+  return { start, end }
+}
+/** 读标题模型配置。blockPresent=false = patch.yml 里没有该块（重启 DSH 让 webin 自愈补块）。 */
+export function readTitleModel(home = dshHomeDir()) {
+  const path = sessionTitlePatchPath(home)
+  const base = { path, blockPresent: false, provider: null, model: null }
+  try {
+    if (!existsSync(path)) return base
+    const lines = readFileSync(path, 'utf8').split(/\r?\n/)
+    const block = locateTitleBlock(lines)
+    if (!block) return base
+    let provider = null
+    let model = null
+    for (let i = block.start + 1; i < block.end; i++) {
+      let m = lines[i].match(/^\s+provider:\s*(.+?)\s*$/)
+      if (m) provider = m[1] || null
+      m = lines[i].match(/^\s+model:\s*(.+?)\s*$/)
+      if (m) model = m[1] || null
+    }
+    return { path, blockPresent: true, provider, model }
+  } catch (error) {
+    return { ...base, error: String(error?.message ?? error) }
+  }
+}
+/** 写标题模型配置（只替换块内 provider/model 两行值；备份 .bak-titlemodel-<ts> + 自检 + 失败回滚）。 */
+export function writeTitleModel(provider, model, home = dshHomeDir()) {
+  const path = sessionTitlePatchPath(home)
+  const raw = readFileSync(path, 'utf8')
+  const lines = raw.split(/\r?\n/)
+  const block = locateTitleBlock(lines)
+  if (!block) throw new Error('cordis.patch.yml 未找到 session-title-llm 块（重启 DSH 让 webin 自愈补块，或手动补块后重试）')
+  let wroteProvider = false
+  let wroteModel = false
+  for (let i = block.start + 1; i < block.end; i++) {
+    if (!wroteProvider && /^\s+provider:\s*/.test(lines[i])) { lines[i] = lines[i].replace(/^(\s+provider:\s*).*$/, `$1${provider}`); wroteProvider = true }
+    else if (!wroteModel && /^\s+model:\s*/.test(lines[i])) { lines[i] = lines[i].replace(/^(\s+model:\s*).*$/, `$1${model}`); wroteModel = true }
+  }
+  if (!wroteProvider || !wroteModel) throw new Error('session-title-llm 块里缺 provider/model 行（结构异常，放弃写入）')
+  const out = lines.join('\n')
+  /* 自检：块还在、两行值正确、全文无 tab（YAML 大忌）。失败即放弃，原文件未动。 */
+  const reBlock = locateTitleBlock(out.split(/\r?\n/))
+  const ok = reBlock !== null
+    && new RegExp(`^\\s+provider:\\s*${provider}\\s*$`, 'm').test(out)
+    && new RegExp(`^\\s+model:\\s*${model}\\s*$`, 'm').test(out)
+    && !/\t/.test(out)
+  if (!ok) throw new Error('写回自检未通过（已放弃写入，原文件未动）')
+  const backup = `${path}.bak-titlemodel-${Date.now()}`
+  copyFileSync(path, backup)
+  try {
+    writeFileSync(path, out, 'utf8')
+  } catch (error) {
+    try { copyFileSync(backup, path) } catch { /* 备份恢复失败也如实上报 */ }
+    throw error
+  }
+  return { backup, path }
+}
+
 /** 读 JSON 文件，失败/缺失回退默认（绝不抛）。 */
 function readJsonOr(file, fallback) {
   try {
@@ -3204,6 +3287,8 @@ export function readExitPrefs(home = dshHomeDir()) {
       txtChunkBytes: Number(ldw.txtChunkBytes) > 0 ? Math.round(Number(ldw.txtChunkBytes))
         : (Number(webin.txtChunkBytes) > 0 ? Math.round(Number(webin.txtChunkBytes)) : 409600),
     },
+    /* 会话标题生成模型（2026-11-23）：真源 patch.yml session-title-llm 块（与 webin config 不同管道）。 */
+    titleModel: readTitleModel(home),
   }
 }
 
@@ -3268,6 +3353,25 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
   if (patch?.zhToolNames !== undefined) {
     if (typeof patch.zhToolNames !== 'boolean') errors.push('zhToolNames 应为布尔')
     else if (patch.zhToolNames !== next.zhToolNames) { next.zhToolNames = patch.zhToolNames; touchWebin = true }
+  }
+  /* 会话标题生成模型（2026-11-23）：真源 patch.yml session-title-llm 块（YAML 文本级写盘，
+     与 webin config JSON 不同管道）。这里只校验并存意图，真正写盘放在下方 try 里——
+     校验失败绝不动 patch.yml。 */
+  let titleModelWrite = null
+  if (patch?.titleModel !== undefined) {
+    const tm = patch.titleModel
+    if (tm === null || typeof tm !== 'object' || Array.isArray(tm)) {
+      errors.push('titleModel 应为对象')
+    } else {
+      const provider = safeTitleModelValue(tm.provider ?? '')
+      const model = safeTitleModelValue(tm.model ?? '')
+      if (!provider || !model) errors.push('titleModel.provider/model 应为合法值（字母数字 . _ - /）')
+      else {
+        /* exit-prefs 是全量 POST——每次保存都会带上 titleModel。与真源同值就跳过写盘，避免无谓备份文件。 */
+        const cur = readTitleModel(home)
+        if (cur.blockPresent !== true || cur.provider !== provider || cur.model !== model) titleModelWrite = { provider, model }
+      }
+    }
   }
   /* LDW 独立模式（2026-11-12）：true=跟随全局（写入端同时清掉 ldw 段五键——段里只留
      replyTimeoutMs 等运行参数，「跟随」的不变量由写盘保证，防残留幽灵覆盖）；
@@ -3345,10 +3449,14 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
       healOptionsCache = { at: 0, home: null, value: null }
     }
     if (touchOwn) writeJsonAtomic(exitPrefsPath(home), { hideVersionPager: next.hideVersionPager, renderFx: next.renderFx === true })
-    if (touchWebin || touchOwn) {
+    if (titleModelWrite) {
+      writeTitleModel(titleModelWrite.provider, titleModelWrite.model, home)
+      appendCompatLog(`title-model saved: ${titleModelWrite.provider}/${titleModelWrite.model}（重启 DSH 生效）`)
+    }
+    if (touchWebin || touchOwn || titleModelWrite) {
       appendCompatLog(`exit-prefs saved: mode=${next.compactionFileMode} threshold=${next.compactionFileThresholdChars} hidePager=${next.hideVersionPager} kbProtocol=${next.kbProtocol} nlTool=${next.nlToolProtocol} titlePrefix=${next.titlePrefix}`)
     }
-    return { ok: true, value: next, changed: { webin: touchWebin, own: touchOwn } }
+    return { ok: true, value: next, changed: { webin: touchWebin, own: touchOwn, titleModel: titleModelWrite !== null } }
   } catch (error) {
     return { ok: false, error: String(error?.message ?? error) }
   }
