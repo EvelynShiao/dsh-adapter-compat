@@ -211,6 +211,7 @@ window.__ModuleLoader__.load({
       }
       const remove = (index) => onChange(items.filter((_, i) => i !== index))
       const addFixed = () => onChange([...items, { type: 'fixed', provider: '', model: '', reasoningEffort: undefined }])
+      const addSession = () => onChange([...items, { type: 'session' }])
 
       const rows = items.map((item, index) => {
         const isSession = item.type === 'session'
@@ -288,7 +289,8 @@ window.__ModuleLoader__.load({
 
       return h('div', { className: 'dsh-chain-editor' },
         ...rows,
-        h(primitives.Button, { variant: 'outline', className: 'dsh-chain-add', disabled: busy, onClick: addFixed }, props.addLabel))
+        h(primitives.Button, { variant: 'outline', className: 'dsh-chain-add', disabled: busy, onClick: addFixed }, props.addLabel),
+        h(primitives.Button, { variant: 'outline', className: 'dsh-chain-add', disabled: busy, onClick: addSession }, props.addSessionLabel))
     }
 
     /* ── 样式：注入一次（与蒸馏链条卡同款外观，类名加 dsh-chain- 前缀避免撞宿主）── */
@@ -385,6 +387,7 @@ window.__ModuleLoader__.load({
       titleModelChainHint: '按顺序逐项尝试：某项失败（配额、超时等）自动换下一项重发；空链条＝使用当前会话模型。',
       chainFollowSession: '跟随会话使用模型',
       chainAdd: '添加固定渠道',
+      chainAddSession: '添加跟随会话',
       chainReasoning: '思考度',
       chainProviderDefault: '跟随提供商默认',
       chainSession: '跟随会话',
@@ -652,6 +655,7 @@ window.__ModuleLoader__.load({
       titleModelChainHint: 'Tried in order: on failure (quota, timeout, ...) the request is retried with the next item. An empty chain = use the current session model.',
       chainFollowSession: 'Follow the session model',
       chainAdd: 'Add fixed lane',
+      chainAddSession: 'Add follow-session',
       chainReasoning: 'Reasoning',
       chainProviderDefault: 'Provider default',
       chainSession: 'Follow session',
@@ -877,6 +881,13 @@ window.__ModuleLoader__.load({
 
     const style = `
       .ac-settings { display: flex; flex-direction: column; width: 100%; max-width: 760px; gap: 10px; }
+      /* 折叠行（2026-11-24 仿 session-kit SessionKitFoldRow）：轻量分隔线行，不再是重卡片。 */
+      .ac-fold { display: flex; flex-direction: column; gap: 8px; }
+      .ac-fold-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; border-bottom: 0.5px solid var(--dsh-color-border, rgba(128,128,128,0.28)); flex-wrap: wrap; }
+      .ac-fold-text { min-width: 0; flex: 1 1 auto; }
+      .ac-fold-title { font-size: 14px; line-height: 20px; color: var(--dsw-alias-label-primary); }
+      .ac-fold-hint { display: block; margin-top: 4px; font-size: 12px; line-height: 1.45; color: var(--dsw-alias-label-secondary); opacity: 0.82; }
+      .ac-fold-body { display: flex; flex-direction: column; gap: 10px; padding-top: 4px; }
       .ac-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; background: var(--dsw-alias-bg-base); }
       .ac-row-title { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
       .ac-row-desc { font-size: 12px; color: var(--dsw-alias-label-secondary); margin-top: 2px; }
@@ -2010,6 +2021,7 @@ window.__ModuleLoader__.load({
               chain, onChange: setChain, directory, t, busy,
               followLabel: t('chainFollowSession'),
               addLabel: t('chainAdd'),
+              addSessionLabel: t('chainAddSession'),
               reasoningLabel: t('chainReasoning'),
               providerDefaultLabel: t('chainProviderDefault'),
             }),
@@ -2130,26 +2142,20 @@ window.__ModuleLoader__.load({
     const INVISIBLE = '/dsh-adapter-compat/invisible'
     const INVISIBLE_PURGE = '/dsh-adapter-compat/invisible/purge'
 
-    /** 折叠块：默认收起，点标题/按钮展开（2026-10-16 用户要求「默认折叠」）。 */
+    /** 折叠块：默认收起，点标题/按钮展开（2026-10-16 用户要求「默认折叠」）。
+     *  2026-11-24 复刻 session-kit 的 SessionKitFoldRow（「▸ 注入源开关」那套）：
+     *  标题左侧三角 + 描述仅展开时显示 + 右侧 outline「展开/折叠」按钮；
+     *  行样式从「卡片边框圆角」改为「细分隔线」的轻量行，与「会话与提示词」视觉一致。 */
     function Fold({ title, desc, children, defaultOpen = false }) {
       const [open, setOpen] = useState(defaultOpen)
-      return h('div', {
-        style: {
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '8px',
-          borderTop: '1px solid var(--dsw-alias-border-subtle, #3333)',
-          paddingTop: '10px',
-          marginTop: '4px',
-        },
-      },
-      h('div', { className: 'ac-row' },
-        h('div', null,
-          h('div', { className: 'ac-row-title', style: { cursor: 'pointer' }, onClick: () => setOpen((v) => !v) },
-            `${open ? '▾' : '▸'} ${title}`),
-          desc ? h('div', { className: 'ac-row-desc' }, desc) : null),
-        h('button', { className: 'ac-btn', onClick: () => setOpen((v) => !v) }, open ? t('stateCollapse') : t('stateExpand'))),
-      open ? children : null)
+      return h('div', { className: 'ac-fold' },
+        h('div', { className: 'ac-fold-row' },
+          h('div', { className: 'ac-fold-text' },
+            h('div', { className: 'ac-fold-title', style: { cursor: 'pointer' }, onClick: () => setOpen((v) => !v) },
+              `${open ? '▾' : '▸'} ${title}`),
+            open && desc ? h('small', { className: 'ac-fold-hint' }, desc) : null),
+          h('button', { className: 'ac-btn', onClick: () => setOpen((v) => !v) }, open ? t('stateCollapse') : t('stateExpand'))),
+        open ? h('div', { className: 'ac-fold-body' }, children) : null)
     }
 
     /** 不可见会话子块 —— 嵌在「会话日志修复」分区里（2026-10-16 用户要求：紧致点，别单开顶级分区）。
@@ -2655,10 +2661,9 @@ window.__ModuleLoader__.load({
         },
       }, manualBusy === key ? t('running') : label)
 
-      const head = h('div', { className: 'ac-row' },
-        h('div', null,
-          h('div', { className: 'ac-row-title' }, t('healNav')),
-          h('div', { className: 'ac-row-desc' }, t('healDesc'))))
+      /* 分区整体也折叠（2026-11-24 用户要求「会话日志修复都弄成这样」）：
+         标题行 = ▸ 会话日志修复，展开才显示描述与各子块；不再常驻一个标题卡片。 */
+      const head = null
 
       const buttons = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
         h('button', { className: 'ac-btn ac-btn-primary', disabled: saving, onClick: save },
@@ -2744,7 +2749,8 @@ window.__ModuleLoader__.load({
             h(Fold, { key: 'ver', title: t('verNav'), desc: t('verDesc') }, h(VersionsBlock)))
         : h('div', { className: 'ac-row-desc' }, t('loadingPrefs'))
 
-      return h('div', { className: 'ac-settings' }, head, body)
+      return h('div', { className: 'ac-settings' },
+        h(Fold, { title: t('healNav'), desc: t('healDesc') }, body))
     }
 
     function apply(ctx) {
