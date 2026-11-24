@@ -780,6 +780,183 @@ export function selectedRoute(ctx, agent) {
   return { provider: pick.provider, model: pick.model }
 }
 
+/* ============ 会话标题链（只拦 purpose=session-title） ============ */
+export const TITLE_CHAIN_STREAM = Symbol.for('dsh-adapter-compat.session-title-chain-stream')
+export const TITLE_CONFIG_COMPAT = Symbol.for('dsh-adapter-compat.session-title-config-compat')
+
+/** session 项：优先 modelSelection.pending ?? lastUsed，拿不到退 requestHeader().config。 */
+export function titleSessionRoute(ctx, options) {
+  const sessions = serviceOf(ctx, 'sessions')
+  const session = typeof options?.sessionId === 'string' ? sessions?.get?.(options.sessionId) : undefined
+  const picked = session ? selectedRoute(ctx, { session }) : undefined
+  if (picked) return picked
+  const header = session?.requestHeader?.()?.config
+  const provider = safeTitleModelValue(header?.provider ?? '')
+  const model = safeTitleModelValue(header?.model ?? '')
+  if (!provider || !model) throw new Error('session-title chain: session route unavailable (modelSelection/requestHeader)')
+  return { provider, model }
+}
+
+function titleFinishFailure(chunk) {
+  if (chunk?.type !== 'finish' || chunk?.reason?.kind !== 'error') return null
+  const failure = chunk.reason.failure
+  if (failure instanceof Error) return failure
+  const error = new Error(String(failure?.message ?? 'session-title request failed'))
+  if (failure?.code !== undefined) error.code = failure.code
+  return error
+}
+
+/**
+ * 标题专用整流缓冲重试：每次尝试收完才转发；失败项的 delta 绝不给下游，故不会重复。
+ * 最后一项若抛错则原样抛出；若 finish=error 则回放其原始 chunks（保留宿主错误协议）。
+ * aborted 不是车道故障，立即结束，不再打下一项。
+ */
+export function titleChainStream(call, options, chain, log = () => {}) {
+  return (async function* () {
+    let lastError = null
+    for (let index = 0; index < chain.length; index++) {
+      const item = chain[index]
+      let route
+      try {
+        route = item.type === 'session' ? titleSessionRoute(call.ctx, options) : item
+      } catch (error) {
+        lastError = error
+        if (index + 1 >= chain.length) throw error
+        log(`title-chain[${index}] session route unavailable; trying next: ${String(error?.message ?? error).slice(0, 160)}`)
+        continue
+      }
+      const attemptOptions = {
+        ...options,
+        provider: route.provider,
+        model: route.model,
+        ...(item.type === 'fixed' && item.reasoningEffort !== undefined ? { reasoningEffort: item.reasoningEffort } : {}),
+      }
+      const chunks = []
+      let thrown = null
+      let failed = null
+      let aborted = false
+      try {
+        const stream = call.stream(attemptOptions)
+        if (!stream || typeof stream[Symbol.asyncIterator] !== 'function') throw new Error('session-title llm.stream did not return an async iterable')
+        for await (const chunk of stream) {
+          chunks.push(chunk)
+          if (chunk?.type !== 'finish') continue
+          if (chunk.reason?.kind === 'aborted') aborted = true
+          failed = titleFinishFailure(chunk)
+          break
+        }
+      } catch (error) {
+        thrown = error
+        aborted = options?.signal?.aborted === true || error?.code === 'ABORTED'
+      }
+      if (!thrown && !failed) {
+        for (const chunk of chunks) yield chunk
+        return
+      }
+      lastError = thrown ?? failed
+      if (aborted || index + 1 >= chain.length) {
+        if (thrown) throw thrown
+        for (const chunk of chunks) yield chunk
+        return
+      }
+      log(`title-chain[${index}] ${route.provider}/${route.model} failed; trying next: ${String(lastError?.message ?? lastError).slice(0, 160)}`)
+    }
+    throw lastError ?? new Error('session-title chain exhausted without a response')
+  })()
+}
+
+/**
+ * 官方标题插件直接走 ctx.llm.stream(options)（不是 agent-loop 的 preparedCall），
+ * 因而这里能真正重选 adapter，而不是在旧 preparedCall 上假改 provider/model。
+ */
+export function installTitleChain(ctx, config = {}, deps = {}) {
+  if (config?.titleChain === false) return false
+  const llm = serviceOf(ctx, 'llm')
+  if (!llm || typeof llm.stream !== 'function' || llm.stream[TITLE_CHAIN_STREAM]) return false
+  const original = llm.stream
+  const readChain = typeof deps.readChain === 'function'
+    ? deps.readChain
+    : () => readTitleModel().chain
+  const log = typeof deps.log === 'function' ? deps.log : (line) => appendCompatLog(line)
+  const wrapped = function (options) {
+    if (options?.purpose !== 'session-title') return original.apply(this, arguments)
+    let chain
+    try {
+      chain = readChain()
+      if (!Array.isArray(chain)) throw new Error('titleModel.chain is not an array')
+      chain = chain.map((item, index) => normalizeTitleChainEntry(item, index))
+    } catch (error) {
+      /* 配置读取失败不劫持官方请求；合法空链则明确只走会话当前模型。 */
+      log(`title-chain config read failed; using original request: ${String(error?.message ?? error).slice(0, 160)}`)
+      return original.call(this, options)
+    }
+    const effective = chain.length > 0 ? chain : [{ type: 'session' }]
+    const streamFor = { ctx, stream: (nextOptions) => original.call(this, nextOptions) }
+    return titleChainStream(streamFor, options, effective, log)
+  }
+  wrapped[TITLE_CHAIN_STREAM] = true
+  wrapped.original = original
+  try {
+    llm.stream = wrapped
+    log('title-chain: installed on llm.stream (buffered failover)')
+    return true
+  } catch (error) {
+    log(`title-chain: install failed: ${String(error?.message ?? error).slice(0, 160)}`)
+    return false
+  }
+}
+
+function isOfficialTitleRuntime(runtime) {
+  if (runtime?.name === 'session-title-first-prompt-llm' || runtime?.name === '@deepseek-ai/dsh-session-title-first-prompt-llm') return true
+  try {
+    return [...(runtime?.fibers ?? [])].some((fiber) => fiber?.entry?.options?.id === 'session-title-llm')
+  } catch { return false }
+}
+
+/** 官方二次校验拒绝 chain；只在该插件 apply 的参数上去掉，文件与其他插件配置不动。 */
+function compatTitleRuntime(runtime) {
+  if (!isOfficialTitleRuntime(runtime) || !runtime.callback) return false
+  const callback = runtime.callback
+  const original = typeof callback === 'function' ? callback : callback.apply
+  if (typeof original !== 'function' || original[TITLE_CONFIG_COMPAT]) return false
+  const wrapped = function (ctx, config) {
+    if (config === null || typeof config !== 'object' || !Object.prototype.hasOwnProperty.call(config, 'chain')) {
+      return original.call(this, ctx, config)
+    }
+    const { chain: _chain, ...officialConfig } = config
+    return original.call(this, ctx, officialConfig)
+  }
+  wrapped[TITLE_CONFIG_COMPAT] = true
+  wrapped.original = original
+  try {
+    runtime.callback = typeof callback === 'function' ? wrapped : { ...callback, apply: wrapped }
+    return true
+  } catch { return false }
+}
+
+/** internal/plugin 在 Fiber 构造期、官方 apply 之前触发，可覆盖晚于本插件装载的情况。 */
+export function installTitleConfigCompat(ctx) {
+  const revive = (runtime) => {
+    if (!compatTitleRuntime(runtime)) return
+    try {
+      for (const fiber of [...(runtime.fibers ?? [])]) {
+        /* 标题条目排在本插件前时，首次 chain 校验可能已失败；兼容后就地恢复，不再要求二次重启。 */
+        if (fiber?.state === 3 && typeof fiber.restart === 'function') {
+          Promise.resolve(fiber.restart()).catch((error) => appendCompatLog(`title-config compat restart failed: ${String(error?.message ?? error).slice(0, 160)}`))
+        }
+      }
+    } catch { /* 已失败条目由下次重启兜底 */ }
+    appendCompatLog('title-config compat: chain hidden only from official title apply')
+  }
+  try {
+    for (const runtime of ctx.registry?.values?.() ?? []) revive(runtime)
+  } catch { /* 下面的监听仍覆盖后续注册 */ }
+  try {
+    ctx.on('internal/plugin', (fiber) => revive(fiber?.runtime), { global: true, prepend: true })
+    return true
+  } catch { return false }
+}
+
 /**
  * 包装一个对象的 summarize()：调用期间把 this.config 的摘要目标钉到当前选中模型。
  * 幂等（SUMMARIZER_ARMED 标记）；任何异常静默返回 false。
@@ -3144,10 +3321,10 @@ export function webinConfigPath(home = dshHomeDir()) {
  * 真源 = ~/.dsh/profiles/web/cordis.patch.yml 的 session-title-llm 条目
  * （宿主官方插件 @deepseek-ai/dsh-session-title-first-prompt-llm 的 config：
  *   provider/model 钉死标题请求走哪条车道；历史值 inai-deepseek）。
- * 只读写块内 provider/model 两行，targetWords/timeoutMs 等其余键一概不动。
+ * chain 为本插件真源；provider/model 保留为官方插件兜底，targetWords/timeoutMs 等其余键一概不动。
  * 与 webin 启动自愈的关系：自愈只在「块整体缺失」时写回默认（inai-deepseek），
  * 块在就不碰——本 UI 只改值不删块，两边无冲突。
- * 生效时机：宿主插件 apply 时读 config → 改完需重启 DSH（UI 明确提示）。 */
+ * 标题请求每次现读 chain；官方配置兼容由 installTitleConfigCompat 定向处理。 */
 export function sessionTitlePatchPath(home = dshHomeDir()) {
   return `${home.replace(/[\\/]+$/u, '')}/profiles/web/cordis.patch.yml`
 }
@@ -3165,10 +3342,80 @@ function locateTitleBlock(lines) {
   }
   return { start, end }
 }
-/** 读标题模型配置。blockPresent=false = patch.yml 里没有该块（重启 DSH 让 webin 自愈补块）。 */
+/** 标题链项与 reasoningEffort 的合法值。 */
+export const TITLE_REASONING_EFFORTS = ['off', 'low', 'medium', 'high']
+
+/** 校验并归一一条标题链；UI 写入与 patch.yml 读取共用同一份语义。 */
+function normalizeTitleChainEntry(raw, index = 0) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`titleModel.chain[${index}] 应为对象`)
+  }
+  if (raw.type === 'session') return { type: 'session' }
+  if (raw.type !== 'fixed') throw new Error(`titleModel.chain[${index}].type 应为 session/fixed`)
+  const provider = safeTitleModelValue(raw.provider ?? '')
+  const model = safeTitleModelValue(raw.model ?? '')
+  if (!provider || !model) throw new Error(`titleModel.chain[${index}] 的 provider/model 应为合法值（字母数字 . _ - /）`)
+  const out = { type: 'fixed', provider, model }
+  if (raw.reasoningEffort !== undefined && raw.reasoningEffort !== null && raw.reasoningEffort !== '') {
+    if (!TITLE_REASONING_EFFORTS.includes(raw.reasoningEffort)) {
+      throw new Error(`titleModel.chain[${index}].reasoningEffort 应为 off/low/medium/high`)
+    }
+    out.reasoningEffort = raw.reasoningEffort
+  }
+  return out
+}
+
+/** 解析 session-title-llm 块的简单 YAML 列表；只认本功能写出的固定缩进，不碰其他配置。 */
+function titleChainFromLines(lines, block) {
+  let start = -1
+  let indent = ''
+  for (let i = block.start + 1; i < block.end; i++) {
+    const m = lines[i].match(/^(\s+)chain:\s*$/)
+    if (m) { start = i; indent = m[1]; break }
+  }
+  if (start < 0) return { present: false, chain: [], start, end: start }
+  const chain = []
+  let end = start + 1
+  /* chain 列表的结束只由缩进决定，解析与写入共用同一个 limit。 */
+  const limit = (() => {
+    let i = start + 1
+    while (i < block.end) {
+      if (lines[i].trim() !== '' && !lines[i].startsWith(`${indent}  `)) break
+      i++
+    }
+    return i
+  })()
+  while (end < limit) {
+    const line = lines[end]
+    if (line.trim() === '') { end++; continue }
+    if (!line.startsWith(`${indent}  `)) break
+    const item = line.match(new RegExp(`^${indent}  -\\s*(.*)$`))
+    if (item) {
+      const raw = {}
+      if (item[1].trim() !== '') {
+        const kv = item[1].match(/^([\w]+):\s*(.*?)\s*$/)
+        if (kv) raw[kv[1]] = kv[2]
+      }
+      end++
+      while (end < limit) {
+        const kv = lines[end].match(new RegExp(`^${indent}    ([\\w]+):\\s*(.*?)\\s*$`))
+        if (!kv) break
+        raw[kv[1]] = kv[2]
+        end++
+      }
+      try { chain.push(normalizeTitleChainEntry(raw, chain.length)) } catch { /* 坏项忽略；写入端会严格拒绝 */ }
+      continue
+    }
+    break
+  }
+  /* start=chain: 键所在行，end=列表块结束行（下一个缩进 ≤ indent 的非空行或块尾），供写入端 splice(start, end-start) 整段删除。 */
+  return { present: true, chain, start, end: limit }
+}
+
+/** 读标题模型配置；chain 优先，旧 provider/model 归一为单项 fixed，二者皆无则空链。 */
 export function readTitleModel(home = dshHomeDir()) {
   const path = sessionTitlePatchPath(home)
-  const base = { path, blockPresent: false, provider: null, model: null }
+  const base = { path, blockPresent: false, provider: null, model: null, chain: [] }
   try {
     if (!existsSync(path)) return base
     const lines = readFileSync(path, 'utf8').split(/\r?\n/)
@@ -3182,42 +3429,110 @@ export function readTitleModel(home = dshHomeDir()) {
       m = lines[i].match(/^\s+model:\s*(.+?)\s*$/)
       if (m) model = m[1] || null
     }
-    return { path, blockPresent: true, provider, model }
+    const parsed = titleChainFromLines(lines, block)
+    const legacyProvider = safeTitleModelValue(provider ?? '')
+    const legacyModel = safeTitleModelValue(model ?? '')
+    const chain = parsed.present
+      ? parsed.chain
+      : (legacyProvider && legacyModel ? [{ type: 'fixed', provider: legacyProvider, model: legacyModel }] : [])
+    return { path, blockPresent: true, provider, model, chain }
   } catch (error) {
     return { ...base, error: String(error?.message ?? error) }
   }
 }
-/** 写标题模型配置（只替换块内 provider/model 两行值；备份 .bak-titlemodel-<ts> + 自检 + 失败回滚）。 */
-export function writeTitleModel(provider, model, home = dshHomeDir()) {
+
+/**
+ * 写标题模型链：保留官方插件的 provider/model 兜底，同时在其 config 下写 chain。
+ * 新签名 writeTitleModel(chain, home)；保留旧签名 (provider, model, home) 兼容既有调用。
+ */
+export function writeTitleModel(chainOrProvider, modelOrHome, legacyHome) {
+  const legacy = typeof chainOrProvider === 'string'
+  const home = legacy ? (legacyHome ?? dshHomeDir()) : (modelOrHome ?? dshHomeDir())
+  const rawChain = legacy
+    ? [{ type: 'fixed', provider: chainOrProvider, model: modelOrHome }]
+    : chainOrProvider
+  if (!Array.isArray(rawChain)) throw new Error('titleModel.chain 应为数组')
+  const chain = rawChain.map((item, index) => normalizeTitleChainEntry(item, index))
   const path = sessionTitlePatchPath(home)
   const raw = readFileSync(path, 'utf8')
   const lines = raw.split(/\r?\n/)
   const block = locateTitleBlock(lines)
   if (!block) throw new Error('cordis.patch.yml 未找到 session-title-llm 块（重启 DSH 让 webin 自愈补块，或手动补块后重试）')
+  let configIndent = null
+  for (let i = block.start + 1; i < block.end; i++) {
+    const m = lines[i].match(/^(\s+)config:\s*$/)
+    if (m) { configIndent = m[1]; break }
+  }
+  if (configIndent === null) throw new Error('session-title-llm 块里缺 config（结构异常，放弃写入）')
+  const keyIndent = `${configIndent}  `
+  const oldChain = titleChainFromLines(lines, block)
+  if (oldChain.present) lines.splice(oldChain.start, oldChain.end - oldChain.start)
+  /* 删除旧 chain 后重新定位条目区间，并同步原 block.end 供解析器安全使用。 */
+  const targetBlock = locateTitleBlock(lines)
+  block.end = targetBlock.end
+
+  const firstFixed = chain.find((item) => item.type === 'fixed')
   let wroteProvider = false
   let wroteModel = false
-  for (let i = block.start + 1; i < block.end; i++) {
-    if (!wroteProvider && /^\s+provider:\s*/.test(lines[i])) { lines[i] = lines[i].replace(/^(\s+provider:\s*).*$/, `$1${provider}`); wroteProvider = true }
-    else if (!wroteModel && /^\s+model:\s*/.test(lines[i])) { lines[i] = lines[i].replace(/^(\s+model:\s*).*$/, `$1${model}`); wroteModel = true }
+  for (let i = targetBlock.start + 1; i < targetBlock.end && i < lines.length; i++) {
+    if (!wroteProvider && new RegExp(`^${keyIndent}provider:\\s*`).test(lines[i])) {
+      if (firstFixed) lines[i] = `${keyIndent}provider: ${firstFixed.provider}`
+      wroteProvider = true
+    } else if (!wroteModel && new RegExp(`^${keyIndent}model:\\s*`).test(lines[i])) {
+      if (firstFixed) lines[i] = `${keyIndent}model: ${firstFixed.model}`
+      wroteModel = true
+    }
   }
-  if (!wroteProvider || !wroteModel) throw new Error('session-title-llm 块里缺 provider/model 行（结构异常，放弃写入）')
+  if (firstFixed && (!wroteProvider || !wroteModel)) {
+    throw new Error('session-title-llm 块里缺 provider/model 行（结构异常，放弃写入）')
+  }
+  const chainLines = [`${keyIndent}chain:`]
+  for (const item of chain) {
+    if (item.type === 'session') { chainLines.push(`${keyIndent}  - type: session`); continue }
+    chainLines.push(`${keyIndent}  - type: fixed`, `${keyIndent}    provider: ${item.provider}`, `${keyIndent}    model: ${item.model}`)
+    if (item.reasoningEffort !== undefined) chainLines.push(`${keyIndent}    reasoningEffort: ${item.reasoningEffort}`)
+  }
+  const modelIndex = lines.findIndex((line, index) => index > targetBlock.start && index < targetBlock.end && new RegExp(`^${keyIndent}model:\\s*`).test(line))
+  const providerIndex = lines.findIndex((line, index) => index > targetBlock.start && index < targetBlock.end && new RegExp(`^${keyIndent}provider:\\s*`).test(line))
+  const insertion = modelIndex >= 0 ? modelIndex + 1 : (providerIndex >= 0 ? providerIndex + 1 : targetBlock.end)
+  lines.splice(insertion, 0, ...chainLines)
   const out = lines.join('\n')
-  /* 自检：块还在、两行值正确、全文无 tab（YAML 大忌）。失败即放弃，原文件未动。 */
-  const reBlock = locateTitleBlock(out.split(/\r?\n/))
-  const ok = reBlock !== null
-    && new RegExp(`^\\s+provider:\\s*${provider}\\s*$`, 'm').test(out)
-    && new RegExp(`^\\s+model:\\s*${model}\\s*$`, 'm').test(out)
+  /* 自检：重读文本，chain 与目标深等、官方兜底正确、其余块仍在、无 tab。 */
+  const check = readTitleModelFromText(out, path)
+  const ok = check.blockPresent === true
+    && JSON.stringify(check.chain) === JSON.stringify(chain)
+    && (!firstFixed || (check.provider === firstFixed.provider && check.model === firstFixed.model))
     && !/\t/.test(out)
   if (!ok) throw new Error('写回自检未通过（已放弃写入，原文件未动）')
   const backup = `${path}.bak-titlemodel-${Date.now()}`
   copyFileSync(path, backup)
   try {
     writeFileSync(path, out, 'utf8')
+    const persisted = readTitleModel(home)
+    if (persisted.blockPresent !== true || JSON.stringify(persisted.chain) !== JSON.stringify(chain)) {
+      throw new Error('落盘后复核未通过')
+    }
   } catch (error) {
     try { copyFileSync(backup, path) } catch { /* 备份恢复失败也如实上报 */ }
     throw error
   }
   return { backup, path }
+}
+
+/** writeTitleModel 的内存自检入口，避免自检依赖磁盘上的旧文件。 */
+function readTitleModelFromText(text, path) {
+  const lines = text.split(/\r?\n/)
+  const block = locateTitleBlock(lines)
+  if (!block) return { path, blockPresent: false, chain: [] }
+  let provider = null
+  let model = null
+  for (let i = block.start + 1; i < block.end; i++) {
+    let m = lines[i].match(/^\s+provider:\s*(.+?)\s*$/)
+    if (m) provider = m[1] || null
+    m = lines[i].match(/^\s+model:\s*(.+?)\s*$/)
+    if (m) model = m[1] || null
+  }
+  return { path, blockPresent: true, provider, model, chain: titleChainFromLines(lines, block).chain }
 }
 
 /** 读 JSON 文件，失败/缺失回退默认（绝不抛）。 */
@@ -3362,14 +3677,16 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
     const tm = patch.titleModel
     if (tm === null || typeof tm !== 'object' || Array.isArray(tm)) {
       errors.push('titleModel 应为对象')
+    } else if (!Array.isArray(tm.chain)) {
+      errors.push('titleModel.chain 应为数组')
     } else {
-      const provider = safeTitleModelValue(tm.provider ?? '')
-      const model = safeTitleModelValue(tm.model ?? '')
-      if (!provider || !model) errors.push('titleModel.provider/model 应为合法值（字母数字 . _ - /）')
-      else {
+      try {
+        const chain = tm.chain.map((item, index) => normalizeTitleChainEntry(item, index))
         /* exit-prefs 是全量 POST——每次保存都会带上 titleModel。与真源同值就跳过写盘，避免无谓备份文件。 */
         const cur = readTitleModel(home)
-        if (cur.blockPresent !== true || cur.provider !== provider || cur.model !== model) titleModelWrite = { provider, model }
+        if (cur.blockPresent !== true || JSON.stringify(cur.chain) !== JSON.stringify(chain)) titleModelWrite = { chain }
+      } catch (error) {
+        errors.push(String(error?.message ?? error))
       }
     }
   }
@@ -3450,8 +3767,9 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
     }
     if (touchOwn) writeJsonAtomic(exitPrefsPath(home), { hideVersionPager: next.hideVersionPager, renderFx: next.renderFx === true })
     if (titleModelWrite) {
-      writeTitleModel(titleModelWrite.provider, titleModelWrite.model, home)
-      appendCompatLog(`title-model saved: ${titleModelWrite.provider}/${titleModelWrite.model}（重启 DSH 生效）`)
+      writeTitleModel(titleModelWrite.chain, home)
+      next.titleModel = readTitleModel(home)
+      appendCompatLog(`title-model chain saved: ${JSON.stringify(titleModelWrite.chain)}`)
     }
     if (touchWebin || touchOwn || titleModelWrite) {
       appendCompatLog(`exit-prefs saved: mode=${next.compactionFileMode} threshold=${next.compactionFileThresholdChars} hidePager=${next.hideVersionPager} kbProtocol=${next.kbProtocol} nlTool=${next.nlToolProtocol} titlePrefix=${next.titlePrefix}`)
@@ -4786,6 +5104,10 @@ export function apply(ctx, config = {}) {
   } catch {
     /* 规范化装不上不能拖垮 apply */
   }
+
+  // -3.701) 会话标题链：官方 chain 配置兼容 + llm.stream 专用缓冲换道
+  try { installTitleConfigCompat(ctx) } catch { /* 不影响其他功能 */ }
+  try { installTitleChain(ctx, config) } catch { /* 标题链装不上不拖垮 apply */ }
 
   // -3.71) 自检路由（两端一眼确认版本与出口规范化状态）
   try {
