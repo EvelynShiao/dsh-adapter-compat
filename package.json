@@ -37,7 +37,7 @@
     "llm"
   ],
   "author": "EvelynShiao",
-  "license": "MIT",
+  "license": "MPL-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/EvelynShiao/dsh-adapter-compat.git"
