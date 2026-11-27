@@ -447,13 +447,20 @@ export function purgeSessionFile(file, sid, options = {}) {
     out.notes.push('inbox-chain rewritten: ' + JSON.stringify(inboxRewrite.stats));
   }
   try {
+    /* 真删除语义（2026-11-26 用户拍板「像删 .txt 一行那么干净」）：
+       备份只作为**写盘失败时**的回滚材料，写成功 + 读回复核通过后立刻销毁。
+       旧行为把 pre-delete 全文永久留在 backup-true-delete/ 里 —— 那就是
+       「插件关了被删除的消息直接暴露」的第二份副本。 */
+    let backupPath;
     if (options.backupDir) {
       mkdirSync(options.backupDir, { recursive: true });
-      copyFileSync(file, join(options.backupDir, `${sid}.zstd`));
+      backupPath = join(options.backupDir, `${sid}.zstd`);
+      copyFileSync(file, backupPath);
     }
     /* 安全写盘：临时文件 → 读回复核 + 断口门 → 替换。此前是「先写正文再复核」，
        复核不过时坏文件已经落盘（写后验尸）。现在任何一步不过 = 原文件分毫不动。 */
     const w = writeSessionSafe(file, result.header, result.events);
+    if (w.ok && backupPath !== undefined) { try { rmSync(backupPath, { force: true }); } catch { /* 删不掉只是多留一份，不影响结果 */ } }
     out.verify = w.ok;
     out.status = w.ok ? 'written' : w.status;
     if (w.after !== undefined) out.after = w.after;
@@ -693,6 +700,8 @@ export function redactSessionFile(file, sid, options = {}) {
     out.status = w.ok ? 'redacted' : w.status;
     if (w.after !== undefined) out.after = w.after;
     if (Array.isArray(w.notes)) for (const n of w.notes) out.notes.push(n);
+    /* 真删除：写成功且复核通过 → 销毁 pre-redact 备份（它含被删原文）。 */
+    if (w.ok) { try { rmSync(join(options.backupDir, sid + '.redact.zstd'), { force: true }); } catch { /* 删不掉不影响结果 */ } }
   } catch (error) { out.status = 'failed'; out.notes.push('write: ' + String(error?.message ?? error).slice(0, 160)); }
   return out;
 }

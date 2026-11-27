@@ -410,6 +410,8 @@ window.__ModuleLoader__.load({
       renderFxDesc: '屏幕外的消息跳过布局与绘制（content-visibility），长会话滚动更顺；时间轴不受影响。默认关，改完点保存',
       renderFxOn: '已开启',
       renderFxOff: '已关闭',
+      autoCompactLabel: '自动压缩',
+      autoCompactDesc: '开：窗口快满时宿主自动压缩摘要（宿主原生行为）。关：从代码层拦掉自动压缩，到顶直接报 context-overflow，手动 /compact 仍可用。改完即时生效，不用重启',
       modeLabel: '压缩 .txt 出口',
       modeDesc: '压缩摘要（/compact）输入太大时，把全文打包成 .txt 附件传给网页端',
       thresholdLabel: '直接发送阈值（字符）',
@@ -668,6 +670,8 @@ window.__ModuleLoader__.load({
       renderFxDesc: 'Off-screen messages skip layout and paint (content-visibility) so long sessions scroll smoother; the timeline is unaffected. Default off; click save after changing',
       renderFxOn: 'Enabled',
       renderFxOff: 'Disabled',
+      autoCompactLabel: 'Auto compaction',
+      autoCompactDesc: 'On: the host summarizes automatically when the window fills up (native behavior). Off: auto compaction is gated out at the code layer, hitting the ceiling reports context-overflow, manual /compact still works. Applies immediately, no restart',
       modeLabel: 'Compaction .txt exit',
       modeDesc: 'When a compaction summary (/compact) is too large, the full text is packed into a .txt attachment for the web side',
       thresholdLabel: 'Direct-send threshold (chars)',
@@ -1103,18 +1107,21 @@ window.__ModuleLoader__.load({
        宿主消息流容器 [data-conversation-scroll]，消息项 .EvIC1a_flowItem（宿主 chat 包的
        稳定 class）；预估高度给 contain-intrinsic-size 防滚动跳动。Timeline 的 turn 轨道
        （.eGxaPq_frame，绝对定位独立层）不在消息流内、且显式豁免——缩略条/刻度照常渲染。 */
-    // hidden="until-found" relies on UA content-visibility:hidden. Never override it:
-    // doing so reveals collapsed assistant steps even while disclosure stays closed.
+    /* hidden="until-found" relies on UA content-visibility:hidden. Never override it:
+       doing so reveals collapsed assistant steps even while disclosure stays closed.
+       选择器锚点（2026-11-26 换锚）：原先用混淆类名 .EvIC1a_flowItem / .eGxaPq_*，
+       宿主升到 0.2.2-rc.5 后前缀全变（现为 .V4vHZW_flowItem、timeline 改用
+       iFBRtq_* + data-dsh-tl-*），旧选择器一条都匹配不到 == 懒渲染整条静默失效。
+       改锚到语义属性：宿主 flowItem 恒带 data-chat-flow-key（新宿主 client.js 实锤），
+       timeline 有稳定前缀 data-dsh-tl-theme，两者都不随混淆前缀变化。 */
     const RENDER_FX_CSS = [
-      '[data-conversation-scroll] .EvIC1a_flowItem:not([hidden]) {',
+      '[data-conversation-scroll] [data-chat-flow-key]:not([hidden]) {',
       '  content-visibility: auto;',
       '  contain-intrinsic-size: auto 220px;',
       '}',
       '/* Timeline 轨道豁免：绝对定位层不吃 content-visibility，双保险显式还原 */',
-      '[data-conversation-scroll] .eGxaPq_frame,',
-      '[data-conversation-scroll] .eGxaPq_slot,',
-      '[data-conversation-scroll] .eGxaPq_scroller,',
-      '[data-conversation-scroll] .eGxaPq_marks {',
+      '[data-conversation-scroll] [data-dsh-tl-theme],',
+      '[data-conversation-scroll] [data-dsh-tl-theme] * {',
       '  content-visibility: visible;',
       '}',
     ].join('\n')
@@ -1228,6 +1235,8 @@ window.__ModuleLoader__.load({
               compactionFileThresholdChars: prefs.compactionFileThresholdChars,
               hideVersionPager: prefs.hideVersionPager,
               renderFx: prefs.renderFx === true,
+              /** 自动压缩开关（2026-11-26）：写本插件偏好文件，后端读完立即切实时标志。 */
+              autoCompaction: prefs.autoCompaction === true,
               kbProtocol: prefs.kbProtocol !== false,
               nlToolProtocol: prefs.nlToolProtocol === true,
               titlePrefix: prefs.titlePrefix !== false,
@@ -1296,6 +1305,17 @@ window.__ModuleLoader__.load({
           className: 'ac-btn',
           onClick: () => setPrefs((p) => ({ ...p, renderFx: p.renderFx !== true })),
         }, prefs.renderFx === true ? t('renderFxOn') : t('renderFxOff')))
+
+      /* 自动压缩开关（2026-11-26 用户要求）：放在压缩出口上方——先决定「要不要自动压缩」，
+         再决定「压缩摘要怎么出口」。 */
+      const autoCompactRow = h('div', { className: 'ac-row' },
+        h('div', null,
+          h('div', { className: 'ac-row-title' }, t('autoCompactLabel')),
+          h('div', { className: 'ac-row-desc' }, t('autoCompactDesc'))),
+        h('button', {
+          className: 'ac-btn',
+          onClick: () => setPrefs((p) => ({ ...p, autoCompaction: p.autoCompaction !== true })),
+        }, prefs.autoCompaction === true ? t('on') : t('off')))
 
       const modeRow = h('div', { className: 'ac-row' },
         h('div', null,
@@ -1431,7 +1451,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'ac-row-desc' }, note || t('exitNote')),
         h('button', { className: 'ac-btn', disabled: busy, onClick: () => void save() }, busy ? t('saving') : t('save')))
 
-      return wrap([pagerRow, renderFxRow, modeRow, thresholdRow, directThresholdRow, txtChunkRow, chatOnlyRow, zhRow, kbRow, nlRow, ldwFollowRow, ...ldwRows, titleRow, foot])
+      return wrap([pagerRow, renderFxRow, autoCompactRow, modeRow, thresholdRow, directThresholdRow, txtChunkRow, chatOnlyRow, zhRow, kbRow, nlRow, ldwFollowRow, ...ldwRows, titleRow, foot])
     }
 
     /* 链条编辑器需要的宿主上下文：从 apply 注入的 ctx 读取（modelDirectories/agents）。 */

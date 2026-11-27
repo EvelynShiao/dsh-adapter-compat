@@ -1,6 +1,9 @@
+import './_hermetic-home.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { apply, armEngine, gateTarget, backfillAdapter, GATED } from '../index.js'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { apply, armEngine, gateTarget, backfillAdapter, GATED, setAutoCompactionAllowed, isAutoCompactionAllowed, resolveAutoCompactionAllowed } from '../index.js'
 
 /** 模拟 BasicCompactionEngine 形态：方法在 prototype 上。 */
 class FakeEngine {
@@ -73,11 +76,13 @@ test('apply 默认开闸：根引擎被武装', () => {
   assert.equal(engine.compactNow(), 'manual-ok')
 })
 
-test('config.autoGate:false 恢复官方行为', () => {
-  // 每个测试用独立类，避免 prototype 打标跨用例污染（armEngine 会动 prototype）
+test('config.autoGate:false 恢复官方行为（闸常驻、放行转发）', () => {
+  /* 2026-11-26 语义变更：为了让设置页开关能实时来回切，闸不再「关掉就不装」，
+     而是常驻 + 读实时标志。autoGate:false 的对外行为仍是「官方原样」——
+     方法被包了一层，但调用会被原样转发给 original。 */
   class FreshEngine {
-    compactIfNeeded() {
-      throw new Error('auto compaction must never run')
+    compactIfNeeded(agent, kind) {
+      return { summarized: true, kind }
     }
     compactNow() {
       return 'manual-ok'
@@ -86,8 +91,48 @@ test('config.autoGate:false 恢复官方行为', () => {
   const engine = new FreshEngine()
   const ctx = makeCtx({ engine })
   apply(ctx, { autoGate: false })
-  assert.notEqual(engine.compactIfNeeded[GATED], true, '关闸后不动引擎')
-  assert.throws(() => engine.compactIfNeeded(), /auto compaction must never run/)
+  assert.equal(engine.compactIfNeeded[GATED], true, '闸仍然装着（否则无法随时切回拦截）')
+  assert.equal(isAutoCompactionAllowed(), true, '放行态已置位')
+  assert.deepEqual(engine.compactIfNeeded({}, 'pressure'), { summarized: true, kind: 'pressure' }, '放行态必须转发给原方法')
+  assert.equal(engine.compactNow(), 'manual-ok', '手动路径原样')
+})
+
+test('设置页开关：放行态实时切换，无需重新装闸', () => {
+  class ToggleEngine {
+    compactIfNeeded(agent, kind) {
+      return { summarized: true, kind }
+    }
+  }
+  const engine = new ToggleEngine()
+  const ctx = makeCtx({ engine })
+  apply(ctx) /* 默认 = 拦截 */
+  assert.equal(isAutoCompactionAllowed(), false)
+  assert.equal(engine.compactIfNeeded({}, 'pressure'), null, '默认拦截')
+
+  setAutoCompactionAllowed(true)
+  assert.equal(engine.compactIfNeeded({}, 'pressure')?.summarized, true, '打开后转发')
+  /* prototype 层同步生效：开关之后新建的实例也尊重同一标志 */
+  const another = new ToggleEngine()
+  assert.equal(another.compactIfNeeded({}, 'pressure')?.summarized, true, '新实例同样放行')
+
+  setAutoCompactionAllowed(false)
+  assert.equal(engine.compactIfNeeded({}, 'pressure'), null, '切回拦截')
+  assert.equal(another.compactIfNeeded({}, 'pressure'), null, '新实例同样被拦')
+})
+
+test('偏好文件 autoCompaction 优先于 patch.yml config.autoGate', () => {
+  const dir = mkdtempSync(join(process.env.DSH_HOME || '.', 'pref-'))
+  const prefs = join(dir, 'adapter-compat-exit.json')
+
+  /* 文件里没写：落到 config 判断 */
+  assert.equal(resolveAutoCompactionAllowed({ autoGate: false }, dir), true, '无文件时 autoGate:false = 放行')
+  assert.equal(resolveAutoCompactionAllowed({}, dir), false, '无文件时默认拦截')
+
+  /* 文件写了就以文件为准（设置页开关是真源） */
+  writeFileSync(prefs, JSON.stringify({ autoCompaction: true }), 'utf8')
+  assert.equal(resolveAutoCompactionAllowed({ autoGate: false }, dir), true, '文件 true 覆盖 patch')
+  writeFileSync(prefs, JSON.stringify({ autoCompaction: false }), 'utf8')
+  assert.equal(resolveAutoCompactionAllowed({ autoGate: false }, dir), false, '文件 false 覆盖 patch')
 })
 
 test('preset 作用域引擎经 pre-step 补闸', () => {

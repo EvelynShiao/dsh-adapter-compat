@@ -140,6 +140,26 @@ const THINK_FILTER = Symbol.for('dsh-adapter-compat.thinking-tag-filter')
 /** 自动压缩硬闸标记：挂在替换后的 compactIfNeeded 上。 */
 export const GATED = Symbol.for('dsh-adapter-compat.compaction-gate')
 
+/* 自动压缩放行态（2026-11-26 用户要求「弄成开关」）：设置页开关写这个标志。
+ *   false（默认）= 硬闸生效，自动压缩恒不触发（手动 /compact 不受影响）
+ *   true          = 原样转发宿主原生自动压缩
+ * 刻意做成「闸一直装着、只看标志」而不是来回装/拆：
+ *   - 反转即时生效，不用重启、不用摘 prototype 上的包装；
+ *   - 进程内所有已包/后包的引擎实例读同一个标志，没有漏网实例；
+ *   - 与 cordis.patch.yml 被 sync 整文件盖掉也无关（真源是本插件自己的偏好文件）。 */
+let autoCompactionAllowed = false
+
+/** 设置开关状态。@returns {boolean} 归一后的值。 */
+export function setAutoCompactionAllowed(value) {
+  autoCompactionAllowed = value === true
+  return autoCompactionAllowed
+}
+
+/** 当前放行态。 */
+export function isAutoCompactionAllowed() {
+  return autoCompactionAllowed
+}
+
 /** settings schema 守卫标记：防止热重载后二次包装。 */
 export const SCHEMA_GUARDED = Symbol.for('dsh-adapter-compat.settings-schema-guard')
 
@@ -623,7 +643,9 @@ function sweep(llm) {
 export function gateTarget(obj) {
   if (!obj || typeof obj.compactIfNeeded !== 'function') return false
   if (obj.compactIfNeeded[GATED]) return false
-  const gated = function () {
+  const gated = function (...args) {
+    // 放行态（UI 开关打开 = 用户要自动压缩）：原样转发给被包住的原方法。
+    if (autoCompactionAllowed) return gated.original.apply(this, args)
     // 宿主语义：compactIfNeeded(...) → null = 无需压缩，调用方静默跳过。
     // 手动 /compact 走 compactNow，不经这里。
     return null
@@ -1419,6 +1441,42 @@ export function sessionsFingerprint(home = dshHomeDir()) {
   return { count: ids.length, newest, key: `${ids.length}:${newest}` }
 }
 
+/**
+ * 结构化指纹：只回答「现在有哪些会话」，**不看内容、不看 mtime**。
+ *
+ * 为什么必须换掉 sessionsFingerprint 来做变化检测（2026-11-27 用户令「扫描那个改了吧，白白消耗性能」）：
+ * 旧指纹里带 `newest` mtime，而聊天时**每落一条消息**都会改某个会话文件的 mtime
+ * → fs.watch 每次触发都被判成「sessions changed」→ 每次都要跑
+ * warm+rescan（全库投影预热）+ purge（stat 增量）+ head-guard 三件套。
+ * 也就是说「用户在打字」这件事本身就在驱动一轮扫描，纯浪费。
+ *
+ * 现在只有「会话目录增删」（同步下载进来一个新会话 / 删掉一个会话）才算变化，
+ * 追加消息一律不触发。纯目录列举，零 stat、零解压。
+ * @param {string} [home] DSH 主目录。
+ * @returns {string} 稳定键（会话目录集合）。
+ */
+export function sessionsStructureKey(home = dshHomeDir()) {
+  const ids = []
+  let workspaces = []
+  try {
+    workspaces = readdirSync(`${home}/sessions`, { withFileTypes: true })
+  } catch {
+    return 'no-sessions-root'
+  }
+  for (const workspace of workspaces) {
+    if (!workspace.isDirectory()) continue
+    let dirs = []
+    try {
+      dirs = readdirSync(`${home}/sessions/${workspace.name}`, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const dir of dirs) if (dir.isDirectory()) ids.push(`${workspace.name}/${dir.name}`)
+  }
+  ids.sort()
+  return `${ids.length}|${ids.join(',')}`
+}
+
 /** 探一个服务：优先 ctx.get，退回属性访问（都不抛）。 */
 function serviceOf(ctx, name) {
   try {
@@ -1474,19 +1532,31 @@ export async function warmProjectionTitles(ctx, options = {}) {
     const cache = serviceOf(ctx, 'sessionProjectionCache')
     const persistence = serviceOf(ctx, 'sessionPersistence')
     if (typeof cache?.coldSnapshot !== 'function') return stats
-    const byId = new Map()
-    if (typeof persistence?.list === 'function') {
-      const entries = (await persistence.list().catch(() => [])) ?? []
-      for (const entry of entries) {
-        const header = entry?.header ?? entry
-        if (header?.id) byId.set(header.id, entry)
-      }
-    }
     const projDir = `${home}/storages/session_projcache/sessions`
     const { ids } = scanSessionFiles(home)
     stats.scanned = ids.length
     const budget = Number.isFinite(options.max) ? options.max : TITLE_WARM_MAX_PER_PASS
     const repairUntitled = options.repairUntitled !== false
+    /* 零成本前置（2026-11-27 用户质疑「反复预热标题不也是浪费」）：
+       所有会话都已有缓存文件、且不要求「修空标题」→ 直接返回。
+       这一步把稳态成本从「list() 解 82 个头帧 + 逐个 JSON.parse」压到「82 次 existsSync」。
+       需要修空标题（手动「立即重扫」）时才走全量检查。 */
+    if (!repairUntitled && !ids.some((sid) => !existsSync(`${projDir}/${sid}.json`))) return stats
+    /* list() 推迟到「确实有会话要重建」时才调用：它是全库操作（每个文件解一个头帧），
+       空的补齐轮不该付这份钱。 */
+    let byId
+    const ensureEntries = async () => {
+      if (byId !== undefined) return byId
+      byId = new Map()
+      if (typeof persistence?.list === 'function') {
+        const entries = (await persistence.list().catch(() => [])) ?? []
+        for (const entry of entries) {
+          const header = entry?.header ?? entry
+          if (header?.id) byId.set(header.id, entry)
+        }
+      }
+      return byId
+    }
     for (const sid of ids) {
       if (stats.rebuilt + stats.repaired >= budget) break
       const file = `${projDir}/${sid}.json`
@@ -1503,7 +1573,7 @@ export async function warmProjectionTitles(ctx, options = {}) {
         }
       }
       try {
-        const entry = byId.get(sid)
+        const entry = (await ensureEntries()).get(sid)
         const header = entry?.header ?? entry
         if (header?.id !== sid) {
           stats.missing += 1
@@ -1579,7 +1649,7 @@ export function installSessionWatch(ctx, options = {}) {
   /* 变化后要做哪些事：默认全做（2026-10-16 前的行为）；设置页可逐项关掉，
      这正是用户抱怨的「每次会话变化都全盘扫 94 个会话」的三个动作。 */
   const on = options.toggles ?? readHealOptions(home)
-  const state = { last: sessionsFingerprint(home).key, pendingKey: null, busy: false, timer: null, watcher: null }
+  const state = { last: sessionsStructureKey(home), pendingKey: null, busy: false, timer: null, watcher: null }
   let check
   const schedule = (delay) => {
     if (state.timer !== null) return
@@ -1593,7 +1663,7 @@ export function installSessionWatch(ctx, options = {}) {
     if (state.busy) return
     let key
     try {
-      key = sessionsFingerprint(home).key
+      key = sessionsStructureKey(home)
     } catch {
       return
     }
@@ -1615,7 +1685,7 @@ export function installSessionWatch(ctx, options = {}) {
     if (on.changeRescan !== false) acts.push('warm+rescan')
     if (on.changePurge !== false) acts.push('purge·stat增量')
     if (on.changeHeadGuard !== false) acts.push('head-guard')
-    appendCompatLog(`sessions changed (${key}) -> ${acts.length > 0 ? acts.join(' + ') : '（动作全部关闭，仅记录）'}`, home)
+    appendCompatLog(`sessions structure changed (${key.split('|')[0]} sessions, ${key.slice(0, 120)}${key.length > 120 ? '…' : ''}) -> ${acts.length > 0 ? acts.join(' + ') : '（动作全部关闭，仅记录）'}`, home)
     Promise.resolve()
       .then(() => (on.changeRescan !== false ? rescanAndWarm(ctx, options) : undefined))
       .catch(() => {})
@@ -1628,7 +1698,7 @@ export function installSessionWatch(ctx, options = {}) {
       .finally(() => {
         state.busy = false
         try {
-          state.last = sessionsFingerprint(home).key
+          state.last = sessionsStructureKey(home)
         } catch {
           /* ignore */
         }
@@ -1676,7 +1746,12 @@ export function installTitleWarm(ctx, config = {}) {
   if (config?.[TITLE_WARM_DISABLED_KEY] === false) return undefined
   const on = readHealOptions()
   const options = {
-    repairUntitled: config?.titleWarmRepairUntitled !== false,
+    /* 默认**不**再修「空标题」（2026-11-27）：修标题必须逐个 JSON.parse 全部缓存，
+       是这条链上最贵的一步。空标题只可能出现在「预热时还没有标题事件」的会话上，
+       这种会话通常就是刚建的新会话 —— 它的目录变化本身会再触发一次 warm。
+       需要全量修标题时走设置页「立即重扫」（runTitleWarmNow 显式传 true），
+       或把 titleWarmRepairUntitled 设为 true。 */
+    repairUntitled: config?.titleWarmRepairUntitled === true,
     max: Number.isFinite(config?.titleWarmMax) ? config.titleWarmMax : undefined,
     /* 频率与「变化后动作」都交给用户选项（设置页「扫描与校准频率」）。 */
     toggles: on,
@@ -1684,7 +1759,9 @@ export function installTitleWarm(ctx, config = {}) {
     debounceMs: on.watchDebounceMs,
   }
   const watch = installSessionWatch(ctx, options)
-  // 启动补跑：12s 全盘补齐；60s 再补一次（覆盖启动后立刻发生的下载）
+  // 启动补跑：只留 12s 一次（2026-11-27 去掉 60s 那轮）。
+  // 启动后才落盘的会话（同步下载）会改变「会话目录集合」，由 installSessionWatch 的
+  // 结构化变化检测当场触发 warm —— 那一轮 60s 补扫是纯重复。
   const timers = []
   const at = (ms, fn) => {
     const t = setTimeout(() => {
@@ -1696,8 +1773,7 @@ export function installTitleWarm(ctx, config = {}) {
     timers.push(t)
   }
   if (on.bootTitleWarm !== false) {
-    at(12000, () => warmProjectionTitles(ctx, options))
-    at(60000, () => rescanAndWarm(ctx, options))
+    at(12000, () => warmProjectionTitles(ctx, { ...options, repairUntitled: false }))
   } else {
     appendCompatLog('title warm: 开机预热已关闭（设置页可开）')
   }
@@ -3304,7 +3380,7 @@ export const COMPACT_EXIT_MODES = ['never', 'auto', 'always']
 /** 出口设置默认值：与 webin 出厂默认一致。 */
 export const COMPACT_EXIT_DEFAULTS = { compactionFileMode: 'auto', compactionFileThresholdChars: 100000 }
 /** 版本分页器开关的默认值：true = 隐藏（用户要「禁了」）。 */
-export const EXIT_PREFS_DEFAULTS = { hideVersionPager: true, renderFx: false }
+export const EXIT_PREFS_DEFAULTS = { hideVersionPager: true, renderFx: false, autoCompaction: false }
 
 /** 本插件出口偏好文件（只存「与 webin 无关」的开关，如隐藏分页器）。 */
 export function exitPrefsPath(home = dshHomeDir()) {
@@ -3577,6 +3653,9 @@ export function readExitPrefs(home = dshHomeDir()) {
     /* [B线 2026-10-24] 消息流懒渲染开关：默认关（用户刚被闪退惊过，不替他做默认决定）。
      *  开启后客户端给消息项注入 content-visibility:auto，屏幕外跳过布局绘制。 */
     renderFx: own.renderFx === true,
+    /* 自动压缩开关（2026-11-26）：true = 放行宿主原生自动压缩。
+     * 缺省 false = 保持历史行为（硬闸拦截，手动 /compact 仍可用）。 */
+    autoCompaction: own.autoCompaction === true,
     /* 知识库自然语言协议（2026-10-19；2026-11-12 回归全局真源：读顶层）。 */
     kbProtocol: webin.kbProtocol !== false,
     /* 自然语言工具调用（2026-10-19；2026-11-12 回归全局真源：读顶层）。默认关（保守）。 */
@@ -3636,6 +3715,11 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
   if (patch?.renderFx !== undefined) {
     if (typeof patch.renderFx !== 'boolean') errors.push('renderFx 应为布尔')
     else if (patch.renderFx !== next.renderFx) { next.renderFx = patch.renderFx; touchOwn = true }
+  }
+  /* 自动压缩开关（2026-11-26）：只存自己的偏好文件，写完立即切实时标志（不重启生效）。 */
+  if (patch?.autoCompaction !== undefined) {
+    if (typeof patch.autoCompaction !== 'boolean') errors.push('autoCompaction 应为布尔')
+    else if (patch.autoCompaction !== next.autoCompaction) { next.autoCompaction = patch.autoCompaction; touchOwn = true }
   }
   if (patch?.kbProtocol !== undefined) {
     if (typeof patch.kbProtocol !== 'boolean') errors.push('kbProtocol 应为布尔')
@@ -3764,14 +3848,20 @@ export function writeExitPrefs(patch, home = dshHomeDir()) {
          首轮 dispatch tc=54 未裁剪，续轮 6.2s 后才 tc=9）。置空强制下一次重读文件。 */
       healOptionsCache = { at: 0, home: null, value: null }
     }
-    if (touchOwn) writeJsonAtomic(exitPrefsPath(home), { hideVersionPager: next.hideVersionPager, renderFx: next.renderFx === true })
+    if (touchOwn) writeJsonAtomic(exitPrefsPath(home), {
+      hideVersionPager: next.hideVersionPager,
+      renderFx: next.renderFx === true,
+      autoCompaction: next.autoCompaction === true,
+    })
+    /* 开关落盘后立刻切实时标志：GET/POST 返回的就是新状态，无需重启。 */
+    if (patch?.autoCompaction !== undefined) setAutoCompactionAllowed(next.autoCompaction)
     if (titleModelWrite) {
       writeTitleModel(titleModelWrite.chain, home)
       next.titleModel = readTitleModel(home)
       appendCompatLog(`title-model chain saved: ${JSON.stringify(titleModelWrite.chain)}`)
     }
     if (touchWebin || touchOwn || titleModelWrite) {
-      appendCompatLog(`exit-prefs saved: mode=${next.compactionFileMode} threshold=${next.compactionFileThresholdChars} hidePager=${next.hideVersionPager} kbProtocol=${next.kbProtocol} nlTool=${next.nlToolProtocol} titlePrefix=${next.titlePrefix}`)
+      appendCompatLog(`exit-prefs saved: mode=${next.compactionFileMode} threshold=${next.compactionFileThresholdChars} hidePager=${next.hideVersionPager} kbProtocol=${next.kbProtocol} nlTool=${next.nlToolProtocol} titlePrefix=${next.titlePrefix} autoCompaction=${next.autoCompaction}`)
     }
     return { ok: true, value: next, changed: { webin: touchWebin, own: touchOwn, titleModel: titleModelWrite !== null } }
   } catch (error) {
@@ -5019,6 +5109,23 @@ export function installSelfCheckRoute(ctx, config = {}) {
   }
 }
 
+/**
+ * 解析自动压缩初始态。
+ * 真源优先级：本插件偏好文件 autoCompaction（设置页开关）> patch.yml config.autoGate > 默认关。
+ * @returns {boolean} true = 放行宿主原生自动压缩。
+ */
+export function resolveAutoCompactionAllowed(config = {}, home = dshHomeDir()) {
+  try {
+    /* 刻意读「裸文件 + 空 fallback」而不是合并 EXIT_PREFS_DEFAULTS：
+     * 合并会让默认值 autoCompaction:false 抢先命中，把 patch.yml 的
+     * config.autoGate:false（恢复官方行为）永远压死——必须区分「文件里真的写了」
+     * 和「没写」。 */
+    const own = readJsonOr(exitPrefsPath(home), {})
+    if (typeof own?.autoCompaction === 'boolean') return own.autoCompaction
+  } catch { /* 读不到就落到 patch 判断 */ }
+  return config?.autoGate === false
+}
+
 export function apply(ctx, config = {}) {
   // -3) 会话改工作区：路由（不依赖 llm，排在早退之前）
   try {
@@ -5313,7 +5420,7 @@ export function apply(ctx, config = {}) {
   // 压缩摘要模型跟随已停用：模型选择必须完全交给宿主原生链路。
   // 保留 armSummarizerSelection 导出供旧测试/诊断使用，但不在插件入口挂载。
 
-  // 5) 自动压缩硬闸（默认开；cordis.patch.yml 本插件行 config.autoGate:false 可恢复官方行为）
-  if (config?.autoGate === false) return
+  // 5) 自动压缩硬闸（闸常驻，放行与否看实时标志——设置页开关即时生效，无需重启）
+  setAutoCompactionAllowed(resolveAutoCompactionAllowed(config))
   armGate(ctx)
 }
