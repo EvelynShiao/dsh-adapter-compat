@@ -472,3 +472,10 @@ insertSessionBefore / archive / unarchive / pin）。所以侧栏里那些「登
 2026-10-16 已清掉 18 条 archived 残留。
 
 单测：`node --test test/invisible.test.js`（可见/归档/workspace-id/登记表损坏四档）。
+## 许可证与上游
+
+本仓库整体按 **Mozilla Public License 2.0（MPL-2.0）** 发布，全文见 [LICENSE](LICENSE)。
+
+这是对上游项目的分支/修改版本：上游原始许可证与版权声明保留在
+[LICENSE-UPSTREAM](LICENSE-UPSTREAM)，出处与改动说明见 [NOTICE](NOTICE)。
+上游文件保留其原许可证，本仓库中由 EvelynShiao 修改或新增的文件按 MPL-2.0 发布。
